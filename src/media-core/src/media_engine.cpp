@@ -52,6 +52,7 @@
 #include "nlohmann/json.hpp"
 
 // libwebrtc（m152）—— 与 spikes/media-link/main.cpp 同一组头文件
+#include "api/audio/audio_device.h"
 #include "api/audio_codecs/builtin_audio_decoder_factory.h"
 #include "api/audio_codecs/builtin_audio_encoder_factory.h"
 #include "api/create_modular_peer_connection_factory.h"
@@ -82,6 +83,7 @@
 #include "api/video_codecs/video_encoder_factory_template_libvpx_vp8_adapter.h"
 #include "api/video/video_codec_type.h"
 #include "api/webrtc_sdp.h"
+#include "modules/audio_device/include/audio_device_default.h"
 #include "pc/video_track.h"
 #include "rtc_base/ref_counted_object.h"
 #include "rtc_base/thread.h"
@@ -516,6 +518,35 @@ class StatsCollector : public webrtc::RTCStatsCollectorCallback {
 };
 
 // ---------------------------------------------------------------------------
+// 空音频设备模块（v2.2）：本版媒体核心不拥有任何音频硬件
+// ---------------------------------------------------------------------------
+// EnableMedia() 需要一个 AudioDeviceModule。不注入的话 libwebrtc 会建一个**真的**
+// Windows Core Audio（WASAPI）ADM：构造时 CoCreateInstance（COM/MTA），
+// WebRtcVoiceEngine::Init 在 worker 线程上 InitSpeaker/InitMicrophone，最后在
+// PeerConnectionFactory 析构时走 ~AudioDeviceWindowsCore（Terminate + Release
+// IMMDeviceEnumerator/COM 端点 + 卸载 Avrt.dll）。本版 pu_voice_* 全部返回
+// PU_NOT_IMPLEMENTED，这个 ADM 一点也用不到，却把「COM + 音频端点 + 音频线程」的
+// 收尾拉进了每次 pu_engine_destroy 的路径上。
+//
+// 2026-11-02 的 teardown 压测在 ~AudioDeviceWindowsCore 里抓到 0xC0000005
+// （crash-iter-0001）——栈是 工厂析构 → 媒体引擎析构 → ADM Release → 平台 ADM
+// 析构，正是这条路。修法不是把析构挪个位置，而是**让引擎根本不创建真实 ADM**：
+// 用 AudioDeviceModuleDefault 的默认实现组装一个「什么都不做」的 ADM（语义等价于
+// webrtc 的 kDummyAudio：Init/Terminate/InitPlayout/InitRecording 全返回 0，
+// 没有平台资源、没有线程、没有 COM 对象），工厂析构因此不再触碰 WASAPI。
+//
+// 生命周期契约（后续实现语音时必须遵守）：
+//   * 本类的实例由 PeerConnectionFactory 通过 deps.adm 独占（scoped_refptr），
+//     随工厂一起析构；引擎不另存引用。
+//   * 语音落地时把这里换成真实 ADM，并保证「创建与析构在同一条线程」，且该线程
+//     在工厂析构时仍然存活（见 docs/spikes/2026-11-01-signaling-abi.md §10）。
+class NullAudioDeviceModule
+    : public webrtc::webrtc_impl::AudioDeviceModuleDefault<webrtc::AudioDeviceModule> {
+ public:
+  NullAudioDeviceModule() = default;
+};
+
+// ---------------------------------------------------------------------------
 // 引擎实现
 // ---------------------------------------------------------------------------
 class MediaEngine {
@@ -671,6 +702,9 @@ class MediaEngine {
   std::string last_error_;
 
   int log_level_ = 0;
+  // 可选的引擎日志文件（环境变量 PARTYUP_MEDIA_LOG）。teardown 压测用它把每个引擎
+  // 实例的收尾阶段落到每次迭代自己的文件里；默认（未设置）只写 stderr。
+  std::FILE* log_file_ = nullptr;
 };
 
 // 远端视频轨的 sink：OnFrame 在解码线程（worker）回调，只做计数 + 推事件。
@@ -780,20 +814,39 @@ class MediaEngine::PcObserver : public webrtc::PeerConnectionObserver {
 };
 
 MediaEngine::~MediaEngine() {
+  Log(3, "dtor: enter");
   Stop();
+  Log(3, "dtor: Stop() returned");
 
   // 顺序照抄 spike：Close()/track/pc（signaling 线程）→ source → factory → 三条线程 Stop。
   ReleaseStreamObjects();
+  Log(3, "dtor: ReleaseStreamObjects() returned");
 
-  pc_factory_ = nullptr;
+  // 工厂是 PeerConnectionFactoryProxy：它的析构会把内部 PeerConnectionFactory
+  // 投递回 signaling 线程（并在控制线程上等待）。这里显式地在 signaling 线程上
+  // 释放，把「webrtc 对象的归属线程」写成契约，而不是依赖 proxy 的实现细节；
+  // 顺序必须在 ReleaseStreamObjects() 之后、三条线程 Stop() 之前。
+  if (signaling_ != nullptr) {
+    signaling_->BlockingCall([this] {
+      Log(3, "dtor: destroying factory (signaling thread)");
+      pc_factory_ = nullptr;
+    });
+  } else {
+    pc_factory_ = nullptr;
+  }
+  Log(3, "dtor: factory released");
 
   if (signaling_ != nullptr) signaling_->Stop();
+  Log(3, "dtor: signaling stopped");
   if (worker_ != nullptr) worker_->Stop();
+  Log(3, "dtor: worker stopped");
   if (network_ != nullptr) network_->Stop();
+  Log(3, "dtor: network stopped");
 
   signaling_.reset();
   worker_.reset();
   network_.reset();
+  Log(3, "dtor: thread objects destroyed");
 
   // 三条 webrtc 线程都停了，才删「可能被它们回调」的对象：远端 sink（解码线程）
   // 与 PC 观察者（signaling 线程）。这样即使有回调在飞也没有线程能再碰它们。
@@ -801,6 +854,11 @@ MediaEngine::~MediaEngine() {
   remote_sink_ = nullptr;
   delete pc_observer_;
   pc_observer_ = nullptr;
+  Log(3, "dtor: sinks/observer deleted");
+  if (log_file_ != nullptr) {
+    std::fclose(log_file_);
+    log_file_ = nullptr;
+  }
 }
 
 void MediaEngine::Log(int level, const char* format, ...) {
@@ -810,8 +868,25 @@ void MediaEngine::Log(int level, const char* format, ...) {
   va_start(args, format);
   std::vsnprintf(buffer, sizeof(buffer), format, args);
   va_end(args);
-  std::fprintf(stderr, "[partyup-media] %s\n", buffer);
+  // 时间戳 + 线程名/线程号 + 引擎地址：收尾证据链要能跨线程排序，也要能分出 A/B
+  // 两个引擎。秒表起点取进程内第一次打日志的时刻（只影响日志内相对时间）。
+  static const int64_t log_t0_us = NowUsSteady();
+  const double since_ms = static_cast<double>(NowUsSteady() - log_t0_us) / 1000.0;
+  const webrtc::Thread* current_thread = webrtc::Thread::Current();
+  const char* thread_name = current_thread != nullptr ? current_thread->name().c_str() : "control";
+  char line[768];
+  const int length = std::snprintf(
+      line, sizeof(line), "[partyup-media][%9.1fms][%s/%lu][engine %p] %s\n", since_ms,
+      thread_name, static_cast<unsigned long>(GetCurrentThreadId()), static_cast<void*>(this),
+      buffer);
+  if (length <= 0) return;
+  const size_t bytes = std::min(static_cast<size_t>(length), sizeof(line) - 1);
+  std::fwrite(line, 1, bytes, stderr);
   std::fflush(stderr);
+  if (log_file_ != nullptr) {
+    std::fwrite(line, 1, bytes, log_file_);
+    std::fflush(log_file_);
+  }
 }
 
 void MediaEngine::SetLastError(const std::string& message) {
@@ -825,6 +900,17 @@ const char* MediaEngine::LastError() {
 }
 
 bool MediaEngine::Init(const pu_config* cfg, std::string* error) {
+  // 可选：把本实例的全部日志另写一份到文件（压测/现场排查用）。用 Win32 的
+  // GetEnvironmentVariableA 而不是 getenv：DLL 与 exe 各带一份 /MT CRT，exe 的
+  // _putenv_s 不会刷新 DLL 的 CRT 环境副本，Win32 的进程环境是唯一共享的。
+  {
+    char log_path[1024];
+    const DWORD length = GetEnvironmentVariableA("PARTYUP_MEDIA_LOG", log_path,
+                                                static_cast<DWORD>(sizeof(log_path)));
+    if (length > 0 && length < sizeof(log_path)) {
+      log_file_ = std::fopen(log_path, "a");
+    }
+  }
   if (cfg != nullptr) {
     log_level_ = static_cast<int>(std::min<uint32_t>(cfg->log_level, 4));
     if (cfg->event_queue_capacity != 0) {
@@ -847,6 +933,9 @@ bool MediaEngine::Init(const pu_config* cfg, std::string* error) {
   network_ = webrtc::Thread::CreateWithSocketServer();
   worker_ = webrtc::Thread::Create();
   signaling_ = webrtc::Thread::Create();
+  if (network_ != nullptr) network_->SetName("pu-network", nullptr);
+  if (worker_ != nullptr) worker_->SetName("pu-worker", nullptr);
+  if (signaling_ != nullptr) signaling_->SetName("pu-signaling", nullptr);
   if (network_ == nullptr || worker_ == nullptr || signaling_ == nullptr ||
       !network_->Start() || !worker_->Start() || !signaling_->Start()) {
     *error = "failed to start webrtc threads";
@@ -868,6 +957,11 @@ bool MediaEngine::Init(const pu_config* cfg, std::string* error) {
       webrtc::VideoDecoderFactoryTemplate<webrtc::LibvpxVp8DecoderTemplateAdapter>>();
   deps.audio_encoder_factory = webrtc::CreateBuiltinAudioEncoderFactory();
   deps.audio_decoder_factory = webrtc::CreateBuiltinAudioDecoderFactory();
+  // v2.2：注入空 ADM（见 NullAudioDeviceModule 的注释）——必须在 EnableMedia 之前，
+  // 否则 MediaFactoryImpl 会把 deps.adm（nullptr）交给 WebRtcVoiceEngine，后者用
+  // EnsureAudioDeviceModule() 建出真实的 Windows Core Audio ADM。
+  deps.adm = webrtc::scoped_refptr<webrtc::AudioDeviceModule>(
+      new webrtc::RefCountedObject<NullAudioDeviceModule>());
   webrtc::EnableMedia(deps);
 
   pc_factory_ = webrtc::CreateModularPeerConnectionFactory(std::move(deps));
@@ -1037,11 +1131,13 @@ int MediaEngine::Start(const char* screen_id, std::string* error) {
 
 int MediaEngine::Stop() {
   std::lock_guard<std::mutex> control_lock(control_mu_);
+  Log(3, "stop: enter (running=%d)", running_ ? 1 : 0);
 
   // v2：先停协商线程。它会在 ICE 收集完成后往事件队列推一条信令，必须在关闭 PC
   // 之前收掉，否则会出现「stop 之后还冒出一条 offer」。
   negotiator_stop_.store(true, std::memory_order_relaxed);
   if (negotiator_.joinable()) negotiator_.join();
+  Log(3, "stop: negotiator joined");
 
   if (!running_) {
     // 正常路径是幂等返回；但如果 start() 在中途抛异常，采集线程可能已经起来而
@@ -1050,11 +1146,14 @@ int MediaEngine::Stop() {
       stop_requested_.store(true, std::memory_order_relaxed);
       pump_.join();
     }
+    Log(3, "stop: pump joined (idle path)");
     // v2.1：pump 停了之后才停采样线程——它在收尾时会再取一份报告，把
     // frames_encoded 追到终值（没有新帧要说，这份就是最终数）。
     StopStatsSampler();
+    Log(3, "stop: stats stopped (idle path)");
     // 接收侧 PC（没 start、只收不发）也要关掉；没有 PC 时这里是无操作。
     ReleaseStreamObjects();
+    Log(3, "stop: released (idle path), returning");
     return PU_OK;
   }
 
@@ -1063,12 +1162,15 @@ int MediaEngine::Stop() {
 
   stop_requested_.store(true, std::memory_order_relaxed);
   if (pump_.joinable()) pump_.join();
+  Log(3, "stop: pump joined");
 
   // v2.1：同上——pump 已停，采样线程取完最后一份报告再退（幂等）。
   StopStatsSampler();
+  Log(3, "stop: stats stopped");
 
   running_ = false;
   ReleaseStreamObjects();
+  Log(3, "stop: released");
 
   state_ = PU_STREAM_IDLE;
   PushState(PU_STREAM_IDLE, PU_STREAM_STOPPING, PU_REASON_REQUESTED);
@@ -1083,6 +1185,8 @@ int MediaEngine::Stop() {
 }
 
 void MediaEngine::ReleaseStreamObjects() {
+  Log(3, "release: enter (pc=%d track=%d remote_track=%d)", pc_ != nullptr ? 1 : 0,
+      track_ != nullptr ? 1 : 0, remote_track_ != nullptr ? 1 : 0);
   // 顺序照抄 spike：先 Close()，再释放 track / pc；这三件事都必须在 signaling
   // 线程上做（VideoTrack 与 PeerConnection 的方法都有线程断言）。
   if (signaling_ != nullptr) {
@@ -1103,6 +1207,7 @@ void MediaEngine::ReleaseStreamObjects() {
     pc_ = nullptr;
     remote_track_ = nullptr;
   }
+  Log(3, "release: pc/track closed and released");
   {
     std::lock_guard<std::mutex> lock(cand_mu_);
     gathered_candidates_.clear();
@@ -1114,6 +1219,7 @@ void MediaEngine::ReleaseStreamObjects() {
   local_sdp_emitted_.store(false, std::memory_order_relaxed);
   stat_peer_state_.store(PU_PEER_NONE, std::memory_order_relaxed);
   stat_ice_state_.store(PU_ICE_NEW, std::memory_order_relaxed);
+  Log(3, "release: done");
 }
 
 // ---------------------------------------------------------------------------
@@ -1655,12 +1761,18 @@ void MediaEngine::StartStatsSampler(webrtc::scoped_refptr<webrtc::PeerConnection
 
 void MediaEngine::StopStatsSampler() {
   stats_stop_.store(true, std::memory_order_relaxed);
-  if (!stats_.joinable()) return;
+  if (!stats_.joinable()) {
+    Log(3, "stats-stop: no sampler thread");
+    return;
+  }
+  Log(3, "stats-stop: joining sampler");
   stats_.join();
+  Log(3, "stats-stop: sampler joined, draining signaling queue");
   // 采样线程可能在队列里留下最后一条 GetStats 任务：它揣着 PC 的引用，如果让它
   // 留到 signaling_->Stop() 被丢弃，PC 就可能在控制线程上析构（libwebrtc 的
   // PeerConnection 是要在 signaling 线程上析构的）。这里投一条空任务把它排干。
   if (signaling_ != nullptr) signaling_->BlockingCall([] {});
+  Log(3, "stats-stop: queue drained");
   // 收尾时把 PC 侧的累计量报一次：这是「一共编码了多少帧」的直接证据（1:1 时
   // 应该等于采集推出去的帧数，而不是它的两倍）。
   Log(3, "pc stats at stop: framesEncoded=%llu bytesSent=%llu keyFramesEncoded=%llu (samples=%u)",

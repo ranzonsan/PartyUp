@@ -1,0 +1,19 @@
+<Project>
+
+  <!--
+    GalleryGuiProbe —— 局部 Directory.Build.props：**阻断** repo 祖父级 Directory.Build.props 的继承。
+
+    MSBuild 向上查找 Directory.Build.props 时在第一个命中的目录停止；本文件位于
+    tests/fixtures/GalleryGuiProbe/，只对本法具目录之下生效（不影响任何兄弟夹具或业务工程）。
+    本夹具是**零 NuGet 的纯 BCL 控制台程序**，必须在无中央包管理的干净前提下自行求值框架属性。
+    本文件刻意不 Import 任何父级 props —— 这正是阻断的实现方式。
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+
+</Project>

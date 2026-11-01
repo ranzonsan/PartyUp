@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    多目标框架夹具（windows-smoke day2 用）：刻意声明**恰好两个** TFM
+      net10.0        —— 跨平台默认
+      net10.0-windows—— 需要 Windows 目标包；EnableWindowsTargeting 允许在非 Windows 宿主上也构建
+    用途：
+      * 负向：build-run 不传 framework 参数时，多 TFM 项目的 TargetPath 无法求值 →
+        桥必须以 ERR_FRAMEWORK_REQUIRED 失败且**不启动**目标进程；
+      * 正向：显式指定 net10.0 / net10.0-windows 时各自构建并运行成功，
+        且程序自身经 #if 打印真实运行的 TFM（证明跑的确实是那个 TFM，不是猜的）。
+    本文件位于 tests/fixtures/** —— 已被 Bridge.csproj 与 Wdb.Tests.csproj 排除，不参与桥与测试程序集编译。
+    零 NuGet、纯 BCL；不依赖仓库根的 Directory.Build.props / Directory.Packages.props。
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFrameworks>net10.0;net10.0-windows</TargetFrameworks>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>MultiTfm</AssemblyName>
+    <RootNamespace>MultiTfm</RootNamespace>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <IsPackable>false</IsPackable>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+
+</Project>

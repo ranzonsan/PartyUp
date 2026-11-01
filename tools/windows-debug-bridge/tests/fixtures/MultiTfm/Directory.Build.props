@@ -1,0 +1,8 @@
+<Project>
+  <!--
+    刻意的**空** Directory.Build.props：MSBuild 向上查找时会在本目录停止，
+    因此仓库根的 Directory.Build.props（其中定义了单数 <TargetFramework>net10.0</TargetFramework>）
+    不会注入本夹具 —— 否则「单数 TargetFramework + 复数 TargetFrameworks 同时存在」会让多 TFM 构建直接失败。
+    台账：2026-10-11 已有一个多 TFM 夹具因继承单数 TargetFramework 而退化，这里从机制上杜绝。
+  -->
+</Project>

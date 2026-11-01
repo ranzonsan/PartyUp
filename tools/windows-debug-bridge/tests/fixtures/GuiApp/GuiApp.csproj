@@ -1,0 +1,43 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    GuiApp —— Windows 调试桥的 Win32 窗口夹具（fixture）。
+
+    定位：证明「`wdb build-run` 经 Windows 前台 Worker 拉起的进程，真的在用户交互桌面上
+    显示了一个可见的 Win32 窗口，并且客户区被真实绘制过」。它**不是**真实 Avalonia 画廊应用，
+    也不得被当作用户业务 UI 的验收。
+
+    硬性约束（与 EchoApp / ProcessProbe 同款）：
+      * 纯 .NET 10 BCL、零 NuGet、零 ProjectReference、零第三方库 —— 桥会把源码复制到仓库之外
+        （%LOCALAPPDATA%\WslDebugBridge\runs\<id>\src）离线构建；
+      * 只 P/Invoke user32 / gdi32 / kernel32 / dwmapi / ntdll；不引用 System.Drawing / WinForms / WPF；
+      * 不触碰任何用户业务数据（画廊库、SQLite、配置、Telegram/Tdlib 会话一律不读写）；
+      * WinExe：无控制台窗口，stdout 由 Worker 重定向接管（RedirectStandardOutput=true）。
+  -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>GuiApp</AssemblyName>
+    <RootNamespace>GuiApp</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <IsPackable>false</IsPackable>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <RestorePackagesWithLockFile>false</RestorePackagesWithLockFile>
+    <!--
+      仓库根的 Directory.Build.props 已由同目录 Directory.Build.props 阻断（MSBuild 在第一个命中的目录停止向上查找）。
+      但 **Directory.Packages.props 不走同一条链路**：NuGet 用 GetPathOfFileAbove 独立向上查找并导入仓库根那一份，
+      于是它设置的 ManagePackageVersionsCentrally / CentralPackageTransitivePinningEnabled 仍会进入求值。
+      本夹具零 PackageReference，必须在项目体内把这两个开关显式压回 false（项目体求值晚于所有 props 导入，必定生效），
+      从而与仓库级中央包管理策略彻底解耦 —— 桥在仓库外构建时行为一致。
+    -->
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+    <CentralPackageTransitivePinningEnabled>false</CentralPackageTransitivePinningEnabled>
+    <!-- 本夹具只跑 Windows：平台兼容性分析器对裸 P/Invoke 无意义，避免噪音。 -->
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
+  </PropertyGroup>
+
+</Project>

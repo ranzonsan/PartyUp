@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    日志增量夹具（windows-smoke day2 用）：按**确定性公式**逐行、逐字节写 stdout/stderr，
+    让 WSL 侧能独立重算出完全相同的期望字节序列，从而断言 wdb logs 跟随模式的增量输出逐字节正确。
+
+    硬性约束（与 EchoApp / ProcessProbe 同款）：
+      * 零 NuGet、纯 BCL、自带 TargetFramework，不依赖仓库根的 Directory.Build.props / Packages.props；
+      * 不写任何文件（除可选的 marker 参数）；每行写完立即 Flush，保证「增量」是真增量；
+      * 无时间戳 / 无随机数 / 无 PID —— 输出完全由参数决定，可复算。
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>LogSpinner</AssemblyName>
+    <RootNamespace>LogSpinner</RootNamespace>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <IsPackable>false</IsPackable>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+
+</Project>

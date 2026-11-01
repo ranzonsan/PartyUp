@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    自包含桥项目：会被 start-worker.ps1 复制到仓库之外（%LOCALAPPDATA%\WslDebugBridge\tool）
+    再构建，因此这里必须自带 TargetFramework，且不得依赖仓库根的
+    Directory.Build.props / Directory.Packages.props，也不得引用任何 NuGet 包（纯 BCL）。
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>wdb</AssemblyName>
+    <RootNamespace>GalleriesManager.Wdb</RootNamespace>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <IsPackable>false</IsPackable>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- tests 树（含 fixtures/EchoApp）不是桥的一部分，禁止被默认 glob 收进本项目 -->
+    <Compile Remove="tests/**/*.cs" />
+    <Compile Remove="tests/**" />
+    <None Remove="tests/**" />
+  </ItemGroup>
+
+</Project>

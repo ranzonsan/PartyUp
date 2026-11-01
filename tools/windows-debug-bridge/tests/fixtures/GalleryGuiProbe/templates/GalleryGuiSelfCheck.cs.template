@@ -1,0 +1,1068 @@
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text.Json;
+using Avalonia;
+using Avalonia.Controls;
+using Avalonia.Controls.ApplicationLifetimes;
+using Avalonia.Controls.Primitives;
+using Avalonia.Media.Imaging;
+using Avalonia.Threading;
+using Avalonia.VisualTree;
+using GalleriesManager.Core.Constants;
+using GalleriesManager.Desktop.ViewModels;
+
+namespace GalleriesManager.Desktop.Services;
+
+/// <summary>
+/// 【隔离 GUI 验收副本专用 instrumentation】—— 本文件只存在于 .wdb/guisrc-&lt;GUID&gt; 临时源码副本，
+/// **不在仓库业务源码中**，原仓库完全不受影响。
+///
+/// 职责：在**真实 App 的 MainWindow.Opened 事件**里，于启动编排（StartupOrchestrator.RunAsync）跑完之后
+/// 自证并输出一行 <c>WDB_GALLERY_GUI {json}</c> 到 stdout（由 Windows 调试桥 Worker 重定向到 stdout.log），
+/// 内容包含：真实 OS / 数据根 AppPaths.Root / 进程 PID / 真实原生窗口句柄 HWND / 可见性 / 窗口与客户区尺寸 /
+/// **只截自己这一个窗口**（绝不截桌面）的截图及其 SHA256 / 启动各步骤终态（用于证明 ConnectTelegram = Skipped）/
+/// 以及"隔离根确实位于桥运行副本内、而非 %LOCALAPPDATA%\galleries-manager*" 的自证。
+///
+/// 2026-10-12 扩展：在线-LLM 无关网络的**四态 UI 验收**。Avalonia 无法被外部程序化注入鼠标事件（OS 级点击注入
+/// 不在本治具能力范围内），因此交互改由**应用内部**完成：在 UI 线程上读 ViewModel 公开属性、把「运行后端」下拉
+/// 按显示名选中「在线 API」/切回本地、把「服务商预设」切到另一家，并在每一步之后独立截一张 PNG + 一份 VM 状态快照：
+///   * 状态 A（phase="A"）：本地默认态——程序化导航到设置页 LLM 子页，本地挡位卡可见、无在线配置卡；
+///   * 状态 B（phase="B"）：在线模式态——后端下拉选中「在线 API（OpenAI 兼容端点）」，在线配置卡
+///                            （预设/端点/密钥/模型）可见，本地挡位卡、本地高级参数区、组件下载块隐藏，
+///                            **后端选择器常驻可见**（否则用户进了在线模式就切不回本地）；
+///   * 状态 C（phase="C"）：切预设联动态——先把手填端点/模型写入，再把预设切到另一家，两输入框应被清空；
+///   * 状态 D（phase="D"）：切回本地——后端下拉按显示名切回本地项，在线配置卡隐藏、本地挡位卡恢复可见。
+/// 全程**只改 UI/VM 状态**：不触发任何网络请求、不点任何下载按钮、不跑整理任务，LLM 总闸保持默认值。
+///
+/// 截图同时产出**两条独立通道**，便于 Windows 侧 GalleryGuiProbe 独立复核：
+///   * PNG = Avalonia RenderTargetBitmap（本应用自己的可视树，语义上不可能含桌面）；
+///   * BMP = 纯 Win32 PrintWindow(自己的 HWND) + 手工 24bpp 头（只画该窗口，同样不碰桌面；
+///           原始像素可被 probe 直接解析，用于证明「窗口真的被绘制过」而非空洞文件）。
+///
+/// 随后**自动**退出——由阶段驱动在三个状态全部采集完成后调用 <c>desktop.Shutdown(0)</c>
+/// （任一状态没拿到图/快照则退出码 1），另有看门狗兜底强制退出，**绝不等待用户点击**。
+/// </summary>
+internal static class GalleryGuiSelfCheck
+{
+    /// <summary>stdout 协议前缀（与 tests/windows-gallery-gui.py 的解析一一对应）。</summary>
+    internal const string Prefix = "WDB_GALLERY_GUI ";
+
+    /// <summary>Opened 之后等待布局/首次绘制稳定的时间。</summary>
+    private const int SettleMs = 1500;
+
+    /// <summary>三个状态之间等待渲染/联动稳定的时间（每个状态各自等待一次）。</summary>
+    private const int PhaseSettleMs = 900;
+
+    /// <summary>截图并输出证据之后自动退出的等待时间（不等用户点击）。</summary>
+    private const int QuitAfterCaptureMs = 6000;
+
+    /// <summary>单次等待的上限：即使渲染循环异常，也必须走完剩余阶段并退出（防挂死）。</summary>
+    private const int WaitHardCapMs = 8000;
+    private const int WaitTickMs = 250;
+
+    /// <summary>看门狗总时长上限：超过它仍未采集完所有状态就强制退出（避免挂住 Worker 任务）。</summary>
+    private const int WatchdogMs = 30000;
+
+    /// <summary>在线-LLM 四态验收：每个状态的稳定等待 + 该状态自身阶段切换前的额外等待。
+    /// A 本地默认 → B 切到在线 API（下拉选中） → C 切服务商预设（清空手填） → D 切回本地后端。</summary>
+    private const int PhaseCount = 4;
+
+    /// <summary>三态验收的期望后端/预设标识（与 LlamaModelCatalog 常量一致，此处只读引用）。</summary>
+    private const string OnlineBackendId = "Online";
+
+    private const string PngBaseName = "wdb-gallery-gui-shot";
+    private const string BmpBaseName = "wdb-gallery-gui-shot-win32";
+    private const string EvidenceFileName = "wdb-gallery-gui-evidence.json";
+
+    private static bool _started;
+    private static readonly List<Dictionary<string, object?>> Phases = [];
+    private static string _phaseError = string.Empty;
+
+    /// <summary>由 App.OnFrameworkInitializationCompleted 在真实 Opened 事件末尾调用（UI 线程）。</summary>
+    internal static void Run(IClassicDesktopStyleApplicationLifetime desktop, StartupOrchestrator orchestrator)
+    {
+        if (_started)
+            return;
+        _started = true;
+
+        // 阶段驱动：等待 → 执行 → 等待 → 执行 …… 全程只依赖 DispatcherTimer（UI 线程），
+        // 每个阶段之间让渲染循环自然完成若干帧，再截图，避免"改完状态立刻截图"拿到上一帧画面。
+        var index = -1;
+
+        void Advance()
+        {
+            index++;
+            if (index >= PhaseCount)
+            {
+                Finish(desktop, orchestrator, null);
+                return;
+            }
+            RunPhase(desktop, orchestrator, index, Advance);
+        }
+
+        var boot = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(SettleMs) };
+        boot.Tick += (_, _) =>
+        {
+            boot.Stop();
+            Advance();
+        };
+        boot.Start();
+
+        // 兜底看门狗：无论阶段驱动出什么意外，都必须自动退出（绝不挂住 Worker 的任务）。
+        var watchdog = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(WatchdogMs) };
+        watchdog.Tick += (_, _) =>
+        {
+            watchdog.Stop();
+            if (Phases.Count < PhaseCount)
+                _phaseError = _phaseError + (string.IsNullOrEmpty(_phaseError) ? "" : " | ")
+                              + $"watchdog fired with {Phases.Count}/{PhaseCount} phases captured";
+            Finish(desktop, orchestrator, watchdog);
+        };
+        watchdog.Start();
+    }
+
+    /// <summary>等待 <paramref name="ms"/> 毫秒（UI 线程消息泵继续跑），随后执行 <paramref name="next"/>。</summary>
+    private static void Delay(int ms, Action next)
+    {
+        var waited = 0;
+        var timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(WaitTickMs) };
+        timer.Tick += (_, _) =>
+        {
+            waited += WaitTickMs;
+            if (waited < ms && waited < WaitHardCapMs)
+                return;
+            timer.Stop();
+            try
+            {
+                next();
+            }
+            catch (Exception ex)
+            {
+                // 绝不静默卡死：记录后仍然推进（最后一棒是 Finish，负责退出）。
+                _phaseError = "advance: " + ex.GetType().Name + ": " + ex.Message;
+                try { next(); } catch { }
+            }
+        };
+        timer.Start();
+    }
+
+    /// <summary>执行第 <paramref name="index"/> 个状态：设置 VM 状态 → 等渲染稳定 → 截图 + 状态快照。</summary>
+    private static void RunPhase(IClassicDesktopStyleApplicationLifetime desktop,
+        StartupOrchestrator orchestrator, int index, Action next)
+    {
+        // 先把当前状态施加上去（VM 公开属性；不模拟鼠标、不点 UI）。
+        try
+        {
+            ApplyPhaseState(desktop, index);
+        }
+        catch (Exception ex)
+        {
+            _phaseError = $"phase-{index}-apply: {ex.GetType().Name}: {ex.Message}";
+        }
+
+        // 每个状态之间额外等渲染/联动稳定（PNG 取自 RenderTargetBitmap，会按需强制本轮渲染）。
+        Delay(PhaseSettleMs, () =>
+        {
+            try
+            {
+                Phases.Add(CapturePhase(desktop, orchestrator, index));
+            }
+            catch (Exception ex)
+            {
+                Phases.Add(new Dictionary<string, object?>
+                {
+                    ["phase"] = PhaseName(index),
+                    ["ok"] = false,
+                    ["error"] = ex.GetType().Name + ": " + ex.Message,
+                });
+            }
+
+            next();
+        });
+    }
+
+    private static string PhaseName(int index) => index switch { 0 => "A", 1 => "B", 2 => "C", _ => "D" };
+
+    /// <summary>
+    /// 施加第 <paramref name="index"/> 个状态（全部走 ViewModel 公开属性，等价于用户在 UI 上操作同一绑定点）：
+    ///   A 本地默认态：仅导航到设置页 LLM 子页，不改任何 LLM 设置；
+    ///   B 在线模式态：把「运行后端」下拉**按显示名选中**「在线 API（OpenAI 兼容端点）」——这正是
+    ///                  ComboBox 选中项时写入绑定属性的路径（OnSelectedLlmBackendLabelChanged → LlmBackend）；
+    ///   C 切预设联动态：先填手填端点/模型，再把服务商预设切到第 3 项（与 B 不同）；
+    ///   D 切回本地后端：把「运行后端」按显示名切回首个本地项（验证在线↔本地可互切，且本地区块恢复可见）。
+    /// **绝不**调用任何网络路径：不点下载、不跑整理、不触发连接测试。
+    /// </summary>
+    private static void ApplyPhaseState(IClassicDesktopStyleApplicationLifetime desktop, int index)
+    {
+        var window = desktop.MainWindow;
+        if (index == 0)
+        {
+            NavigateToSettingsLlmTab(window);
+            return;
+        }
+
+        var vm = TryGetLlmVm(window);
+        if (vm is null)
+            return;
+
+        if (index == 1)
+        {
+            // 走下拉选中路径（按显示名），而不是直接写 LlmBackend：这样 SelectedLlmBackendLabel
+            // 必须与 LlmBackend 保持一致，否则说明下拉没有在线项或绑定失配（会被硬判据判红）。
+            var label = vm.LlmBackendLabels.FirstOrDefault(l => l.Contains("在线 API", StringComparison.Ordinal));
+            if (!string.IsNullOrEmpty(label))
+                vm.SelectedLlmBackendLabel = label;
+            else
+                vm.LlmBackend = OnlineBackendId;   // 兜底：至少让状态进入在线模式（并会被硬判据暴露）
+            return;
+        }
+
+        if (index == 2)
+        {
+            // 状态 C：先制造"手填值"（此刻界面在在线模式），再切预设。
+            vm.LlmOnlineEndpoint = "https://example.local/v1";
+            vm.LlmOnlineModel = "test-model";
+            var labels = vm.LlmOnlinePresetLabels;
+            if (labels.Length > 0)
+            {
+                var cur = vm.SelectedLlmOnlinePresetLabel;
+                var target = labels.FirstOrDefault(l => !string.Equals(l, cur, StringComparison.Ordinal)) ?? labels[0];
+                vm.SelectedLlmOnlinePresetLabel = target;
+            }
+            return;
+        }
+
+        // 状态 D：按显示名切回首个本地后端。
+        var local = vm.LlmBackendLabels.FirstOrDefault(l => !l.Contains("在线 API", StringComparison.Ordinal));
+        if (!string.IsNullOrEmpty(local))
+            vm.SelectedLlmBackendLabel = local;
+    }
+
+    /// <summary>
+    /// 程序化导航到设置页的 LLM 子页：走 FluentAvalonia 的 NavigationView → 真实 SettingsView 页面，
+    /// 并把设置页内层 TabControl 切到「LLM 助手」子页。只读可视树 + 设置 SelectedItem/SelectedIndex，不点任何按钮。
+    /// </summary>
+    private static void NavigateToSettingsLlmTab(Window? window)
+    {
+        if (window is null) return;
+
+        var nav = window.GetVisualDescendants().OfType<FluentAvalonia.UI.Controls.FANavigationView>().FirstOrDefault();
+        if (nav is not null)
+        {
+            var item = nav.MenuItems.OfType<FluentAvalonia.UI.Controls.FANavigationViewItem>()
+                .FirstOrDefault(i => string.Equals(i.Tag as string, "5", StringComparison.Ordinal));
+            if (item is not null)
+                nav.SelectedItem = item;
+        }
+
+        var vm = TryGetLlmVm(window);
+        if (vm is not null)
+            SetSettingsTab(window, 4);
+    }
+
+    /// <summary>
+    /// 把设置页内层 TabControl 切到指定下标（LLM 助手 = 4）。
+    /// **必须设 ViewModel 属性**（SelectedSettingsTab 绑定在 TabControl.SelectedIndex 上，且 TabControl
+    /// 的控件模板要等 layout 才实例化）：实测先在控件上设 SelectedIndex 会被随后的绑定初值覆盖回 0，
+    /// 界面上就仍停在「作品源」子页。控件级设置仅作模板已就绪时的补充。
+    /// </summary>
+    private static void SetSettingsTab(Window? window, int index)
+    {
+        if (window is null) return;
+        try
+        {
+            if (window.DataContext is MainWindowViewModel main && main.Settings is not null)
+                main.Settings.SelectedSettingsTab = index;
+        }
+        catch { /* 设置属性失败时仍尝试控件级设置 */ }
+        foreach (var tab in window.GetVisualDescendants().OfType<TabControl>())
+        {
+            if (tab.Items.Count > index)
+            {
+                tab.SelectedIndex = index;
+                return;
+            }
+        }
+    }
+
+    private static void Finish(IClassicDesktopStyleApplicationLifetime desktop, StartupOrchestrator orchestrator,
+        DispatcherTimer? watchdog)
+    {
+        try { watchdog?.Stop(); } catch { /* 看门狗已停用时无副作用 */ }
+
+        var allOk = Phases.Count == PhaseCount
+                    && Phases.All(p => p.TryGetValue("ok", out var v) && v is true);
+
+        var summary = new Dictionary<string, object?>
+        {
+            ["ok"] = allOk,
+            ["stage"] = "shutdown",
+            ["pid"] = Environment.ProcessId,
+            ["exitCode"] = allOk ? 0 : 1,
+            ["phasesOk"] = Phases.Count(p => p.TryGetValue("ok", out var v) && v is true),
+            ["phasesExpected"] = PhaseCount,
+            ["phaseError"] = string.IsNullOrEmpty(_phaseError) ? null : _phaseError,
+        };
+        try { Emit(summary); }
+        catch { /* 退出前最后一次输出失败不应阻止退出 */ }
+
+        // 关键：自动退出，绝不等待用户点击。三个状态全部成功才以退出码 0 结束，否则退出码 1。
+        try
+        {
+            if (allOk)
+                desktop.Shutdown(0);
+            else
+                desktop.Shutdown(1);
+        }
+        catch { Environment.Exit(allOk ? 0 : 1); }
+    }
+
+    // ------------------------------------------------------------------
+    // 单个状态的采集：截图（PNG + BMP 双通道）+ VM 状态快照
+    // ------------------------------------------------------------------
+    private static Dictionary<string, object?> CapturePhase(IClassicDesktopStyleApplicationLifetime desktop,
+        StartupOrchestrator orchestrator, int index)
+    {
+        var phase = PhaseName(index);
+        var window = desktop.MainWindow;
+
+        var info = new Dictionary<string, object?>
+        {
+            ["ok"] = false,
+            ["phase"] = phase,
+            ["phaseIndex"] = index,
+            ["stage"] = "captured",
+            ["pid"] = Environment.ProcessId,
+        };
+
+        // ---- 窗口身份（每个状态单独取一次：证明三张图都来自同一个真实可见窗口）----
+        nint hwnd = 0;
+        try
+        {
+            var handle = window?.TryGetPlatformHandle();
+            if (handle is not null)
+                hwnd = handle.Handle;
+        }
+        catch (Exception ex)
+        {
+            info["hwndError"] = ex.GetType().Name + ": " + ex.Message;
+        }
+        info["hwnd"] = hwnd == 0 ? null : "0x" + hwnd.ToString("X");
+        info["hwndInt"] = hwnd == 0 ? null : hwnd.ToInt64();
+
+        if (window is not null)
+        {
+            try
+            {
+                info["clientSize"] = new Dictionary<string, object?>
+                {
+                    ["w"] = (int)Math.Round(window.ClientSize.Width),
+                    ["h"] = (int)Math.Round(window.ClientSize.Height),
+                };
+                info["windowBounds"] = new Dictionary<string, object?>
+                {
+                    ["w"] = (int)Math.Round(window.Bounds.Width),
+                    ["h"] = (int)Math.Round(window.Bounds.Height),
+                };
+                info["windowTitle"] = window.Title;
+                info["isVisibleProp"] = window.IsVisible;
+            }
+            catch (Exception ex)
+            {
+                info["windowMetricsError"] = ex.GetType().Name + ": " + ex.Message;
+            }
+        }
+
+        if (hwnd != 0 && OperatingSystem.IsWindows())
+        {
+            try
+            {
+                info["isWindowVisible"] = NativeMethods.IsWindowVisible(hwnd);
+                if (NativeMethods.GetWindowRect(hwnd, out var wr))
+                {
+                    info["windowRect"] = new Dictionary<string, object?>
+                    {
+                        ["x"] = wr.Left,
+                        ["y"] = wr.Top,
+                        ["w"] = wr.Right - wr.Left,
+                        ["h"] = wr.Bottom - wr.Top,
+                    };
+                }
+                if (NativeMethods.GetClientRect(hwnd, out var cr))
+                {
+                    info["clientRect"] = new Dictionary<string, object?>
+                    {
+                        ["w"] = cr.Right - cr.Left,
+                        ["h"] = cr.Bottom - cr.Top,
+                    };
+                }
+            }
+            catch (Exception ex)
+            {
+                info["win32MetricsError"] = ex.GetType().Name + ": " + ex.Message;
+            }
+        }
+
+        // ---- 隔离自证（每个状态各带一份，避免只信单点）----
+        var realLocalAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        var root = AppPaths.Root;
+        var userProd = Path.Combine(realLocalAppData, "galleries-manager");
+        var userDev = Path.Combine(realLocalAppData, "galleries-manager-dev");
+        var rootIsIsolated = !string.Equals(root, userProd, StringComparison.OrdinalIgnoreCase)
+                             && !string.Equals(root, userDev, StringComparison.OrdinalIgnoreCase)
+                             && root.Contains("_gm_gui_testdata_", StringComparison.Ordinal)
+                             && !root.StartsWith(userProd + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+                             && !root.StartsWith(userDev + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+        info["root"] = root;
+        info["realLocalAppData"] = realLocalAppData;
+        info["rootIsIsolated"] = rootIsIsolated;
+        info["baseDirectory"] = AppContext.BaseDirectory;
+        info["os"] = RuntimeInformation.OSDescription;
+        info["framework"] = RuntimeInformation.FrameworkDescription;
+
+        Directory.CreateDirectory(root);
+
+        // ---- 截图：只截本应用自己的窗口，绝不截桌面（双通道；每个状态独立文件）----
+        var pngPath = Path.Combine(root, PngBaseName + "-" + phase + ".png");
+        var bmpPath = Path.Combine(root, BmpBaseName + "-" + phase + ".bmp");
+
+        var png = CaptureAvaloniaPng(window, pngPath);
+        var bmp = CaptureWin32Bmp(hwnd, bmpPath);
+
+        foreach (var kv in png)
+            info["shotPng" + kv.Key] = kv.Value;
+        foreach (var kv in bmp)
+            info["shotBmp" + kv.Key] = kv.Value;
+
+        // 主通道：优先 Avalonia PNG，退化到 Win32 BMP。
+        var primary = png.TryGetValue("Ok", out var po) && po is true ? png : bmp;
+        var primaryOk = primary.TryGetValue("Ok", out var o) && o is true;
+        info["shotMethod"] = primaryOk ? primary["Method"] : "none";
+        info["shotPath"] = primaryOk ? primary["Path"] : null;
+        info["shotSha256"] = primaryOk ? primary["Sha256"] : null;
+        info["shotBytes"] = primaryOk ? primary["Bytes"] : null;
+        info["shotWidth"] = primaryOk ? primary["Width"] : null;
+        info["shotHeight"] = primaryOk ? primary["Height"] : null;
+        // 「只截自己的窗口」的依据是**静态代码 + 捕获路径方法学**，而不是一个运行时布尔：
+        //   * 只走两条路径：Avalonia RenderTargetBitmap 只渲染**本应用自己的可视树**（结构上不可能含桌面）；
+        //     以及 Win32 PrintWindow 作用在**自己的 HWND** 上（GetDC(hwnd) 仅作格式参考）。
+        //   * 静态禁止 BitBlt / GetDC(0) / GetWindowDC / GetDesktopWindow / CopyFromScreen
+        //     （由 tests/windows-gallery-gui.py --verify 的 P7_no_desktop_capture / P7_own_window_dc_ref 断言）。
+        info["shotOwnWindowOnlyEvidence"] = new Dictionary<string, object?>
+        {
+            ["scope"] = "static-code + capture-path-attestation",
+            ["primaryCapturePath"] = "avalonia-rendertargetbitmap: renders this application's own visual tree only",
+            ["secondaryCapturePath"] = "win32-printwindow: PrintWindow on own HWND; GetDC(own hwnd) used as format reference only",
+            ["screenApisUsed"] = false,
+            ["verifiedBy"] = "tests/windows-gallery-gui.py --verify (P7_no_desktop_capture, P7_own_window_dc_ref)",
+        };
+        info["shotChannelsOk"] = (png.TryGetValue("Ok", out var a) && a is true ? 1 : 0)
+                                 + (bmp.TryGetValue("Ok", out var b) && b is true ? 1 : 0);
+
+        // ---- VM / 可视树状态快照：作为 PNG 的**机器可核对旁证** ----
+        var state = TryCaptureVmState(window);
+        info["llmUiState"] = state;
+        info["llmUiStateAvailable"] = state is not null;
+        info["visualTreeProbe"] = TryProbeVisualTree(window);
+
+        info["startupSteps"] = orchestrator.Steps
+            .Select(s => new Dictionary<string, object?>
+            {
+                ["key"] = s.Key.ToString(),
+                ["name"] = s.Name,
+                ["status"] = s.Status.ToString(),
+                ["detail"] = s.Detail,
+            })
+            .ToList();
+        info["startupComplete"] = orchestrator.IsComplete;
+
+        // ok 必须反映**实际**捕获结果：两条通道都失败或状态快照取不到即 false（不输出恒真证据）。
+        info["ok"] = primaryOk && state is not null;
+
+        // ★ 主通道：每个状态各输出一行 WDB_GALLERY_GUI {json}（WSL 侧据此逐态核对；
+        //   注意此处**必须**真的 Emit —— 漏掉它会让三态证据只存在于磁盘文件里，
+        //   协议通道上只剩 Finish 的汇总行，WSL 侧就会误判"没捕获到"）。
+        Emit(info);
+
+        // 每个状态的完整证据单独落盘（便于 WSL 侧经 /mnt/c 直接取用复核）。
+        try
+        {
+            File.WriteAllText(Path.Combine(root, "wdb-gallery-gui-evidence-" + phase + ".json"),
+                JsonSerializer.Serialize(info));
+        }
+        catch { /* 落盘失败不影响 stdout 主通道 */ }
+
+        return info;
+    }
+
+    private static LlmSettingsViewModel? TryGetLlmVm(Window? window)
+    {
+        try
+        {
+            if (window?.DataContext is MainWindowViewModel main)
+                return main.Settings?.LlmVM;
+        }
+        catch { /* 取不到就按不可用处理（ok=false），绝不伪造 */ }
+        return null;
+    }
+
+    /// <summary>读取 LLM 设置子 ViewModel 的关键状态（只读公开属性，不改任何值）。</summary>
+    private static Dictionary<string, object?>? TryCaptureVmState(Window? window)
+    {
+        var vm = TryGetLlmVm(window);
+        if (vm is null)
+            return null;
+
+        return new Dictionary<string, object?>
+        {
+            ["backend"] = vm.LlmBackend,
+            ["backendLabel"] = vm.SelectedLlmBackendLabel,
+            ["backendLabels"] = vm.LlmBackendLabels,
+            ["isOnlineMode"] = vm.IsOnlineMode,
+            ["showBackendSelector"] = vm.ShowBackendSelector,
+            ["showLocalTierPanel"] = vm.ShowLocalTierPanel,
+            ["showLocalAdvancedPanel"] = vm.ShowLocalAdvancedPanel,
+            ["isLlmAutoMode"] = vm.IsLlmAutoMode,
+            ["llmConfigMode"] = vm.LlmConfigMode,
+            ["onlinePreset"] = vm.LlmOnlinePreset,
+            ["onlinePresetLabel"] = vm.SelectedLlmOnlinePresetLabel,
+            ["onlinePresetLabels"] = vm.LlmOnlinePresetLabels,
+            ["onlineEndpoint"] = vm.LlmOnlineEndpoint,
+            ["onlineModel"] = vm.LlmOnlineModel,
+            ["onlineApiKeyLength"] = vm.LlmOnlineApiKey?.Length ?? 0,
+            ["onlineEndpointWatermark"] = vm.LlmOnlineEndpointWatermark,
+            ["onlineModelWatermark"] = vm.LlmOnlineModelWatermark,
+            ["onlineEndpointHint"] = vm.LlmOnlineEndpointHint,
+            ["onlineModelHint"] = vm.LlmOnlineModelHint,
+            ["llmEnabled"] = vm.LlmEnabled,
+            ["llmDownloadRunning"] = vm.LlmDownloadRunning,
+            ["tierCardCount"] = vm.LlmTierCards?.Count ?? 0,
+        };
+    }
+
+    /// <summary>
+    /// 可视树旁证：从**真实已在屏上渲染的控件**读取关键可见性与下拉项，证明"界面上确实长这样"，
+    /// 而不只是 ViewModel 里布尔值为真。只读，不触发任何交互命令。
+    /// </summary>
+    private static Dictionary<string, object?>? TryProbeVisualTree(Window? window)
+    {
+        if (window is null)
+            return null;
+        try
+        {
+            var probe = new Dictionary<string, object?>();
+            var view = window.GetVisualDescendants().OfType<GalleriesManager.Desktop.Views.SettingsView>().FirstOrDefault();
+            probe["settingsViewPresent"] = view is not null;
+            if (view is null)
+                return probe;
+
+            probe["settingsViewVisible"] = view.IsVisible;
+            probe["settingsViewAttached"] = view.IsAttachedToVisualTree();
+
+            // 内层 TabControl 当前选中的子页标题（应为「LLM 助手」）
+            var tab = view.GetVisualDescendants().OfType<TabControl>().FirstOrDefault();
+            probe["settingsTabIndex"] = tab?.SelectedIndex;
+            if (tab?.SelectedItem is TabItem ti && ti.Header is StackPanel sp)
+                probe["settingsTabHeader"] = sp.GetVisualDescendants().OfType<TextBlock>()
+                    .Select(t => t.Text).FirstOrDefault(t => !string.IsNullOrWhiteSpace(t));
+
+            // 下拉项：把每个 ComboBox 的 ItemsSource 与当前可见性如实列出，供 WSL 侧核对
+            var combos = new List<Dictionary<string, object?>>();
+            foreach (var cb in view.GetVisualDescendants().OfType<ComboBox>())
+            {
+                var items = (cb.ItemsSource as System.Collections.IEnumerable)?
+                    .Cast<object?>().Select(x => x?.ToString()).Where(x => x is not null).ToList()
+                    ?? new List<string?>();
+                combos.Add(new Dictionary<string, object?>
+                {
+                    ["items"] = items,
+                    ["itemCount"] = items.Count,
+                    ["selected"] = cb.SelectedItem?.ToString(),
+                    ["isEffectivelyVisible"] = cb.IsEffectivelyVisible,
+                });
+            }
+            probe["comboBoxes"] = combos;
+
+            // 在线配置卡的两个输入框（按 PlaceholderText 精确定位，不依赖 VisualTree 顺序）
+            var boxes = view.GetVisualDescendants().OfType<TextBox>()
+                .GroupBy(t => t.PlaceholderText ?? string.Empty)
+                .Where(g => g.Key.Length > 0)
+                .ToDictionary(g => g.Key, g => new Dictionary<string, object?>
+                {
+                    ["count"] = g.Count(),
+                    ["isEffectivelyVisible"] = g.Count(t => t.IsEffectivelyVisible),
+                    ["text"] = g.Select(t => t.Text ?? string.Empty).Distinct().ToList(),
+                    ["isPasswordBox"] = g.Any(t => t.PasswordChar != '\0'),
+                });
+            probe["textBoxesByPlaceholder"] = boxes;
+
+            // ---- 在线卡"是否被视口裁切"的机器判据数据源（缺陷 2 防回归）----
+            // 语义：取**在线卡里最底部的可见控件**（模型名称输入框下方的提示行）的有效边界底边，
+            // 与承载它的 ScrollViewer 视口底边比较；等价判据是"该态无垂直滚动需求"
+            // （ExtentHeight <= ViewportHeight）。两者都写进自证 JSON，由 WSL 侧判定。
+            probe["viewportFit"] = MeasureViewportFit(view, boxes);
+            return probe;
+        }
+        catch (Exception ex)
+        {
+            return new Dictionary<string, object?> { ["error"] = ex.GetType().Name + ": " + ex.Message };
+        }
+    }
+
+    /// <summary>
+    /// 量测"LLM 子页内容是否被视口裁切"：找承载 LLM 子页的 ScrollViewer，比较
+    ///   * 滚动需求：ExtentHeight vs ViewportHeight（相等以内 = 不需要垂直滚动）；
+    ///   * 最底部可见控件（在线卡的"模型名称"输入框及其下方提示行）的有效边界底边是否落在视口内。
+    /// 只读几何，不做任何滚动/交互。取不到时如实返回 null（上层 fail closed，绝不默认成功）。
+    /// </summary>
+    private static Dictionary<string, object?>? MeasureViewportFit(
+        GalleriesManager.Desktop.Views.SettingsView view, Dictionary<string, Dictionary<string, object?>> boxes)
+    {
+        try
+        {
+            // 1) 定位承载 LLM 子页的 ScrollViewer：以"包含在线卡输入框的祖先"为准，避免误取其它子页的滚动容器。
+            ScrollViewer? scroller = null;
+            foreach (var key in boxes.Keys)
+            {
+                var tb = view.GetVisualDescendants().OfType<TextBox>()
+                    .FirstOrDefault(t => (t.PlaceholderText ?? string.Empty) == key);
+                if (tb is null) continue;
+                scroller = tb.GetVisualAncestors().OfType<ScrollViewer>().FirstOrDefault();
+                if (scroller is not null) break;
+            }
+            if (scroller is null)
+                return new Dictionary<string, object?> { ["error"] = "未找到承载在线卡的 ScrollViewer" };
+
+            // 2) 最底部可见控件：模型名称输入框下方的提示行（NoWrap 单行）。按"是否仍属于在线卡"判定：
+            //    其垂直位置在模型输入框底部附近、且自身可见。
+            var modelBox = view.GetVisualDescendants().OfType<TextBox>()
+                .FirstOrDefault(t => (t.PlaceholderText ?? string.Empty).Contains("留空即用预设首选模型")
+                             || (t.PlaceholderText ?? string.Empty).StartsWith("填写模型名", StringComparison.Ordinal));
+            var modelBoxBottom = modelBox is null ? double.NaN : BoundsBottomIn(modelBox, scroller);
+
+            TextBlock? bottomText = null;
+            double bottomTextBottom = double.NegativeInfinity;
+            foreach (var t in view.GetVisualDescendants().OfType<TextBlock>())
+            {
+                if (!t.IsEffectivelyVisible || string.IsNullOrWhiteSpace(t.Text)) continue;
+                if (modelBox is null || double.IsNaN(modelBoxBottom)) continue;
+                var top = BoundsTopIn(t, scroller);
+                // 模型输入框底部下方 0~40px 内的首个文本行 = 模型提示行
+                if (top >= modelBoxBottom - 2 && top <= modelBoxBottom + 40)
+                {
+                    var bot = BoundsBottomIn(t, scroller);
+                    if (bot > bottomTextBottom)
+                    {
+                        bottomTextBottom = bot;
+                        bottomText = t;
+                    }
+                }
+            }
+
+            var extentH = scroller.Extent.Height;
+            var viewportH = scroller.Viewport.Height;
+            var offsetY = scroller.Offset.Y;
+            var scrollBarVisible = false;
+            var vbar = scroller.GetVisualDescendants().OfType<ScrollBar>()
+                .FirstOrDefault(b => b.Orientation == Avalonia.Layout.Orientation.Vertical);
+            if (vbar is not null)
+                scrollBarVisible = vbar.IsEffectivelyVisible;
+
+            // ---- 绝对坐标（相对 **窗口客户区**）：不依赖 Extent/Viewport 语义，实测把校验钉死在几何上 ----
+            var window = view.GetVisualAncestors().OfType<Window>().FirstOrDefault();
+            var winClientH = window?.ClientSize.Height ?? double.NaN;
+            var scrollerTopInWindow = window is null ? double.NaN : BoundsTopIn(scroller, window);
+            var scrollerBottomInWindow = window is null ? double.NaN : BoundsBottomIn(scroller, window);
+            var modelBoxTopInWindow = (window is null || modelBox is null) ? double.NaN : BoundsTopIn(modelBox, window);
+            var modelBoxBottomInWindow = (window is null || modelBox is null) ? double.NaN : BoundsBottomIn(modelBox, window);
+            var bottomHintBottomInWindow = (window is null || bottomText is null) ? double.NaN : BoundsBottomIn(bottomText, window);
+
+            // 最底部可见控件的判定（窗口坐标）：模型输入框之下、仍在滚动视口内的最低可见文本。
+            // 与"模型输入框下方 40px"那套不同，这一条与具体文案无关，因此对四个状态都成立。
+            double lowestTextBottomInWindow = double.NaN;
+            string? lowestText = null;
+            if (window is not null)
+            {
+                foreach (var t in view.GetVisualDescendants().OfType<TextBlock>())
+                {
+                    if (!t.IsEffectivelyVisible || string.IsNullOrWhiteSpace(t.Text)) continue;
+                    var botW = BoundsBottomIn(t, window);
+                    if (!IsFinite(botW)) continue;
+                    if (botW > lowestTextBottomInWindow || double.IsNaN(lowestTextBottomInWindow))
+                    {
+                        lowestTextBottomInWindow = botW;
+                        lowestText = t.Text;
+                    }
+                }
+            }
+
+            // 权威判定（窗口坐标，不依赖视口元数据）：最后一行文本的底边必须落在窗口客户区内、
+            // 且不超出滚动视口底边 —— 这正是"底部文案被裁半行"的几何反例。
+            var bottomLineVisible = IsFinite(lowestTextBottomInWindow) && IsFinite(winClientH)
+                                    && lowestTextBottomInWindow <= winClientH + 0.5
+                                    && (!IsFinite(scrollerBottomInWindow)
+                                        || lowestTextBottomInWindow <= scrollerBottomInWindow + 0.5);
+
+            var noScrollNeeded = extentH <= viewportH + 0.5;
+            var bottomInside = IsFinite(bottomTextBottom) && bottomTextBottom <= viewportH + 0.5;
+            var fits = noScrollNeeded && bottomInside && bottomLineVisible;
+
+            return new Dictionary<string, object?>
+            {
+                ["scope"] = "llm-tab-scrollviewer",
+                ["extentHeight"] = Finite(extentH),
+                ["viewportHeight"] = Finite(viewportH),
+                ["offsetY"] = Finite(offsetY),
+                ["noVerticalScrollNeeded"] = noScrollNeeded,
+                ["verticalScrollBarVisible"] = scrollBarVisible,
+                ["bottomMostControlText"] = bottomText?.Text,
+                ["bottomMostControlBottom"] = Finite(bottomTextBottom),
+                ["bottomWithinViewport"] = bottomInside,
+                ["modelTextBoxBottom"] = Finite(modelBoxBottom),
+                ["fits"] = fits,
+                // 绝对坐标（相对窗口客户区）——判定的权威依据，语义无歧义：
+                ["windowClientHeight"] = Finite(winClientH),
+                ["scrollerTopInWindow"] = Finite(scrollerTopInWindow),
+                ["scrollerBottomInWindow"] = Finite(scrollerBottomInWindow),
+                ["modelTextBoxTopInWindow"] = Finite(modelBoxTopInWindow),
+                ["modelTextBoxBottomInWindow"] = Finite(modelBoxBottomInWindow),
+                ["bottomHintBottomInWindow"] = Finite(bottomHintBottomInWindow),
+                ["lowestVisibleText"] = lowestText,
+                ["lowestVisibleTextBottomInWindow"] = Finite(lowestTextBottomInWindow),
+                ["bottomLineVisible"] = bottomLineVisible,
+            };
+        }
+        catch (Exception ex)
+        {
+            return new Dictionary<string, object?> { ["error"] = ex.GetType().Name + ": " + ex.Message };
+        }
+    }
+
+    private static double BoundsTopIn(Avalonia.Visual v, Avalonia.Visual relativeTo)
+    {
+        var p = v.TranslatePoint(new Point(0, 0), relativeTo);
+        return p?.Y ?? double.NaN;
+    }
+
+    private static double BoundsBottomIn(Avalonia.Visual v, Avalonia.Visual relativeTo)
+    {
+        var p = v.TranslatePoint(new Point(0, 0), relativeTo);
+        return p is null ? double.NaN : p.Value.Y + v.Bounds.Height;
+    }
+
+    private static bool IsFinite(double d) => !double.IsNaN(d) && !double.IsInfinity(d);
+
+    /// <summary>
+    /// 把几何量写成可 JSON 序列化的值：非有限值（NaN/±∞，本探针用它们表示"未找到控件"）
+    /// 一律写成 null。
+    /// ★ 必须自己判有限性：`Math.Round(double.PositiveInfinity)` 会抛 ArgumentException，
+    /// 而异常发生在 Emit 序列化期会让**整个状态的协议行丢失**（2026-10-12 实测：状态 D 因此消失，
+    /// 且 Finish 聚合仍显示 4/4 全好）——这是最危险的一类静默证据丢失。
+    /// </summary>
+    private static object? Finite(double d) => IsFinite(d) ? Math.Round(d, 1) : (object?)null;
+
+    /// <summary>通道 A：Avalonia RenderTargetBitmap —— 只渲染本应用自己的可视树。</summary>
+    private static Dictionary<string, object?> CaptureAvaloniaPng(Avalonia.Controls.Window? window, string pngPath)
+    {
+        var r = new Dictionary<string, object?> { ["Method"] = "avalonia-rendertargetbitmap", ["Ok"] = false };
+        try
+        {
+            if (window is null)
+            {
+                r["Error"] = "MainWindow is null";
+                return r;
+            }
+            var w = (int)Math.Round(window.ClientSize.Width);
+            var h = (int)Math.Round(window.ClientSize.Height);
+            if (w <= 0 || h <= 0)
+            {
+                r["Error"] = $"invalid client size {w}x{h}";
+                return r;
+            }
+            var rtb = new RenderTargetBitmap(new PixelSize(w, h), new Vector(96, 96));
+            rtb.Render(window);
+            rtb.Save(pngPath);
+            rtb.Dispose();
+
+            r["Path"] = pngPath;
+            r["Width"] = w;
+            r["Height"] = h;
+            r["Bytes"] = new FileInfo(pngPath).Length;
+            r["Sha256"] = Sha256File(pngPath);
+            r["Ok"] = true;
+        }
+        catch (Exception ex)
+        {
+            r["Error"] = ex.GetType().Name + ": " + ex.Message;
+        }
+        return r;
+    }
+
+    /// <summary>通道 B：纯 Win32 PrintWindow(自己的 HWND) → 手工 24bpp BMP（原始像素可被 probe 解析）。</summary>
+    private static Dictionary<string, object?> CaptureWin32Bmp(nint hwnd, string bmpPath)
+    {
+        var r = new Dictionary<string, object?> { ["Method"] = "win32-printwindow-hwnd", ["Ok"] = false };
+        try
+        {
+            if (hwnd == 0)
+            {
+                r["Error"] = "hwnd is 0";
+                return r;
+            }
+            if (!OperatingSystem.IsWindows())
+            {
+                r["Error"] = "not windows";
+                return r;
+            }
+            if (!NativeMethods.GetWindowRect(hwnd, out var wr))
+            {
+                r["Error"] = "GetWindowRect failed";
+                return r;
+            }
+            var w = wr.Right - wr.Left;
+            var h = wr.Bottom - wr.Top;
+            if (w <= 0 || h <= 0)
+            {
+                r["Error"] = $"invalid window size {w}x{h}";
+                return r;
+            }
+            if (!NativeMethods.PrintWindowToBmp(hwnd, w, h, bmpPath, out var flagsUsed, out var uniform))
+            {
+                r["Error"] = "PrintWindowToBmp returned false";
+                return r;
+            }
+
+            r["Path"] = bmpPath;
+            r["Width"] = w;
+            r["Height"] = h;
+            r["Bytes"] = new FileInfo(bmpPath).Length;
+            r["Sha256"] = Sha256File(bmpPath);
+            r["FlagsUsed"] = "0x" + flagsUsed.ToString("X");
+            // 单一色 = PrintWindow 没拿到真实合成内容。Avalonia 走 Skia/ANGLE 的 GPU 合成，
+            // PrintWindow（即使 PW_RENDERFULLCONTENT）常只能得到全黑；这是**环境限制**而非失败：
+            // 窗口"真的被画过"由 Avalonia RenderTargetBitmap 的 PNG 通道独立证明（见 shotPng*）。
+            r["Uniform"] = uniform;
+            r["Note"] = uniform ? "PrintWindow 得到单一色（GPU 合成窗口的已知限制）；以 PNG 通道为准" : null;
+            r["Ok"] = true;
+        }
+        catch (Exception ex)
+        {
+            r["Error"] = ex.GetType().Name + ": " + ex.Message;
+        }
+        return r;
+    }
+
+    private static string Sha256File(string path)
+    {
+        using var sha = SHA256.Create();
+        using var fs = File.OpenRead(path);
+        return Convert.ToHexString(sha.ComputeHash(fs)).ToLowerInvariant();
+    }
+
+    /// <summary>向 stdout 输出协议行（纯 ASCII：非 ASCII 字符由 JSON 序列化器转义为 \uXXXX）。</summary>
+    private static void Emit(Dictionary<string, object?> payload)
+    {
+        try
+        {
+            var json = JsonSerializer.Serialize(payload);
+            Console.Out.WriteLine(Prefix + json);
+            Console.Out.Flush();
+        }
+        catch (Exception ex)
+        {
+            // ★ 序列化失败绝不能让整条协议行消失（2026-10-12 实测：状态 D 因 Math.Round(±∞) 抛
+            //   ArgumentException 而**完全没有输出**，WSL 侧只看得到 3/4 个状态）。
+            //   这里退化为**手写 JSON** 的最小事实行：阶段名 + 异常类型 + 消息（消息里的引号做转义）。
+            try
+            {
+                var phase = payload.TryGetValue("phase", out var ph) ? ph?.ToString() ?? "" : "";
+                var stage = payload.TryGetValue("stage", out var st) ? st?.ToString() ?? "" : "";
+                var msg = (ex.Message ?? "").Replace("\\", "/").Replace("\"", "'");
+                Console.Out.WriteLine(Prefix + "{\"ok\":false,\"stage\":\"" + stage
+                                      + "\",\"phase\":\"" + phase + "\",\"pid\":" + Environment.ProcessId
+                                      + ",\"error\":\"" + ex.GetType().Name + ": " + msg + "\"}");
+                Console.Out.Flush();
+            }
+            catch { /* 输出通道不可用时只能放弃 */ }
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RECT
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BITMAPINFOHEADER
+    {
+        public int biSize;
+        public int biWidth;
+        public int biHeight;
+        public short biPlanes;
+        public short biBitCount;
+        public int biCompression;
+        public int biSizeImage;
+        public int biXPelsPerMeter;
+        public int biYPelsPerMeter;
+        public int biClrUsed;
+        public int biClrImportant;
+    }
+
+    private static class NativeMethods
+    {
+        // 这三个常量必须是 uint：new[]{ PW_RENDERFULLCONTENT, PW_CLIENTONLY } 会被推断成 int[]，
+        // 而 PrintWindow 的第 3 参是 uint，int 变量不能隐式转换（Linux 编译门已实测捕获）。
+        private const uint PW_RENDERFULLCONTENT = 0x00000002;
+        private const uint PW_CLIENTONLY = 0x00000001;
+        private const uint DIB_RGB_COLORS = 0;
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool IsWindowVisible(nint hWnd);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool GetWindowRect(nint hWnd, out RECT lpRect);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool GetClientRect(nint hWnd, out RECT lpRect);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool PrintWindow(nint hwnd, nint hdcBlt, uint nFlags);
+
+        // 取**自己窗口**的 DC，仅作内存 DC 的「格式参考」；绝不对任何 DC 做 BitBlt，也绝不取桌面 DC。
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern nint GetDC(nint hWnd);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern int ReleaseDC(nint hWnd, nint hDC);
+
+        [DllImport("gdi32.dll", SetLastError = true)]
+        private static extern nint CreateCompatibleDC(nint hdc);
+
+        // CreateDIBSection：直接得到一块**真 24bpp BI_RGB** 的 DIB，像素格式由 DIB header 决定，
+        // 与 DC 当前选中的位图（CreateCompatibleDC 后初始是 1x1 单色）彻底无关。
+        [DllImport("gdi32.dll", SetLastError = true)]
+        private static extern nint CreateDIBSection(nint hdc, ref BITMAPINFOHEADER pbmi, uint usage, out nint ppvBits, nint hSection, uint offset);
+
+        [DllImport("gdi32.dll", SetLastError = true)]
+        private static extern nint SelectObject(nint hdc, nint h);
+
+        [DllImport("gdi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool DeleteObject(nint ho);
+
+        [DllImport("gdi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool DeleteDC(nint hdc);
+
+        /// <summary>
+        /// 用 PrintWindow 把**指定 HWND** 画进内存 DIB，并手工写 24bpp BMP（不依赖任何图像库）。
+        ///
+        /// 关键修复（父代理 2026-10-12 指出的两处真实缺陷）：
+        ///   1) 旧实现 CreateCompatibleDC(0) + CreateCompatibleBitmap(memDc,w,h)：新建内存 DC 初始选中的是
+        ///      1x1 **单色**位图，因此 compatible bitmap 会按**单色**格式创建，随后按 24bpp 调 GetDIBits
+        ///      必然拿不到真彩色。现改为 **CreateDIBSection**，直接申请真 24bpp BI_RGB 的 DIB，
+        ///      格式与 DC 当前位图无关；内存 DC 的格式参考取自**自己窗口**的 GetDC(hwnd)。
+        ///   2) 旧实现在位图**仍被选入 DC** 时调用 GetDIBits（MSDN 要求位图不得被选入 DC）。
+        ///      现直接读 CreateDIBSection 返回的 ppvBits 内存，**完全不调用 GetDIBits**，该限制自然消失。
+        /// 全程不做 BitBlt、不取桌面 DC ⇒ 只可能捕获**本窗口自己**。
+        /// </summary>
+        internal static bool PrintWindowToBmp(nint hwnd, int w, int h, string outPath, out uint flagsUsed, out bool uniform)
+        {
+            flagsUsed = 0;
+            uniform = false;
+            if (hwnd == 0) return false;
+
+            var stride = ((w * 3 + 3) / 4) * 4;
+            var size = stride * h;
+
+            var header = new BITMAPINFOHEADER
+            {
+                biSize = Marshal.SizeOf<BITMAPINFOHEADER>(),
+                biWidth = w,
+                biHeight = h,          // 正数 = bottom-up，与 BMP 行序一致，无需翻转
+                biPlanes = 1,
+                biBitCount = 24,       // 真 24bpp
+                biCompression = 0,     // BI_RGB
+                biSizeImage = size,
+                biXPelsPerMeter = 2835,
+                biYPelsPerMeter = 2835,
+            };
+
+            var hdcWindow = GetDC(hwnd);                 // 仅自己窗口；仅作格式参考
+            if (hdcWindow == 0) return false;
+            var memDc = CreateCompatibleDC(hdcWindow);
+            if (memDc == 0) { ReleaseDC(hwnd, hdcWindow); return false; }
+
+            var hbm = CreateDIBSection(memDc, ref header, DIB_RGB_COLORS, out var ppvBits, 0, 0);
+            if (hbm == 0 || ppvBits == 0) { DeleteDC(memDc); ReleaseDC(hwnd, hdcWindow); return false; }
+
+            var old = SelectObject(memDc, hbm);
+            try
+            {
+                var pixels = new byte[size];
+
+                // 先 PW_RENDERFULLCONTENT（向 DWM 要完整合成内容）；若整幅仍是单一色，再退到 PW_CLIENTONLY。
+                // 记录实际生效的旗标与"是否单一色"，供上层/WSL 侧如实呈现（不做任何 BitBlt、不取桌面 DC）。
+                foreach (var flags in new[] { PW_RENDERFULLCONTENT, PW_CLIENTONLY })
+                {
+                    if (!PrintWindow(hwnd, memDc, flags))
+                        continue;
+                    flagsUsed = flags;
+                    Marshal.Copy(ppvBits, pixels, 0, size);   // 直接读 DIB 内存；无需 GetDIBits、无需先反选
+                    uniform = IsUniform(pixels);
+                    if (!uniform)
+                        break;
+                }
+
+                using var fs = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.None);
+                using var bw = new BinaryWriter(fs);
+                const int offBits = 14 + 40;
+                bw.Write((byte)'B'); bw.Write((byte)'M');
+                bw.Write(offBits + size);
+                bw.Write(0);
+                bw.Write(offBits);
+                bw.Write(40);
+                bw.Write(w);
+                bw.Write(h);
+                bw.Write((short)1);
+                bw.Write((short)24);
+                bw.Write(0);
+                bw.Write(size);
+                bw.Write(2835);
+                bw.Write(2835);
+                bw.Write(0);
+                bw.Write(0);
+                bw.Write(pixels);
+                return true;
+            }
+            finally
+            {
+                if (old != 0) SelectObject(memDc, old);
+                DeleteObject(hbm);
+                DeleteDC(memDc);
+                ReleaseDC(hwnd, hdcWindow);
+            }
+        }
+
+        /// <summary>整幅是否只有一种 R/G/B 组合（用于判定 PrintWindow 是否真的画出了内容）。</summary>
+        private static bool IsUniform(byte[] px)
+        {
+            if (px.Length < 3) return true;
+            byte b0 = px[0], b1 = px[1], b2 = px[2];
+            for (var i = 3; i + 2 < px.Length; i += 3)
+            {
+                if (px[i] != b0 || px[i + 1] != b1 || px[i + 2] != b2)
+                    return false;
+            }
+            return true;
+        }
+    }
+}

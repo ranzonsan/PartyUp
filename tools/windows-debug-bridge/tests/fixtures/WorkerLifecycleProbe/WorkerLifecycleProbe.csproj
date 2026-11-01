@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Worker 生命周期探针（fixture，纯 BCL）。
+    由主桥（真实 Windows Worker）以 build-run 任务启动；它自己再拉起一个「专用副 Worker」
+    （本 exe 的 secondary-worker 子模式 → 公共 Worker.RunAsync），用来自证：
+      * 副 Worker 在外层主 Job 之内、又能给自己的子进程建嵌套 Job（Assign 成功才算跑通）；
+      * shutdown 标记能主动清掉副 Worker 的整棵树；
+      * 强杀副 Worker（只 Kill 自己 Process.Start 得到的对象）触发 KILL_ON_JOB_CLOSE 清树；
+      * 同一 queue 重启后旧任务写 interrupted 且绝不重放。
+
+    刻意自包含：显式声明 TargetFramework/OutputType，不依赖仓库根的 Directory.Build.props
+    与 Directory.Packages.props；除 ProjectReference 桥本体外不引任何 NuGet 包。
+    注意：本工程位于 tools/windows-debug-bridge/tests/**，已被 Bridge.csproj 从自己的编译项里排除，
+    不会污染桥的构建。
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>WorkerLifecycleProbe</AssemblyName>
+    <RootNamespace>Wdb.LifecycleProbe</RootNamespace>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <IsPackable>false</IsPackable>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 只为调用公共 API：Worker.RunAsync / BridgeJson / Request / BridgeLayout -->
+    <ProjectReference Include="../../../Bridge.csproj" />
+  </ItemGroup>
+
+</Project>

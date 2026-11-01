@@ -1,0 +1,9 @@
+bin/
+obj/
+artifacts/
+.vs/
+*.user
+.wdb/
+third_party/libwebrtc/*.7z
+third_party/libwebrtc/*.zip
+third_party/libwebrtc/

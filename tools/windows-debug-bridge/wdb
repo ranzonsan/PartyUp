@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Windows 调试桥 · WSL 侧 CLI 启动器
+#
+#   tools/windows-debug-bridge/wdb doctor --json
+#   tools/windows-debug-bridge/wdb run --project src/GalleriesManager.Desktop/GalleriesManager.Desktop.csproj
+#
+# 只做两件事：必要时构建一次（按时间戳增量），然后把 argv 原样交给 dotnet exec。
+# 本脚本自身不解析、不拼接任何用户参数，也不经 shell 执行任何命令。
+set -euo pipefail
+
+dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cfg="${WDB_CONFIGURATION:-Release}"
+dll="$dir/bin/$cfg/net10.0/wdb.dll"
+
+needs_build=0
+if [[ ! -f "$dll" ]]; then
+  needs_build=1
+elif [[ "$dir/Bridge.csproj" -nt "$dll" ]]; then
+  needs_build=1
+else
+  while IFS= read -r -d '' src; do
+    if [[ "$src" -nt "$dll" ]]; then
+      needs_build=1
+      break
+    fi
+  done < <(find "$dir" -maxdepth 2 -name '*.cs' -not -path '*/obj/*' -not -path '*/bin/*' -print0 2>/dev/null)
+fi
+
+if [[ "${WDB_REBUILD:-0}" != "0" ]]; then
+  needs_build=1
+fi
+
+if [[ "$needs_build" -eq 1 ]]; then
+  echo "[wdb] 构建 $dir ($cfg)" >&2
+  dotnet build "$dir/Bridge.csproj" -c "$cfg" --nologo -nodeReuse:false -p:UseSharedCompilation=false >&2
+fi
+
+exec dotnet "$dll" "$@"

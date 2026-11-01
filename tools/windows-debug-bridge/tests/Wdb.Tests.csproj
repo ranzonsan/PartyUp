@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    离线自运行测试 harness：纯 BCL + 反射，零 NuGet（不引 xunit / Microsoft.NET.Test.Sdk）。
+    入口：dotnet run 本 csproj（过滤参数见 Program.cs 与 Harness.ArgValue）。
+    退出码：0 = 全绿；1 = 有失败项；2 = harness 自身异常。
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>Wdb.Tests</AssemblyName>
+    <RootNamespace>Wdb.Tests</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <IsPackable>false</IsPackable>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      主项目（Bridge.csproj，AssemblyName=wdb）直连引用：
+      单元测试走进程内 API；集成测试以子进程方式运行 wdb.dll（argv 数组传递，不经 shell）。
+      Bridge.csproj 已在自身排除 tests/**，两边不会互相污染编译项。
+    -->
+    <ProjectReference Include="../Bridge.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- fixtures 是被测程序（EchoApp），自己的 Main 与桥无关，不得进测试程序集 -->
+    <Compile Remove="fixtures/**/*.cs" />
+    <None Remove="fixtures/**" />
+    <!-- 测试运行期的临时目录（queue/runs/快照），永不参与编译 -->
+    <Compile Remove=".tmp/**/*.cs" />
+    <None Remove=".tmp/**" />
+  </ItemGroup>
+
+</Project>

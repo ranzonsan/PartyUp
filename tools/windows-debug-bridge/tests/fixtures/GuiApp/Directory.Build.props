@@ -1,0 +1,27 @@
+<Project>
+
+  <!--
+    局部 Directory.Build.props —— 唯一作用：**阻断 repo 祖父级 Directory.Build.props 的继承**。
+
+    MSBuild 向上查找 Directory.Build.props 时，在**第一个命中的目录**停止并只导入那一份；
+    本文件位于 tests/fixtures/GuiApp/，只对 GuiApp 目录之下的项目生效（兄弟 fixture EchoApp /
+    ProcessProbe 不受影响）。
+
+    为什么必须阻断：Windows 调试桥会把仓库源码快照复制到仓库之外
+    （%LOCALAPPDATA%\WslDebugBridge\runs\<id>\src）再构建，那份快照里同样带着仓库根的
+    Directory.Build.props / Directory.Packages.props（打开 ManagePackageVersionsCentrally、
+    CentralPackageTransitivePinningEnabled 等中央包管理属性）。本夹具是**零 NuGet 的纯 BCL WinExe**，
+    必须在离线、无中央包管理的干净前提下自行求值框架属性，故在此显式声明本地框架属性。
+
+    本文件不 Import 任何父级 props —— 这正是阻断的实现方式。
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>WinExe</OutputType>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+
+</Project>

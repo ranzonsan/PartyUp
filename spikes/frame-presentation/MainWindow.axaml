@@ -1,0 +1,18 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="SpikeFrame.MainWindow"
+        Width="1280" Height="800"
+        Background="#FF101014"
+        Title="PartyUp Spike 1 · 1080p60 Frame Presentation">
+
+  <Grid>
+    <Image Name="Surface" Stretch="Uniform" RenderOptions.BitmapInterpolationMode="LowQuality" />
+
+    <Border Background="#CC000000" CornerRadius="6"
+            Margin="12" Padding="12,8"
+            HorizontalAlignment="Left" VerticalAlignment="Top">
+      <TextBlock Name="Stats" Foreground="#FFEDEDED" FontFamily="Consolas" FontSize="13"
+                 Text="starting…" />
+    </Border>
+  </Grid>
+</Window>

@@ -1,0 +1,45 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    GalleryGuiProbe —— 「真实 Avalonia 画廊应用隔离 GUI 验收」的 **Windows 侧只读探针**（fixture）。
+
+    定位：由 Windows 调试桥以**独立 job** 在 Windows 上执行，为真实应用 GUI 验收提供三件**应用自身报告之外**的
+    独立证据（子命令见 Program.cs 头部注释）：
+      1) baseline    ：读取用户真实的 %LOCALAPPDATA%\galleries-manager 与 galleries-manager-dev 的
+                       **元数据 + 必要内容哈希清单**（运行前 / 运行后各跑一次，两份必须逐字节一致）。
+                       这是「隔离运行没有触碰用户真实数据」的**硬判据**。
+      2) verify-shot ：在 Windows 侧独立解析应用自己写出的截图（BMP 原始像素 / PNG 尺寸），
+                       证明「窗口真的被绘制过」，而不是一个空洞的占位文件。
+      3) window-probe：按 PID 枚举顶层窗口（可选补充证据；应用约 7.5s 自动退出故窗口存活期很短）。
+
+    硬性约束（与 EchoApp / ProcessProbe / GuiApp 同款）：
+      * 纯 .NET 10 BCL、零 NuGet、零 ProjectReference、零第三方库（桥把源码复制到仓库之外离线构建）；
+      * 只 P/Invoke user32.dll（EnumWindows 等），不引用 WinForms / WPF / System.Drawing；
+      * **只读**：绝不创建、修改、删除、移动任何文件；除显式 out 参数外不写盘；
+      * 绝不把任何文件内容写进日志或 JSON —— 只输出路径、大小、mtime 与 SHA256 摘要
+        （哈希不是内容，故即使扫到含凭据的库文件也不会泄露凭据）；
+      * 读不到（权限 / IO 失败）时 **fail closed**：退出码 3 并标注 failClosed=true，
+        绝不让上层把「读不到」误判成「一致」。
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>GalleryGuiProbe</AssemblyName>
+    <RootNamespace>GalleryGuiProbe</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <IsPackable>false</IsPackable>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <!--
+      Directory.Packages.props 由 NuGet 用 GetPathOfFileAbove 独立向上查找，不受本目录 Directory.Build.props 阻断。
+      本夹具零 PackageReference，故在项目体内把中央包管理开关显式压回 false（项目体求值晚于所有 props 导入）。
+    -->
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+    <CentralPackageTransitivePinningEnabled>false</CentralPackageTransitivePinningEnabled>
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
+  </PropertyGroup>
+
+</Project>

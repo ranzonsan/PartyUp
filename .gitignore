@@ -7,3 +7,6 @@ artifacts/
 third_party/libwebrtc/*.7z
 third_party/libwebrtc/*.zip
 third_party/libwebrtc/
+# 构建产物（partyup_media.dll / 冒烟 exe / dumpbin 输出）
+src/media-core/out/
+spikes/*/out/

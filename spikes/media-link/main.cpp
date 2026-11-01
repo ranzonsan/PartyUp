@@ -1,7 +1,10 @@
-// Spike 2 第三步：同一进程内建两个 PeerConnection，交换 offer/answer，确认 ICE + DTLS 真的建起来。
+// Spike 2：第三步（双连接 ICE/DTLS/SCTP）+ 第四步（一路合成视频轨，PC1 编码、PC2 解出帧）。
 //
-// 前两步只证明了「静态库能链接」「工厂和连接对象能创建」；这一步才真正跑媒体链路：
-// ICE 连通性检查（UDP 回环）+ DTLS 握手 + SCTP 数据通道。
+// 第三步证明了「静态库能链接」「工厂和连接对象能创建」「同进程两条连接能连通」；
+// 第四步补上媒体本身：合成 I420 帧 → 视频轨 → AddTrack → 协商 m=video → VP8 编码出包
+// → PC2 收包解码 → sink 回调计数。闭环判据有两条，缺一不可：
+//   * PC1 GetStats 的 outbound-rtp.packetsSent > 0（RTP 真的出去了）
+//   * PC2 的 VideoSinkInterface::OnFrame 计数 > 0（对端真的解出了帧）
 //
 // 线程模型（这一步最容易踩坑的地方）：
 //   * PeerConnection 的方法要在它所属的 signaling 线程上调用，所以主线程把每一步
@@ -15,24 +18,47 @@
 //   * 建连接用 CreatePeerConnectionOrError（返回 RTCErrorOr），error().message() 是 const char*
 //   * 连接状态读 peer_connection_state()（旧版本叫 connection_state()）
 //   * OnIceCandidate 的参数是 webrtc::IceCandidate（不再是 IceCandidateInterface）
+//   * 媒体默认是关的：必须自己装 video_encoder/decoder_factory + EnableMedia(deps)
+//   * VideoTrackInterface 已经没有 SetSink()，挂 sink 走 AddOrUpdateSink()
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
 
+#include "api/audio_codecs/builtin_audio_decoder_factory.h"
+#include "api/audio_codecs/builtin_audio_encoder_factory.h"
 #include "api/create_modular_peer_connection_factory.h"
 #include "api/data_channel_interface.h"
+#include "api/enable_media.h"
 #include "api/jsep.h"
+#include "api/media_stream_interface.h"
+#include "api/media_types.h"
 #include "api/peer_connection_interface.h"
+#include "api/rtp_receiver_interface.h"
+#include "api/rtp_transceiver_interface.h"
 #include "api/set_local_description_observer_interface.h"
 #include "api/set_remote_description_observer_interface.h"
+#include "api/stats/rtc_stats_collector_callback.h"
+#include "api/stats/rtc_stats_report.h"
+#include "api/stats/rtcstats_objects.h"
+#include "api/video/i420_buffer.h"
+#include "api/video/video_broadcaster.h"
+#include "api/video/video_frame.h"
+#include "api/video/video_sink_interface.h"
+#include "api/video_codecs/video_decoder_factory_template.h"
+#include "api/video_codecs/video_decoder_factory_template_libvpx_vp8_adapter.h"
+#include "api/video_codecs/video_encoder_factory_template.h"
+#include "api/video_codecs/video_encoder_factory_template_libvpx_vp8_adapter.h"
 #include "api/webrtc_sdp.h"
+#include "pc/video_track.h"
 #include "rtc_base/ref_counted_object.h"
 #include "rtc_base/win32_socket_init.h"
 #include "rtc_base/thread.h"
@@ -143,7 +169,9 @@ struct CandidateCopy {
 
 class PcObserver final : public webrtc::PeerConnectionObserver {
  public:
-  explicit PcObserver(std::string name) : name_(std::move(name)) {}
+  // video_sink 非空时，收到远端视频轨就挂上去（PC2 用；PC1 传 nullptr）。
+  PcObserver(std::string name, webrtc::VideoSinkInterface<webrtc::VideoFrame>* video_sink)
+      : name_(std::move(name)), video_sink_(video_sink) {}
 
   void OnSignalingChange(PeerConnection::SignalingState state) override {
     std::printf("[%s] signaling_state=%s\n", name_.c_str(), StateName(state).c_str());
@@ -184,11 +212,21 @@ class PcObserver final : public webrtc::PeerConnectionObserver {
 
   void OnRenegotiationNeeded() override {}
 
+  // Unified Plan 下远端有新的 m= 段落时先调 OnTrack；OnAddTrack 是兼容旧语义的
+  // 同义回调，两个都挂一遍最保险（重复挂同一个 sink 对 VideoBroadcaster 是幂等的）。
+  void OnTrack(webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver) override {
+    if (transceiver == nullptr) return;
+    AttachVideoSink(transceiver->receiver());
+  }
+
   void OnAddTrack(
-      webrtc::scoped_refptr<webrtc::RtpReceiverInterface>,
-      const std::vector<webrtc::scoped_refptr<webrtc::MediaStreamInterface>>&) override {}
+      webrtc::scoped_refptr<webrtc::RtpReceiverInterface> receiver,
+      const std::vector<webrtc::scoped_refptr<webrtc::MediaStreamInterface>>&) override {
+    AttachVideoSink(std::move(receiver));
+  }
 
   bool gathered() const { return gathered_.load(); }
+  bool video_track_seen() const { return video_track_seen_.load(); }
 
   std::vector<CandidateCopy> Candidates() const {
     std::lock_guard<std::mutex> lock(mu_);
@@ -196,7 +234,26 @@ class PcObserver final : public webrtc::PeerConnectionObserver {
   }
 
  private:
+  // 把 sink 挂到远端视频轨上。M152 的 VideoTrackInterface 已经没有 SetSink()
+  // （RtpReceiverInterface 也没有），能用的是 VideoTrackInterface::AddOrUpdateSink：
+  // 基类里它是空实现，真正的实现是 VideoTrack::AddOrUpdateSink，虚分派会走对。
+  void AttachVideoSink(webrtc::scoped_refptr<webrtc::RtpReceiverInterface> receiver) {
+    if (video_sink_ == nullptr || receiver == nullptr) return;
+    if (receiver->media_type() != webrtc::MediaType::VIDEO) return;
+    webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track = receiver->track();
+    if (track == nullptr || track->kind() != webrtc::MediaStreamTrackInterface::kVideoKind) {
+      return;
+    }
+    auto* video_track = static_cast<webrtc::VideoTrackInterface*>(track.get());
+    video_track->AddOrUpdateSink(video_sink_, webrtc::VideoSinkWants());
+    video_track_seen_.store(true);
+    std::printf("[%s] remote video track -> sink: id=%s kind=%s\n", name_.c_str(),
+                track->id().c_str(), track->kind().c_str());
+  }
+
   const std::string name_;
+  webrtc::VideoSinkInterface<webrtc::VideoFrame>* const video_sink_;
+  std::atomic<bool> video_track_seen_{false};
   std::atomic<bool> gathered_{false};
   mutable std::mutex mu_;
   std::vector<CandidateCopy> candidates_;
@@ -249,9 +306,138 @@ struct Snapshot {
   PeerConnection::PeerConnectionState connection = PeerConnection::PeerConnectionState::kNew;
 };
 
+// ---------------------------------------------------------------------------
+// 合成视频源
+// ---------------------------------------------------------------------------
+// 直接实现 VideoTrackSourceInterface（它本身是 VideoSourceInterface<VideoFrame>），
+// 帧分发交给 webrtc::VideoBroadcaster：它线程安全，会把每一帧送到所有 sink，
+// 而「编码器」就是 VideoTrack 挂上来的那个 sink。
+//
+// 注意：类不能写 final —— 外面还要套 webrtc::RefCountedObject<T> 才能提供 Ref/Release
+// （VideoTrackSourceInterface 继承自 RefCountInterface）。
+class SyntheticVideoSource : public webrtc::VideoTrackSourceInterface {
+ public:
+  void AddOrUpdateSink(webrtc::VideoSinkInterface<webrtc::VideoFrame>* sink,
+                       const webrtc::VideoSinkWants& wants) override {
+    broadcaster_.AddOrUpdateSink(sink, wants);
+  }
+  void RemoveSink(webrtc::VideoSinkInterface<webrtc::VideoFrame>* sink) override {
+    broadcaster_.RemoveSink(sink);
+  }
+
+  SourceState state() const override { return kLive; }
+  bool remote() const override { return false; }
+  bool is_screencast() const override { return true; }
+  std::optional<bool> needs_denoising() const override { return false; }
+  bool GetStats(Stats* /*stats*/) override { return false; }
+  bool SupportsEncodedOutput() const override { return false; }
+  void GenerateKeyFrame() override {}
+  void AddEncodedSink(webrtc::VideoSinkInterface<webrtc::RecordableEncodedFrame>* /*sink*/) override {}
+  void RemoveEncodedSink(
+      webrtc::VideoSinkInterface<webrtc::RecordableEncodedFrame>* /*sink*/) override {}
+  void RegisterObserver(webrtc::ObserverInterface* /*observer*/) override {}
+  void UnregisterObserver(webrtc::ObserverInterface* /*observer*/) override {}
+
+  // 推一帧。VideoBroadcaster 自带锁，从主线程调用没问题；
+  // 但它会把帧直接转给编码器的 sink，所以别在持锁的位置调用。
+  void PushFrame(const webrtc::VideoFrame& frame) { broadcaster_.OnFrame(frame); }
+
+ private:
+  webrtc::VideoBroadcaster broadcaster_;
+};
+
+// PC2 侧的接收 sink：OnFrame 在 worker（解码）线程回调，只做原子计数。
+class FrameCounterSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
+ public:
+  void OnFrame(const webrtc::VideoFrame& frame) override {
+    if (frames_.fetch_add(1, std::memory_order_relaxed) == 0) {
+      first_width_.store(frame.width(), std::memory_order_relaxed);
+      first_height_.store(frame.height(), std::memory_order_relaxed);
+    }
+    last_timestamp_us_.store(frame.timestamp_us(), std::memory_order_relaxed);
+  }
+
+  int frames() const { return frames_.load(std::memory_order_relaxed); }
+  int first_width() const { return first_width_.load(std::memory_order_relaxed); }
+  int first_height() const { return first_height_.load(std::memory_order_relaxed); }
+  int64_t last_timestamp_us() const { return last_timestamp_us_.load(std::memory_order_relaxed); }
+
+ private:
+  std::atomic<int> frames_{0};
+  std::atomic<int> first_width_{0};
+  std::atomic<int> first_height_{0};
+  std::atomic<int64_t> last_timestamp_us_{0};
+};
+
+// 640x360 I420 渐变：Y 平面随列 + 行 + 帧号变化，U/V 固定 128（灰色）。
+void FillI420(webrtc::I420Buffer* buffer, int frame_index) {
+  const int width = buffer->width();
+  const int height = buffer->height();
+  uint8_t* y = buffer->MutableDataY();
+  const int y_stride = buffer->StrideY();
+  for (int row = 0; row < height; ++row) {
+    for (int col = 0; col < width; ++col) {
+      y[row * y_stride + col] = static_cast<uint8_t>((col + row + frame_index * 5) & 0xFF);
+    }
+  }
+  const int chroma_height = (height + 1) / 2;
+  std::memset(buffer->MutableDataU(), 128,
+              static_cast<size_t>(buffer->StrideU()) * chroma_height);
+  std::memset(buffer->MutableDataV(), 128,
+              static_cast<size_t>(buffer->StrideV()) * chroma_height);
+}
+
+// 只摘视频相关的 RTP 统计。PC1 看出站（packetsSent），PC2 看入站（framesDecoded）。
+struct VideoStatsSnapshot {
+  bool got_report = false;
+  uint64_t packets_sent = 0;
+  uint64_t bytes_sent = 0;
+  uint32_t frames_encoded = 0;
+  uint32_t frames_sent = 0;
+  uint32_t packets_received = 0;
+  uint32_t frames_received = 0;
+  uint32_t frames_decoded = 0;
+  uint64_t jitter_buffer_emitted = 0;
+};
+
+class VideoStatsObserver : public webrtc::RTCStatsCollectorCallback {
+ public:
+  VideoStatsObserver(Event* event, VideoStatsSnapshot* out) : event_(event), out_(out) {}
+
+  void OnStatsDelivered(
+      const webrtc::scoped_refptr<const webrtc::RTCStatsReport>& report) override {
+    if (report != nullptr) {
+      out_->got_report = true;
+      for (const webrtc::RTCOutboundRtpStreamStats* stats :
+           report->GetStatsOfType<webrtc::RTCOutboundRtpStreamStats>()) {
+        if (stats->kind.has_value() && *stats->kind != "video") continue;
+        out_->packets_sent += stats->packets_sent.value_or(0);
+        out_->bytes_sent += stats->bytes_sent.value_or(0);
+        out_->frames_encoded += stats->frames_encoded.value_or(0);
+        out_->frames_sent += stats->frames_sent.value_or(0);
+      }
+      for (const webrtc::RTCInboundRtpStreamStats* stats :
+           report->GetStatsOfType<webrtc::RTCInboundRtpStreamStats>()) {
+        if (stats->kind.has_value() && *stats->kind != "video") continue;
+        out_->packets_received += stats->packets_received.value_or(0);
+        out_->frames_received += stats->frames_received.value_or(0);
+        out_->frames_decoded += stats->frames_decoded.value_or(0);
+        out_->jitter_buffer_emitted += stats->jitter_buffer_emitted_count.value_or(0);
+      }
+    }
+    Finish(event_, true, {}, {});
+  }
+
+ private:
+  Event* const event_;
+  VideoStatsSnapshot* const out_;
+};
+
 }  // namespace
 
 int main() {
+  const auto process_start = std::chrono::steady_clock::now();
+
   // 静态链接时，libwebrtc 里那个负责 WSAStartup 的全局 WinsockInitializer 会随
   // 「没人引用的目标文件」一起被链接器丢掉，于是所有 socket() 都失败：
   // 症状是只收到 TCP active 候选、一条 UDP 候选都没有，ICE 永远停在 checking。
@@ -278,6 +464,20 @@ int main() {
   deps.worker_thread = worker.get();
   deps.signaling_thread = signaling.get();
 
+  // CreateModularPeerConnectionFactory 默认 media_factory == nullptr（「媒体默认关闭」），
+  // 这时 AddTrack 出来的视频 m= 段落不会挂编码器、offer 里也不会出现 m=video。
+  // 打开媒体 + 给出编解码器工厂，两件事都得做：
+  //   * EnableMedia(deps) 装 MediaFactory —— 库里只有 EnableMedia，没有 EnableMediaWithDefaults；
+  //   * encoder/decoder 工厂用模板 + libvpx VP8 适配器（库里确实有 libvpx VP8/VP9 和 H264/AV1）。
+  // 音频不用，但 MediaEngine 建音频引擎时仍会读这两个工厂，给内置默认实现最省事。
+  deps.video_encoder_factory = std::make_unique<
+      webrtc::VideoEncoderFactoryTemplate<webrtc::LibvpxVp8EncoderTemplateAdapter>>();
+  deps.video_decoder_factory = std::make_unique<
+      webrtc::VideoDecoderFactoryTemplate<webrtc::LibvpxVp8DecoderTemplateAdapter>>();
+  deps.audio_encoder_factory = webrtc::CreateBuiltinAudioEncoderFactory();
+  deps.audio_decoder_factory = webrtc::CreateBuiltinAudioDecoderFactory();
+  webrtc::EnableMedia(deps);
+
   auto factory = webrtc::CreateModularPeerConnectionFactory(std::move(deps));
   if (factory == nullptr) {
     std::printf("factory NULL\n");
@@ -285,9 +485,30 @@ int main() {
   }
   std::printf("factory OK\n");
 
+  // 先把这一版库里实际可用的发送编解码器列出来：视频编码器缺失时，
+  // 后面只会看到 packetsSent=0，提前打印一眼就能定位。
+  std::vector<std::string> video_codecs;
+  signaling->BlockingCall([&] {
+    const webrtc::RtpCapabilities caps =
+        factory->GetRtpSenderCapabilities(webrtc::MediaType::VIDEO);
+    for (const webrtc::RtpCodecCapability& codec : caps.codecs) {
+      video_codecs.push_back(codec.name);
+    }
+  });
+  std::printf("send video codecs:");
+  for (const std::string& codec : video_codecs) std::printf(" %s", codec.c_str());
+  std::printf("\n");
+  if (video_codecs.empty()) {
+    std::printf("no video send codec in this build\n");
+    return 1;
+  }
+
   // ---- 1. 两个 PeerConnection，各带 observer ----
-  PcObserver obs1("pc1");
-  PcObserver obs2("pc2");
+  // 接收 sink 故意 new 出来不释放：Close()/Stop() 之后仍可能有解码回调在飞，
+  // 让它在进程退出前一直活着，比为它安排析构顺序安全（一次性 spike）。
+  auto* frame_sink = new FrameCounterSink();
+  PcObserver obs1("pc1", nullptr);
+  PcObserver obs2("pc2", frame_sink);
   webrtc::PeerConnectionInterface::RTCConfiguration config;
   // 同进程回环，不需要 STUN/TURN；默认只会收集 host 候选。
 
@@ -334,6 +555,42 @@ int main() {
     return 1;
   }
   std::printf("data channel created: %s\n", data_channel->label().c_str());
+
+  // ---- 2b. PC1 挂一路合成视频轨（640x360 @30fps）----
+  // 必须在 CreateOffer 之前 AddTrack，否则 offer 里不会有 m=video。
+  constexpr int kVideoWidth = 640;
+  constexpr int kVideoHeight = 360;
+  constexpr int kFrameCount = 100;
+  constexpr int64_t kFrameIntervalUs = 33333;  // 30fps
+
+  webrtc::scoped_refptr<SyntheticVideoSource> video_source;
+  webrtc::scoped_refptr<webrtc::VideoTrackInterface> video_track;
+  error.clear();
+  signaling->BlockingCall([&] {
+    video_source = webrtc::scoped_refptr<SyntheticVideoSource>(
+        new webrtc::RefCountedObject<SyntheticVideoSource>());
+    // 第三个参数必须是真 worker 线程：VideoTrack 内部会包一层
+    // VideoTrackSourceProxy，AddOrUpdateSink / RemoveSink 都投递到它上面执行，
+    // 传 nullptr 会在建代理时炸掉。
+    webrtc::scoped_refptr<webrtc::VideoTrack> track =
+        webrtc::VideoTrack::Create("screen", video_source, worker.get());
+    if (track == nullptr) {
+      error = "VideoTrack::Create returned null";
+      return;
+    }
+    auto added = pc1->AddTrack(track, {"stream0"});
+    if (!added.ok()) {
+      error = std::string("AddTrack(video): ") + added.error().message();
+      return;
+    }
+    video_track = track;
+  });
+  if (video_track == nullptr) {
+    std::printf("video track FAILED: %s\n", error.c_str());
+    return 1;
+  }
+  std::printf("video track added: id=%s kind=%s\n", video_track->id().c_str(),
+              video_track->kind().c_str());
 
   Event offer_event;
   auto offer_observer = webrtc::scoped_refptr<webrtc::CreateSessionDescriptionObserver>(
@@ -549,15 +806,97 @@ int main() {
   std::printf("  data channel state=%s\n",
               webrtc::DataChannelInterface::DataStateString(data_channel->state()));
 
-  const bool success =
+  const bool transport_connected =
       final1.connection == PeerConnection::PeerConnectionState::kConnected &&
       final2.connection == PeerConnection::PeerConnectionState::kConnected;
 
-  // ---- 7. 收尾：先 Close 再释放，最后按 signaling → worker → network 停线程 ----
+  // ---- 7. 推 100 帧合成视频，再等 2 秒让编码/传输/解码/统计落定 ----
+  int frames_pushed = 0;
+  int sink_frames = 0;
+  int64_t push_elapsed_ms = 0;
+  VideoStatsSnapshot pc1_stats;
+  VideoStatsSnapshot pc2_stats;
+
+  if (transport_connected) {
+    std::printf("pushing %d synthetic frames (%dx%d @30fps)...\n", kFrameCount, kVideoWidth,
+                kVideoHeight);
+    const auto push_start = std::chrono::steady_clock::now();
+    // 时间戳必须是「像现在」的绝对值：VideoStreamEncoder 会拿帧时间戳和墙上时钟比，
+    // 太旧的帧按过期丢弃。从 0 开始数（1970）时只有第一帧能编码，其余 99 帧全被丢。
+    int64_t timestamp_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    for (int i = 0; i < kFrameCount; ++i) {
+      webrtc::scoped_refptr<webrtc::I420Buffer> buffer =
+          webrtc::I420Buffer::Create(kVideoWidth, kVideoHeight);
+      FillI420(buffer.get(), i);
+      const webrtc::VideoFrame frame =
+          webrtc::VideoFrame::Builder()
+              .set_video_frame_buffer(buffer)
+              .set_timestamp_us(timestamp_us)
+              .set_ntp_time_ms(timestamp_us / 1000)
+              // RTP 时间戳是 90kHz 时钟，编码器靠它算帧间隔；不设会全是 0。
+              .set_rtp_timestamp(static_cast<uint32_t>(timestamp_us * 90 / 1000))
+              .build();
+      video_source->PushFrame(frame);
+      ++frames_pushed;
+      timestamp_us += kFrameIntervalUs;
+      // 按绝对时间睡，避免 I420 填充耗时累积成掉帧。
+      std::this_thread::sleep_until(push_start +
+                                    std::chrono::microseconds(kFrameIntervalUs * (i + 1)));
+    }
+    push_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - push_start)
+                          .count();
+    std::printf("frames pushed: %d in %lld ms (%.1f fps)\n", frames_pushed,
+                static_cast<long long>(push_elapsed_ms),
+                frames_pushed * 1000.0 /
+                    static_cast<double>(push_elapsed_ms > 0 ? push_elapsed_ms : 1));
+
+    // 再等 2 秒：最后几帧要走过 pacer → 网络 → 抖动缓冲 → 解码器。
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    sink_frames = frame_sink->frames();
+    std::printf("pc2 sink: frames=%d first=%dx%d\n", sink_frames, frame_sink->first_width(),
+                frame_sink->first_height());
+
+    // GetStats 是异步的：在 signalling 线程发起，回调里只写结果 + notify。
+    auto collect_stats = [&](const webrtc::scoped_refptr<PeerConnection>& pc,
+                             VideoStatsSnapshot* out, const char* tag) {
+      Event stats_event;
+      auto observer = webrtc::scoped_refptr<webrtc::RTCStatsCollectorCallback>(
+          new webrtc::RefCountedObject<VideoStatsObserver>(&stats_event, out));
+      signaling->BlockingCall([&] { pc->GetStats(observer.get()); });
+      if (!WaitEvent(&stats_event, 5000)) {
+        std::printf("[%s] GetStats TIMEOUT\n", tag);
+      }
+    };
+    collect_stats(pc1, &pc1_stats, "pc1");
+    collect_stats(pc2, &pc2_stats, "pc2");
+  }
+
+  std::printf("video stats:\n");
+  std::printf("  pc1 outbound-rtp: packetsSent=%llu bytesSent=%llu framesEncoded=%u framesSent=%u\n",
+              static_cast<unsigned long long>(pc1_stats.packets_sent),
+              static_cast<unsigned long long>(pc1_stats.bytes_sent), pc1_stats.frames_encoded,
+              pc1_stats.frames_sent);
+  std::printf("  pc2 inbound-rtp : packetsReceived=%u framesReceived=%u framesDecoded=%u "
+              "jitterBufferEmitted=%llu\n",
+              pc2_stats.packets_received, pc2_stats.frames_received, pc2_stats.frames_decoded,
+              static_cast<unsigned long long>(pc2_stats.jitter_buffer_emitted));
+  std::printf("  pc2 sink frames: %d\n", sink_frames);
+
+  // 闭环判据（缺一不可）：PC1 真的发出了 RTP 包 + PC2 的 sink 真的被喂到解出的帧。
+  const bool video_ok = transport_connected && pc1_stats.packets_sent > 0 && sink_frames > 0;
+
+  // ---- 8. 收尾：先 Close 再释放，最后按 signaling → worker → network 停线程 ----
   signaling->BlockingCall([&] {
     if (pc1 != nullptr) pc1->Close();
     if (pc2 != nullptr) pc2->Close();
+    // VideoTrack（及其内部 source 代理）的析构要求 signalling 线程。
+    video_track = nullptr;
   });
+  video_source = nullptr;
   data_channel = nullptr;
   pc1 = nullptr;
   pc2 = nullptr;
@@ -567,10 +906,22 @@ int main() {
   worker->Stop();
   network->Stop();
 
-  if (success) {
-    std::printf("DTLS connected\n");
+  const int64_t total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - process_start)
+                               .count();
+  std::printf("total elapsed: %lld ms\n", static_cast<long long>(total_ms));
+
+  if (video_ok) {
+    std::printf("VIDEO RTP OK: packetsSent>0 and PC2 decoded frames>0\n");
     return 0;
   }
-  std::printf("DTLS NOT connected (timeout or failure), see states above\n");
+  if (!transport_connected) {
+    std::printf("DTLS NOT connected (timeout or failure), see states above\n");
+  } else if (pc1_stats.packets_sent == 0) {
+    std::printf("VIDEO FAILED: PC1 sent no RTP packets (encoder/negotiation problem?)\n");
+  } else {
+    std::printf("VIDEO FAILED: PC2 decoded no frames (packetsSent=%llu sinkFrames=%d)\n",
+                static_cast<unsigned long long>(pc1_stats.packets_sent), sink_frames);
+  }
   return 1;
 }

@@ -162,15 +162,28 @@ typedef struct pu_remote_frame_event {
   uint32_t reserved;
 } pu_remote_frame_event;
 
-/* 一帧编码完成。sequence 从 0 递增；bitrate_kbps 是最近 1 秒的编码码率。 */
+/* 一帧编码完成。每送出一帧采集帧就产生一条。布局与语义对调用方不变；v2.1 起
+ * 编码只在 PC 的 VideoStreamEncoder 里做一次（以前同一帧还会被本地统计编码器
+ * 再编一次，采集源挂了两个 sink）。
+ *
+ * 字段来源分两类：
+ *   * sequence / capture_ts_us / width / height 由采集侧直接给出；
+ *   * bytes / bitrate_kbps / keyframe 从 PC 的 GetStats 派生（outbound-rtp 的
+ *     bytesSent / framesEncoded / keyFramesEncoded 增量），按 250 ms 采样：
+ *       bytes        = 最近一个窗口的「bytesSent 增量 / framesEncoded 增量」，
+ *                      即该窗口的平均每帧编码字节数（不是本帧的精确字节数）；
+ *       bitrate_kbps = 最近一个窗口的编码码率（kbit/s）；
+ *       keyframe     = 该窗口内 keyFramesEncoded 有增长时为 1。
+ *     VideoFrame 本身没有关键帧标记，只能从统计增量推。
+ */
 typedef struct pu_frame_event {
   uint64_t sequence;      /* 该路流内的帧序号，0 起 */
   int64_t capture_ts_us;  /* 源帧时间戳，system_clock 纪元微秒 */
   uint32_t width;
   uint32_t height;
-  uint32_t bytes;         /* 本帧编码后字节数 */
-  uint32_t bitrate_kbps;  /* 最近 1s 的编码码率（kbit/s） */
-  uint32_t keyframe;      /* 1 = 关键帧 */
+  uint32_t bytes;         /* 最近采样窗口的平均每帧编码字节数（见上） */
+  uint32_t bitrate_kbps;  /* 最近采样窗口的编码码率（kbit/s） */
+  uint32_t keyframe;      /* 1 = 该采样窗口内出现过关键帧 */
   uint32_t reserved;      /* 0，保证对齐与后续扩展 */
 } pu_frame_event;
 
@@ -251,8 +264,11 @@ typedef struct pu_stats {
   int32_t  ice_state;          /* pu_ice_state；无 PC 时是 0 */
   uint32_t has_peer;           /* 1 = 引擎内已建 PeerConnection */
   uint32_t frames_sent;        /* 推进采集源的帧数（本地发送侧） */
-  uint32_t frames_encoded;     /* 本地编码完成的帧数（= PU_EVENT_FRAME 的条数） */
-  uint32_t frames_dropped;     /* 被编码器主动丢弃的帧（过期/降帧） */
+  uint32_t frames_encoded;     /* PC 侧编码完成的帧数（outbound-rtp.framesEncoded，
+                                * 250 ms 采样一次，因此最多陈旧一个窗口）。1:1 编码
+                                * 时它等于 frames_sent 与 PU_EVENT_FRAME 的条数。 */
+  uint32_t frames_dropped;     /* v2.1 起恒 0：本地编码器已删除，PC 侧的丢帧不在
+                                * outbound-rtp 统计里（保留字段，ABI 不变） */
   uint32_t frames_received;    /* 远端解码后回调到引擎的帧数（接收侧硬判据） */
   uint32_t signal_out_count;   /* 已产生的信令事件数（offer/answer/candidate 合计） */
   uint32_t event_drops;        /* 事件队列满导致的丢事件数 */

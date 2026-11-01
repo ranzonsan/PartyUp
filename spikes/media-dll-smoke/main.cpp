@@ -4,6 +4,8 @@
 //   * pu_engine_create 返回非空句柄；
 //   * pu_screen_start 返回 PU_OK，且事件里出现 STATE=RUNNING；
 //   * 10 秒内收到 >= 30 个 PU_EVENT_FRAME；
+//   * v2.1：PC 侧只编码一次——outbound-rtp.framesEncoded ≈ 连上之后推送的帧数，
+//     并且严格小于「推送帧数的 1.5 倍」（2 倍就意味着同一帧被编码了两次）；
 //   * 10 个未实现函数都返回 PU_NOT_IMPLEMENTED（证明导出表齐全）；
 //   * 全程没有 PU_EVENT_ERROR；
 //   * pu_screen_stop / pu_engine_destroy 正常返回。
@@ -22,6 +24,8 @@ namespace {
 
 constexpr int kTargetFrames = 30;
 constexpr int kTimeoutSeconds = 10;
+// PC 的编码计数每 250 ms 采样一次，30 fps 下一个窗口最多 8 帧还没算进去，留 1 帧余量。
+constexpr int kSampleLagFrames = 9;
 
 const char* StateName(int state) {
   switch (state) {
@@ -99,6 +103,42 @@ int CheckUnimplementedSurface(pu_engine* engine) {
   return failures;
 }
 
+// 观看方的最小转发器：把它的 SIGNAL_OUT 原样喂回共享方，顺手数它解出多少帧。
+// 本测试不对观看方做断言（那些在 signaling 冒烟里），它只负责让共享方的 PC
+// 真的进入「有对端、在编码」的状态——没有对端时 PC 的 VideoStreamEncoder 不产出。
+// 返回 -1 = 出错（已打印原因）。
+int DrainViewer(pu_engine* viewer, pu_engine* sharer, int* remote_frames) {
+  for (;;) {
+    pu_event event;
+    std::memset(&event, 0, sizeof(event));
+    event.struct_size = static_cast<uint32_t>(sizeof(event));
+
+    const int rc = pu_poll_event(viewer, &event, 0);
+    if (rc == PU_ERR_TIMEOUT) return 0;
+    if (rc != PU_OK) {
+      std::printf("FAIL: viewer pu_poll_event rc=%d (%s)\n", rc, pu_last_error(viewer));
+      return -1;
+    }
+    if (event.type == PU_EVENT_SIGNAL_OUT) {
+      const pu_signal_event& signal = event.data.signal;
+      if (pu_signal_in(sharer, signal.payload, signal.payload_len) != PU_OK) {
+        std::printf("FAIL: pu_signal_in(sharer) from viewer: %s\n", pu_last_error(sharer));
+        return -1;
+      }
+    } else if (event.type == PU_EVENT_REMOTE_FRAME) {
+      ++*remote_frames;
+    }
+  }
+}
+
+// 观看方引擎的 RAII 守卫：任何提前 return 都把它收掉。
+struct EngineGuard {
+  pu_engine* engine = nullptr;
+  ~EngineGuard() {
+    if (engine != nullptr) pu_engine_destroy(engine);
+  }
+};
+
 }  // namespace
 
 int main() {
@@ -146,6 +186,20 @@ int main() {
                              std::chrono::steady_clock::now() - create_start)
                              .count();
   std::printf("engine created in %lld ms\n", static_cast<long long>(create_ms));
+
+  // v2.1：再起一个观看方。共享方的 PC 只有在 DTLS 连上之后才会真正编码，
+  // 而「一帧只编码一次」这条断言必须有真实的编码路径才验证得了。
+  pu_config viewer_config = config;
+  viewer_config.client_name = "media-dll-smoke-viewer";
+  viewer_config.event_queue_capacity = 512;
+  pu_engine* viewer = pu_engine_create(&viewer_config);
+  if (viewer == nullptr) {
+    std::printf("FAIL: viewer pu_engine_create returned null: %s\n", pu_last_error(nullptr));
+    pu_engine_destroy(engine);
+    return 1;
+  }
+  EngineGuard viewer_guard{viewer};
+  std::printf("viewer engine created (peer for the encoding check)\n");
 
   // 未知源 id 必须被拒绝（本版只有合成源），且不能把引擎带进错误状态。
   {
@@ -198,16 +252,45 @@ int main() {
   int other_events = 0;
   int signal_events = 0;      // v2: PU_EVENT_SIGNAL_OUT
   bool saw_offer_signal = false;
-  int remote_frames = 0;      // v2: PU_EVENT_REMOTE_FRAME（本测试没有对端，恒为 0）
+  int remote_frames = 0;      // v2: PU_EVENT_REMOTE_FRAME（本引擎是共享方，收不到流）
   bool saw_running = false;
   uint64_t total_bytes = 0;
   uint64_t key_frames = 0;
   int64_t first_capture_us = 0;
   int64_t last_capture_us = 0;
   int64_t first_event_us = 0;
+  // v2.1 编码检查用：观看方解出多少帧、双方何时连上、连上时已推多少帧。
+  int viewer_remote_frames = 0;
+  bool peer_connected = false;
+  int64_t sent_at_connect = 0;
 
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(kTimeoutSeconds);
   while (frames < kTargetFrames && std::chrono::steady_clock::now() < deadline) {
+    // 每轮先把观看方的事件抽干（answer / 候选越早喂回共享方越好），顺手看连上没有。
+    if (DrainViewer(viewer, engine, &viewer_remote_frames) < 0) {
+      pu_engine_destroy(engine);
+      return 1;
+    }
+
+    // 记下「DTLS 连上那一刻已经推了多少帧」：连上之前的帧 PC 不会编码，
+    // 编码次数的口径从这里起算。
+    if (!peer_connected) {
+      pu_stats stats_a;
+      pu_stats stats_v;
+      std::memset(&stats_a, 0, sizeof(stats_a));
+      std::memset(&stats_v, 0, sizeof(stats_v));
+      stats_a.struct_size = static_cast<uint32_t>(sizeof(stats_a));
+      stats_v.struct_size = static_cast<uint32_t>(sizeof(stats_v));
+      if (pu_peer_stats(engine, &stats_a) == PU_OK && pu_peer_stats(viewer, &stats_v) == PU_OK &&
+          stats_a.peer_state == PU_PEER_CONNECTED &&
+          stats_v.peer_state == PU_PEER_CONNECTED) {
+        peer_connected = true;
+        sent_at_connect = static_cast<int64_t>(stats_a.frames_sent);
+        std::printf("peer connected (DTLS); %d frame event(s) so far, A pushed %lld frame(s)\n",
+                    frames, static_cast<long long>(sent_at_connect));
+      }
+    }
+
     pu_event event;
     std::memset(&event, 0, sizeof(event));
     event.struct_size = static_cast<uint32_t>(sizeof(event));
@@ -266,6 +349,14 @@ int main() {
                     signal.payload != nullptr ? std::string(signal.payload).substr(0, 48).c_str()
                                               : "(null)",
                     signal.payload_len > 48 ? "..." : "");
+        // 把 offer 直接喂给观看方（C# 侧是「原样发给服务端」）。
+        const int forward_rc = pu_signal_in(viewer, signal.payload, signal.payload_len);
+        if (forward_rc != PU_OK) {
+          std::printf("FAIL: pu_signal_in(viewer) rc=%d (%s)\n", forward_rc,
+                      pu_last_error(viewer));
+          pu_engine_destroy(engine);
+          return 1;
+        }
         break;
       }
       case PU_EVENT_REMOTE_FRAME:
@@ -281,6 +372,28 @@ int main() {
   const int stop_rc = pu_screen_stop(engine);
   // 再停一次必须幂等返回 PU_OK。
   const int second_stop_rc = pu_screen_stop(engine);
+
+  // ---- v2.1：编码次数检查（同一帧只编码一次）----
+  // 口径：PC 的 outbound-rtp.framesEncoded 只统计 PC 自己的 VideoStreamEncoder。
+  // 本地编码器删掉之后，它应当 ≈「DTLS 连上之后推送的帧数」；连上之前的帧 PC 不
+  // 编码（实测 framesEncoded 恒 0），所以要先减掉那一段。2 倍就意味着同一帧被
+  // 两个编码器各编码了一次。
+  pu_stats stats_final;
+  std::memset(&stats_final, 0, sizeof(stats_final));
+  stats_final.struct_size = static_cast<uint32_t>(sizeof(stats_final));
+  const bool stats_ok = (pu_peer_stats(engine, &stats_final) == PU_OK);
+  const int64_t sent_total = stats_ok ? static_cast<int64_t>(stats_final.frames_sent) : 0;
+  const int64_t encoded_total = stats_ok ? static_cast<int64_t>(stats_final.frames_encoded) : 0;
+  const int64_t sent_after_connect = sent_total - sent_at_connect;
+  const double encode_ratio =
+      sent_after_connect > 0
+          ? static_cast<double>(encoded_total) / static_cast<double>(sent_after_connect)
+          : 0.0;
+
+  // 先把观看方关掉，再关共享方：两端都还连着的时候关一端，比「对端已经没了再去关
+  // 另一端」更接近真实退出顺序，也少一类「半死连接」上的收尾竞态。
+  pu_engine_destroy(viewer);
+  viewer_guard.engine = nullptr;
 
   // 收尾的 IDLE 状态事件（不阻塞太久，拿到就打印）。
   {
@@ -353,11 +466,20 @@ int main() {
   }
   std::printf("  avg frame bytes   : %.1f\n",
               frames > 0 ? static_cast<double>(total_bytes) / frames : 0.0);
+  std::printf("  note              : bytes/bitrate_kbps 是 PC GetStats 的 250 ms 窗口均值；\n");
+  std::printf("                      avg frame bytes / avg bitrate 只作趋势参考，不是逐帧精确值\n");
   std::printf("  avg bitrate       : %.1f kbps\n",
               frames > 1 && last_capture_us > first_capture_us
                   ? static_cast<double>(total_bytes) * 8.0 /
                         (static_cast<double>(last_capture_us - first_capture_us) / 1e6) / 1000.0
                   : 0.0);
+  std::printf("  A pushed          : %lld frame(s) (%lld before DTLS)\n",
+              static_cast<long long>(sent_total), static_cast<long long>(sent_at_connect));
+  std::printf("  PC framesEncoded  : %lld (outbound-rtp.framesEncoded)\n",
+              static_cast<long long>(encoded_total));
+  std::printf("  encode ratio      : %.2fx per pushed frame after DTLS (2.00x = duplicate encoding)\n",
+              encode_ratio);
+  std::printf("  viewer decoded    : %d remote frame(s)\n", viewer_remote_frames);
   std::printf("  stop rc           : %d (second stop: %d)\n", stop_rc, second_stop_rc);
   std::printf("  destroy           : %lld ms\n", static_cast<long long>(destroy_ms));
   std::printf("  first event ts    : %lld\n", static_cast<long long>(first_event_us));
@@ -388,7 +510,33 @@ int main() {
     std::printf("FAIL: ABI surface check found %d unexpected result(s)\n", surface_failures);
     return 1;
   }
+  if (!peer_connected) {
+    std::printf("FAIL: the viewer never reached DTLS connected, cannot verify the encoding count\n");
+    return 1;
+  }
+  if (!stats_ok) {
+    std::printf("FAIL: pu_peer_stats failed after stop\n");
+    return 1;
+  }
+  if (encoded_total > sent_total + kSampleLagFrames) {
+    std::printf("FAIL: PC encoded %lld frame(s) for %lld pushed — more than one encode per frame\n",
+                static_cast<long long>(encoded_total), static_cast<long long>(sent_total));
+    return 1;
+  }
+  if (encoded_total + kSampleLagFrames < sent_after_connect) {
+    std::printf(
+        "FAIL: PC only encoded %lld of the %lld frame(s) pushed after DTLS (expected ~1:1)\n",
+        static_cast<long long>(encoded_total), static_cast<long long>(sent_after_connect));
+    return 1;
+  }
+  if (sent_after_connect > 0 && encoded_total * 2 >= sent_after_connect * 3) {
+    std::printf("FAIL: encoding looks doubled: %lld encoded for %lld pushed after DTLS\n",
+                static_cast<long long>(encoded_total), static_cast<long long>(sent_after_connect));
+    return 1;
+  }
 
-  std::printf("PASS: %d frame events, no errors\n", frames);
+  std::printf("PASS: %d frame events, no errors, %.2fx encoding (%lld encoded / %lld pushed after DTLS)\n",
+              frames, encode_ratio, static_cast<long long>(encoded_total),
+              static_cast<long long>(sent_after_connect));
   return 0;
 }

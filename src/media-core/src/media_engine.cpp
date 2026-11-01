@@ -16,10 +16,16 @@
 // 收尾顺序也照抄：关闭协商 → Close() PC → 释放 track/pc（signaling 线程）→ 释放
 // factory → signaling → worker → network 依次 Stop，WinsockInitializer 最后析构。
 //
-// v1 的本地编码链路被完整保留（PU_EVENT_FRAME 的语义不变，v1 冒烟测试仍按原样
-// 通过）。代价是采集源上挂了两个 sink：本地统计编码器 + PC 的 VideoStreamEncoder，
-// 同一帧被编码两次。这是 v2 有意接受的重复计算——下一版把 PU_EVENT_FRAME 改成
-// 从 PC 的 GetStats 派生之后就能删掉本地编码器（见文档 §8「已知代价」）。
+// v2.1（本版）删掉了 v1 的本地 VP8 编码器。以前采集源上并排挂着两个 sink
+// （本地统计编码器 + PC 的 VideoStreamEncoder），同一帧被编码两次；现在采集源
+// 只喂 VideoTrack，编码只在 PC 的 VideoStreamEncoder 里做一次。
+//
+// PU_EVENT_FRAME 的**语义与布局不变**（每帧一条、字段一个没动），但 bytes /
+// keyframe / bitrate 改为从 PC 的 GetStats 派生：采样线程每 250 ms 发起一次
+// 异步 GetStats（RTCStatsCollectorCallback），回调只把 outbound-rtp 的
+// bytesSent / framesEncoded / keyFramesEncoded 累计量写进原子量，采集线程逐帧
+// 发事件时读「最近一次采样窗口」的值。sequence / capture_ts_us / width / height
+// 仍然由采集侧给出。GetStats 是异步回调，绝不能在调用线程上等它（见 §8）。
 #include "partyup_media.h"
 
 #include <algorithm>
@@ -50,7 +56,6 @@
 #include "api/audio_codecs/builtin_audio_encoder_factory.h"
 #include "api/create_modular_peer_connection_factory.h"
 #include "api/enable_media.h"
-#include "api/environment/environment_factory.h"
 #include "api/jsep.h"
 #include "api/media_stream_interface.h"
 #include "api/media_types.h"
@@ -61,18 +66,18 @@
 #include "api/scoped_refptr.h"
 #include "api/set_local_description_observer_interface.h"
 #include "api/set_remote_description_observer_interface.h"
-#include "api/video/encoded_image.h"
+#include "api/stats/rtc_stats_collector_callback.h"
+#include "api/stats/rtc_stats_report.h"
+#include "api/stats/rtcstats_objects.h"
 #include "api/video/i420_buffer.h"
 #include "api/video/video_broadcaster.h"
 #include "api/video/video_frame.h"
-#include "api/video/video_frame_type.h"
 #include "api/video/video_sink_interface.h"
 #include "api/video/video_source_interface.h"
 #include "api/video_codecs/sdp_video_format.h"
 #include "api/video_codecs/video_codec.h"
 #include "api/video_codecs/video_decoder_factory_template.h"
 #include "api/video_codecs/video_decoder_factory_template_libvpx_vp8_adapter.h"
-#include "api/video_codecs/video_encoder.h"
 #include "api/video_codecs/video_encoder_factory_template.h"
 #include "api/video_codecs/video_encoder_factory_template_libvpx_vp8_adapter.h"
 #include "api/video/video_codec_type.h"
@@ -117,8 +122,18 @@ constexpr int kHeight = 360;
 constexpr int kFps = 30;
 constexpr int64_t kFrameIntervalUs = 1000000 / kFps;  // 33333us
 
-// 编码码率的统计窗口
-constexpr int64_t kRateWindowUs = 1000000;
+// ---- PC 统计采样（v2.1）----
+// PU_EVENT_FRAME 的 bytes / keyframe / bitrate 由 PC 的 GetStats 派生，采样节拍
+// 250 ms：够快，让逐帧事件里的数字最多陈旧一个窗口；又够慢，不会让 stats 收集器
+// 自己变成新的开销（一次 GetStats 约 1 ms）。
+constexpr int kStatsSampleIntervalMs = 250;
+// 采样线程的睡眠粒度：用它把「等 250 ms」切成可被 stop 打断的小片。
+constexpr int kStatsSleepSliceMs = 10;
+// stop 时在采样线程上等「最后一份报告」的上限：等不到就用手里的数，不阻塞控制线程。
+// 只等 200 ms：正常一份 GetStats 是几毫秒，等太久只会拖慢 stop（实测曾把
+// 「不带 stop 直接 destroy」拖到 580 ms）。
+constexpr int kStatsFinalWaitMs = 200;
+
 constexpr uint32_t kDefaultQueueCapacity = 256;
 
 // ---- 信令 / 协商（v2）----
@@ -209,25 +224,6 @@ void FillI420(webrtc::I420Buffer* buffer, int frame_index) {
   const int chroma_height = (height + 1) / 2;
   std::memset(buffer->MutableDataU(), 128, static_cast<size_t>(buffer->StrideU()) * chroma_height);
   std::memset(buffer->MutableDataV(), 128, static_cast<size_t>(buffer->StrideV()) * chroma_height);
-}
-
-// VP8 单流 640x360@30 的设置。取值与 webrtc 自己的 test/video_codec_settings.h 一致。
-webrtc::VideoCodec MakeVp8CodecSettings() {
-  webrtc::VideoCodec codec = {};
-  codec.codecType = webrtc::kVideoCodecVP8;
-  codec.width = kWidth;
-  codec.height = kHeight;
-  codec.startBitrate = 1500;  // kbps
-  codec.maxBitrate = 2500;
-  codec.minBitrate = 300;
-  codec.maxFramerate = kFps;
-  codec.active = true;
-  codec.qpMax = 56;
-  codec.numberOfSimulcastStreams = 0;  // 单流
-  codec.mode = webrtc::VideoCodecMode::kScreensharing;
-  codec.timing_frame_thresholds = {200, 250};
-  *codec.VP8() = webrtc::VideoEncoder::GetDefaultVp8Settings();
-  return codec;
 }
 
 // ---------------------------------------------------------------------------
@@ -471,17 +467,65 @@ bool ParseSignal(const char* payload, size_t len, SignalMessage* out, std::strin
 }
 
 // ---------------------------------------------------------------------------
+// PC 侧统计（v2.1）：PU_EVENT_FRAME 的 bytes / keyframe / bitrate 从这里来
+// ---------------------------------------------------------------------------
+
+// GetStats 回调与采样线程之间只共享这块状态：回调写累计量，采样线程读它算增量。
+// 用 shared_ptr 是因为回调可能比引擎活得久（GetStats 是异步的）：它落下最后一份
+// 报告时必须仍然安全，所以它只碰这块内存，绝不碰 MediaEngine。
+struct PcStatsState {
+  std::atomic<uint64_t> bytes_sent{0};          // outbound-rtp.bytesSent
+  std::atomic<uint64_t> frames_encoded{0};      // outbound-rtp.framesEncoded
+  std::atomic<uint64_t> key_frames_encoded{0};  // outbound-rtp.keyFramesEncoded
+  std::atomic<uint32_t> reports{0};             // 收到过几份有效报告（0 = 还没有）
+};
+
+// GetStats 的回调（在 signaling 线程上被调用）。只读报告、只写原子量：
+// 不阻塞、不重入、不回调引擎。不能加 final —— 外面要套 webrtc::RefCountedObject。
+class StatsCollector : public webrtc::RTCStatsCollectorCallback {
+ public:
+  explicit StatsCollector(std::shared_ptr<PcStatsState> state) : state_(std::move(state)) {}
+
+  void OnStatsDelivered(
+      const webrtc::scoped_refptr<const webrtc::RTCStatsReport>& report) override {
+    if (report == nullptr || state_ == nullptr) return;
+    uint64_t bytes = 0;
+    uint64_t frames = 0;
+    uint64_t keys = 0;
+    bool found_video = false;
+    for (const webrtc::RTCOutboundRtpStreamStats* out :
+         report->GetStatsOfType<webrtc::RTCOutboundRtpStreamStats>()) {
+      if (out == nullptr) continue;
+      // framesEncoded / keyFramesEncoded 只有视频流才有；音频的 outbound-rtp 不带
+      // 这两项，直接跳过（本切片也只有一路视频）。
+      if (!out->frames_encoded.has_value() && !out->key_frames_encoded.has_value()) continue;
+      found_video = true;
+      if (out->bytes_sent.has_value()) bytes += *out->bytes_sent;
+      if (out->frames_encoded.has_value()) frames += *out->frames_encoded;
+      if (out->key_frames_encoded.has_value()) keys += *out->key_frames_encoded;
+    }
+    if (!found_video) return;  // PC 刚建好、还没有 outbound video 统计
+    state_->bytes_sent.store(bytes, std::memory_order_relaxed);
+    state_->frames_encoded.store(frames, std::memory_order_relaxed);
+    state_->key_frames_encoded.store(keys, std::memory_order_relaxed);
+    state_->reports.fetch_add(1, std::memory_order_relaxed);
+  }
+
+ private:
+  std::shared_ptr<PcStatsState> state_;
+};
+
+// ---------------------------------------------------------------------------
 // 引擎实现
 // ---------------------------------------------------------------------------
-class MediaEngine : public webrtc::VideoSinkInterface<webrtc::VideoFrame>,
-                    public webrtc::EncodedImageCallback {
+class MediaEngine {
  public:
   // 两个辅助类在类外定义（需要 MediaEngine 完整类型），这里只前置声明。
   class PcObserver;       // webrtc::PeerConnectionObserver：把状态写回原子量、挂远端 sink
   class RemoteFrameSink;  // 远端视频轨的 sink：把帧转给引擎
 
   MediaEngine() = default;
-  ~MediaEngine() override;
+  ~MediaEngine();
 
   MediaEngine(const MediaEngine&) = delete;
   MediaEngine& operator=(const MediaEngine&) = delete;
@@ -498,18 +542,8 @@ class MediaEngine : public webrtc::VideoSinkInterface<webrtc::VideoFrame>,
   // v2：读统计快照
   int PeerStats(pu_stats* out);
 
-  // webrtc::VideoSinkInterface<VideoFrame>：采集线程（pump）上被调用
-  void OnFrame(const webrtc::VideoFrame& frame) override;
   // v2：远端视频轨的 sink 回调，解码线程（worker）上被调用
   void OnRemoteFrame(const webrtc::VideoFrame& frame);
-
-  // webrtc::EncodedImageCallback：同上，编码器在同一线程回调
-  webrtc::EncodedImageCallback::Result OnEncodedImage(
-      const webrtc::EncodedImage& encoded_image,
-      const webrtc::CodecSpecificInfo* codec_specific_info) override;
-  void OnFrameDropped(uint32_t rtp_timestamp,
-                      int spatial_id,
-                      bool is_end_of_temporal_unit) override;
 
  private:
   void PumpLoop();
@@ -522,6 +556,14 @@ class MediaEngine : public webrtc::VideoSinkInterface<webrtc::VideoFrame>,
   void Fail(const std::string& message, std::string* error);
   void ReleaseStreamObjects();
   void Log(int level, const char* format, ...);
+
+  // ---- v2.1：PU_EVENT_FRAME 的数据源是 PC 的 GetStats ----
+  // 逐帧发一条 PU_EVENT_FRAME；bytes / keyframe / bitrate 取最近一次采样值。
+  void PushFrameEvent(int64_t capture_ts_us);
+  void StartStatsSampler(webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc);
+  void StopStatsSampler();
+  void StatsSampleLoop(webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc);
+  void RequestStats(webrtc::PeerConnectionInterface* pc);
 
   // ---- v2：PeerConnection 与信令 ----
   // 建 PC（控制线程调用，内部投递到 signaling 线程）。for_sending 时立刻 AddTrack。
@@ -549,9 +591,6 @@ class MediaEngine : public webrtc::VideoSinkInterface<webrtc::VideoFrame>,
   std::unique_ptr<webrtc::Thread> worker_;
   std::unique_ptr<webrtc::Thread> signaling_;
   webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> pc_factory_;
-  std::unique_ptr<webrtc::VideoEncoderFactoryTemplate<webrtc::LibvpxVp8EncoderTemplateAdapter>>
-      encoder_factory_;
-  std::optional<webrtc::Environment> env_;
 
   // 一路共享流的对象
   webrtc::scoped_refptr<SyntheticVideoSource> source_;
@@ -563,18 +602,16 @@ class MediaEngine : public webrtc::VideoSinkInterface<webrtc::VideoFrame>,
 
   std::mutex control_mu_;
 
-  // start 握手：pump 线程建好编码器（或失败）后通知控制线程
+  // start 握手：pump 线程起来后通知控制线程（v2.1 起没有编码器要初始化，
+  // 这一步只保留「线程真的跑起来了」的语义）
   std::mutex start_mu_;
   std::condition_variable start_cv_;
   bool start_done_ = false;
   bool start_ok_ = false;
   std::string start_error_;
 
-  // 编码器只在 pump 线程上创建、使用、释放；OnFrame/OnEncodedImage 也在该线程。
-  webrtc::VideoEncoder* encoder_ = nullptr;
+  // 采集侧仍负责的元数据：PU_EVENT_FRAME 的帧序号（只由 pump 线程写）。
   uint64_t frame_sequence_ = 0;
-  int64_t capture_ts_us_ = 0;
-  std::deque<std::pair<int64_t, uint32_t>> rate_window_;
 
   // ---- v2：PeerConnection ----
   webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc_;
@@ -592,7 +629,7 @@ class MediaEngine : public webrtc::VideoSinkInterface<webrtc::VideoFrame>,
 
   // ---- v2：统计（全是原子量，pu_peer_stats 直接快照，不加锁） ----
   std::atomic<uint32_t> stat_frames_sent_{0};
-  std::atomic<uint32_t> stat_frames_encoded_{0};
+  // 本地编码器删掉后就没人写它了：PC 侧的丢帧不在 outbound-rtp 统计里，留 0。
   std::atomic<uint32_t> stat_frames_dropped_{0};
   std::atomic<uint32_t> stat_frames_received_{0};
   std::atomic<uint32_t> stat_signal_out_{0};
@@ -602,6 +639,18 @@ class MediaEngine : public webrtc::VideoSinkInterface<webrtc::VideoFrame>,
   std::atomic<uint32_t> stat_remote_height_{0};
   std::atomic<int64_t> stat_last_remote_us_{0};
   std::atomic<uint64_t> stat_remote_sequence_{0};
+
+  // ---- v2.1：PC 侧统计采样（PU_EVENT_FRAME 的 bytes/key/bitrate 来源）----
+  // pc_stats_ 与 GetStats 回调共享所有权：回调迟到（引擎已析构）也只是写一块
+  // 独立内存。采样线程把自己那份 pc 引用揣在 lambda 里、不读 pc_，免得与控制
+  // 线程释放 PC 打架。
+  std::shared_ptr<PcStatsState> pc_stats_ = std::make_shared<PcStatsState>();
+  std::thread stats_;
+  std::atomic<bool> stats_stop_{false};
+  // 最近一次采样窗口的派生值，采集线程逐帧发事件时直接读这三个原子量。
+  std::atomic<uint32_t> sample_frame_bytes_{0};   // 窗口内平均每帧编码字节数
+  std::atomic<uint32_t> sample_bitrate_kbps_{0};  // 窗口内码率（kbit/s）
+  std::atomic<uint32_t> sample_keyframe_{0};      // 该窗口内 keyFramesEncoded 有增长
 
   // 事件队列（有界 deque）：多生产者（pump / signaling / 协商线程 / 控制线程）、
   // 单消费者。SIGNAL_OUT 的 JSON 跟着队列项一起走，投递时才把指针填进事件。
@@ -737,8 +786,6 @@ MediaEngine::~MediaEngine() {
   ReleaseStreamObjects();
 
   pc_factory_ = nullptr;
-  encoder_factory_.reset();
-  env_.reset();
 
   if (signaling_ != nullptr) signaling_->Stop();
   if (worker_ != nullptr) worker_->Stop();
@@ -829,11 +876,6 @@ bool MediaEngine::Init(const pu_config* cfg, std::string* error) {
     SetLastError(*error);
     return false;
   }
-
-  // 本切片直接建编码器用的工厂与 Environment（与 PC 用的那份互不共享所有权）。
-  encoder_factory_ =
-      std::make_unique<webrtc::VideoEncoderFactoryTemplate<webrtc::LibvpxVp8EncoderTemplateAdapter>>();
-  env_ = webrtc::EnvironmentFactory().Create();
 
   // 探一下媒体引擎真的装上了：拿不到视频发送编解码器就是 EnableMedia 没生效。
   std::vector<std::string> codecs;
@@ -932,8 +974,10 @@ int MediaEngine::Start(const char* screen_id, std::string* error) {
     }
   }
 
-  // 编码器在采集线程里创建并初始化（libvpx 的 encoder 不是线程安全的，
-  // 让创建/使用/释放都落在同一个线程上，省掉所有跨线程假设）。
+  // v2.1：采集线程只做「造帧 → 喂 VideoTrack → 发 PU_EVENT_FRAME」，不再建编码器。
+  // 同时起 250 ms 的 PC 统计采样线程（PU_EVENT_FRAME 的 bytes/key/bitrate 由它派生）。
+  // 采样线程揣着自己那份 pc 引用，Stop() 里先 join 再释放 PC。
+  StartStatsSampler(pc_);
   stop_requested_.store(false, std::memory_order_relaxed);
   {
     std::lock_guard<std::mutex> lock(start_mu_);
@@ -950,12 +994,13 @@ int MediaEngine::Start(const char* screen_id, std::string* error) {
     const bool finished = start_cv_.wait_for(lock, std::chrono::seconds(10),
                                              [this] { return start_done_; });
     started = finished && start_ok_;
-    start_error = finished ? start_error_ : std::string("encoder start timed out");
+    start_error = finished ? start_error_ : std::string("capture thread start timed out");
   }
 
   if (!started) {
     stop_requested_.store(true, std::memory_order_relaxed);
     if (pump_.joinable()) pump_.join();
+    StopStatsSampler();
     ReleaseStreamObjects();
     state_ = PU_STREAM_FAILED;
     PushState(PU_STREAM_FAILED, PU_STREAM_STARTING, PU_REASON_MEDIA_FAILURE);
@@ -964,13 +1009,14 @@ int MediaEngine::Start(const char* screen_id, std::string* error) {
     return PU_ERR_MEDIA;
   }
 
-  // v2：生成 offer 并设置本地描述。放在采集线程起来之后，这样编码器启动失败时
+  // v2：生成 offer 并设置本地描述。放在采集线程起来之后，这样采集线程起不来时
   // 不用回滚已经发出去的 SDP。
   {
     std::string sdp_error;
     if (!CreateOfferAndSetLocal(&sdp_error)) {
       stop_requested_.store(true, std::memory_order_relaxed);
       if (pump_.joinable()) pump_.join();
+      StopStatsSampler();
       ReleaseStreamObjects();
       state_ = PU_STREAM_FAILED;
       PushState(PU_STREAM_FAILED, PU_STREAM_STARTING, PU_REASON_MEDIA_FAILURE);
@@ -1004,6 +1050,9 @@ int MediaEngine::Stop() {
       stop_requested_.store(true, std::memory_order_relaxed);
       pump_.join();
     }
+    // v2.1：pump 停了之后才停采样线程——它在收尾时会再取一份报告，把
+    // frames_encoded 追到终值（没有新帧要说，这份就是最终数）。
+    StopStatsSampler();
     // 接收侧 PC（没 start、只收不发）也要关掉；没有 PC 时这里是无操作。
     ReleaseStreamObjects();
     return PU_OK;
@@ -1014,6 +1063,9 @@ int MediaEngine::Stop() {
 
   stop_requested_.store(true, std::memory_order_relaxed);
   if (pump_.joinable()) pump_.join();
+
+  // v2.1：同上——pump 已停，采样线程取完最后一份报告再退（幂等）。
+  StopStatsSampler();
 
   running_ = false;
   ReleaseStreamObjects();
@@ -1477,7 +1529,10 @@ int MediaEngine::PeerStats(pu_stats* out) {
   out->ice_state = stat_ice_state_.load(std::memory_order_relaxed);
   out->has_peer = pc_ != nullptr ? 1u : 0u;
   out->frames_sent = stat_frames_sent_.load(std::memory_order_relaxed);
-  out->frames_encoded = stat_frames_encoded_.load(std::memory_order_relaxed);
+  // v2.1：本地编码器已删除，这个数就是 PC 的 outbound-rtp.framesEncoded（1:1 编码
+  // 时等于 PU_EVENT_FRAME 的条数）。采样节拍 250 ms，最多陈旧一个窗口。
+  out->frames_encoded = static_cast<uint32_t>(
+      std::min<uint64_t>(pc_stats_->frames_encoded.load(std::memory_order_relaxed), 0xFFFFFFFFu));
   out->frames_dropped = stat_frames_dropped_.load(std::memory_order_relaxed);
   out->frames_received = stat_frames_received_.load(std::memory_order_relaxed);
   out->signal_out_count = stat_signal_out_.load(std::memory_order_relaxed);
@@ -1515,31 +1570,12 @@ void MediaEngine::OnRemoteFrame(const webrtc::VideoFrame& frame) {
 }
 
 // ---------------------------------------------------------------------------
-// 采集 / 编码（v1，未改语义，只加了统计计数）
+// 采集 / 发事件（v2.1：本地编码器已删除）
 // ---------------------------------------------------------------------------
 void MediaEngine::PumpLoop() {
-
-  std::unique_ptr<webrtc::VideoEncoder> encoder =
-      encoder_factory_->Create(*env_, webrtc::SdpVideoFormat::VP8());
-  if (encoder == nullptr) {
-    SignalStart(false, "VP8 encoder unavailable (video encoder factory not installed?)");
-    return;
-  }
-
-  const webrtc::VideoCodec codec = MakeVp8CodecSettings();
-  const int init_rc = encoder->InitEncode(
-      &codec, webrtc::VideoEncoder::Settings(webrtc::VideoEncoder::Capabilities(false),
-                                             static_cast<int>(std::thread::hardware_concurrency()),
-                                             1200));
-  if (init_rc != 0) {
-    SignalStart(false, "VP8 InitEncode failed, rc=" + std::to_string(init_rc));
-    return;
-  }
-  encoder->RegisterEncodeCompleteCallback(this);
-  encoder_ = encoder.get();
-
-  // 编码器就绪后才挂 sink：否则第一帧可能落进还没准备好的回调里。
-  source_->AddOrUpdateSink(this, webrtc::VideoSinkWants());
+  // 以前这里先 InitEncode 一个本地 VP8 编码器、把它挂成采集源的 sink。现在采集源
+  // 只挂 VideoTrack，唯一的编码点就是 PC 的 VideoStreamEncoder，所以起跑时没有
+  // 可失败的东西，直接通知控制线程「采集线程已在跑」。
   SignalStart(true, "");
 
   auto next_tick = std::chrono::steady_clock::now();
@@ -1559,10 +1595,13 @@ void MediaEngine::PumpLoop() {
                                              static_cast<uint32_t>(timestamp_us * 90 / 1000))
                                          .build();
 
-    // 同步回调 OnFrame → encoder->Encode，都在本线程；同时 PC 的 VideoStreamEncoder
-    // 也挂着同一个源，所以这一帧会被两路分别编码（见文件头注释的「已知代价」）。
+    // 只喂 VideoTrack：唯一的编码点就是 PC 的 VideoStreamEncoder。
+    // （v2 里这里还同步回调 OnFrame → 本地 encoder->Encode，同一帧被编码两次。）
     source_->PushFrame(frame);
     stat_frames_sent_.fetch_add(1, std::memory_order_relaxed);
+
+    // 事件仍然逐帧产出；bytes/key/bitrate 用最近一次 250 ms 采样窗口的值。
+    PushFrameEvent(timestamp_us);
 
     ++index;
     timestamp_us += kFrameIntervalUs;
@@ -1574,11 +1613,7 @@ void MediaEngine::PumpLoop() {
     std::this_thread::sleep_until(next_tick);
   }
 
-  encoder_ = nullptr;
-  source_->RemoveSink(this);
-  encoder->RegisterEncodeCompleteCallback(nullptr);
-  encoder->Release();
-  Log(3, "encoder released after %llu frames", static_cast<unsigned long long>(index));
+  Log(3, "capture stopped after %llu frames", static_cast<unsigned long long>(index));
 }
 
 void MediaEngine::SignalStart(bool ok, const std::string& error) {
@@ -1591,60 +1626,146 @@ void MediaEngine::SignalStart(bool ok, const std::string& error) {
   start_cv_.notify_all();
 }
 
-void MediaEngine::OnFrame(const webrtc::VideoFrame& frame) {
-  if (encoder_ == nullptr) return;
-  capture_ts_us_ = frame.timestamp_us();
-  // 丢弃返回值没关系：真的要丢帧时编码器会走 OnFrameDropped。
-  static_cast<void>(encoder_->Encode(frame, nullptr));
-}
-
-webrtc::EncodedImageCallback::Result MediaEngine::OnEncodedImage(
-    const webrtc::EncodedImage& encoded_image,
-    const webrtc::CodecSpecificInfo* codec_specific_info) {
-  static_cast<void>(codec_specific_info);
-
+void MediaEngine::PushFrameEvent(int64_t capture_ts_us) {
   const uint64_t sequence = frame_sequence_++;
-  stat_frames_encoded_.fetch_add(1, std::memory_order_relaxed);
-  const int64_t now_us = NowUsSteady();
-  rate_window_.emplace_back(now_us, static_cast<uint32_t>(encoded_image.size()));
-  while (!rate_window_.empty() && now_us - rate_window_.front().first > kRateWindowUs) {
-    rate_window_.pop_front();
-  }
-  uint64_t window_bytes = 0;
-  for (const auto& entry : rate_window_) {
-    window_bytes += entry.second;
-  }
-  // 早期窗口太短时按 100ms 兜底，避免第一帧算出天文数字。
-  const int64_t span_us =
-      std::max<int64_t>(100000, std::min<int64_t>(kRateWindowUs, now_us - rate_window_.front().first));
-  const uint32_t bitrate_kbps =
-      static_cast<uint32_t>(window_bytes * 8 * 1000000ULL / static_cast<uint64_t>(span_us) / 1000ULL);
-
   pu_event event = MakeEvent(PU_EVENT_FRAME);
-  event.timestamp_us = NowUsSystem();
   event.data.frame.sequence = sequence;
-  event.data.frame.capture_ts_us = capture_ts_us_;
+  event.data.frame.capture_ts_us = capture_ts_us;
   event.data.frame.width = kWidth;
   event.data.frame.height = kHeight;
-  event.data.frame.bytes = static_cast<uint32_t>(encoded_image.size());
-  event.data.frame.bitrate_kbps = bitrate_kbps;
-  event.data.frame.keyframe =
-      (encoded_image._frameType == webrtc::VideoFrameType::kVideoFrameKey) ? 1u : 0u;
+  // 下面三个字段来自 PC 的 GetStats 采样（见 StatsSampleLoop）：逐帧拿不到真实
+  // 编码字节数，用「最近一个采样窗口的均值」代表一帧，码率同窗口。
+  event.data.frame.bytes = sample_frame_bytes_.load(std::memory_order_relaxed);
+  event.data.frame.bitrate_kbps = sample_bitrate_kbps_.load(std::memory_order_relaxed);
+  event.data.frame.keyframe = sample_keyframe_.load(std::memory_order_relaxed);
   event.data.frame.reserved = 0;
   PushEvent(event);
-
-  return webrtc::EncodedImageCallback::Result(
-      webrtc::EncodedImageCallback::Result::OK, static_cast<uint32_t>(sequence));
 }
 
-void MediaEngine::OnFrameDropped(uint32_t rtp_timestamp,
-                                 int spatial_id,
-                                 bool is_end_of_temporal_unit) {
-  static_cast<void>(rtp_timestamp);
-  static_cast<void>(spatial_id);
-  static_cast<void>(is_end_of_temporal_unit);
-  stat_frames_dropped_.fetch_add(1, std::memory_order_relaxed);
-  Log(4, "encoder dropped a frame");
+// ---------------------------------------------------------------------------
+// v2.1：PC 统计采样（PU_EVENT_FRAME 的 bytes / keyframe / bitrate 由此派生）
+// ---------------------------------------------------------------------------
+
+void MediaEngine::StartStatsSampler(webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc) {
+  if (pc == nullptr) return;
+  if (stats_.joinable()) return;  // 已经在跑（正常路径不会重复 start）
+  stats_stop_.store(false, std::memory_order_relaxed);
+  stats_ = std::thread([this, pc] { StatsSampleLoop(pc); });
+}
+
+void MediaEngine::StopStatsSampler() {
+  stats_stop_.store(true, std::memory_order_relaxed);
+  if (!stats_.joinable()) return;
+  stats_.join();
+  // 采样线程可能在队列里留下最后一条 GetStats 任务：它揣着 PC 的引用，如果让它
+  // 留到 signaling_->Stop() 被丢弃，PC 就可能在控制线程上析构（libwebrtc 的
+  // PeerConnection 是要在 signaling 线程上析构的）。这里投一条空任务把它排干。
+  if (signaling_ != nullptr) signaling_->BlockingCall([] {});
+  // 收尾时把 PC 侧的累计量报一次：这是「一共编码了多少帧」的直接证据（1:1 时
+  // 应该等于采集推出去的帧数，而不是它的两倍）。
+  Log(3, "pc stats at stop: framesEncoded=%llu bytesSent=%llu keyFramesEncoded=%llu (samples=%u)",
+      static_cast<unsigned long long>(pc_stats_->frames_encoded.load(std::memory_order_relaxed)),
+      static_cast<unsigned long long>(pc_stats_->bytes_sent.load(std::memory_order_relaxed)),
+      static_cast<unsigned long long>(
+          pc_stats_->key_frames_encoded.load(std::memory_order_relaxed)),
+      pc_stats_->reports.load(std::memory_order_relaxed));
+}
+
+// 发起一次异步 GetStats 并把回调挂到 signaling 线程上。这里只投递、不等待：
+// 回调在 signaling 线程送达，阻塞等待会直接死锁（spike 里写死过的坑）。
+void MediaEngine::RequestStats(webrtc::PeerConnectionInterface* pc) {
+  if (pc == nullptr || signaling_ == nullptr || pc_stats_ == nullptr) return;
+  std::shared_ptr<PcStatsState> state = pc_stats_;
+  // 任务自己揣着 pc 的引用：即使引擎已经收摊，队列里这一条也不会打到悬空指针上。
+  signaling_->PostTask(
+      [pc_ref = webrtc::scoped_refptr<webrtc::PeerConnectionInterface>(pc), state] {
+        // 裸指针参数由 PC 接管所有权（rtc 的注释：Takes shared ownership）。
+        pc_ref->GetStats(new webrtc::RefCountedObject<StatsCollector>(state));
+      });
+}
+
+void MediaEngine::StatsSampleLoop(webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc) {
+  int64_t prev_us = NowUsSteady();
+  uint64_t prev_bytes = 0;
+  uint64_t prev_frames = 0;
+  uint64_t prev_keys = 0;
+
+  // 读一次共享状态、算一个窗口的增量、写回三个派生量。只在本线程调用。
+  const auto sample_once = [&] {
+    const uint32_t reports = pc_stats_->reports.load(std::memory_order_relaxed);
+    const uint64_t bytes = pc_stats_->bytes_sent.load(std::memory_order_relaxed);
+    const uint64_t frames = pc_stats_->frames_encoded.load(std::memory_order_relaxed);
+    const uint64_t keys = pc_stats_->key_frames_encoded.load(std::memory_order_relaxed);
+    const int64_t now_us = NowUsSteady();
+
+    if (reports > 0) {
+      // 计数器只会在「换了一个新 PC」时倒退；这时把当前值整个当成一轮增量。
+      const uint64_t d_bytes = bytes >= prev_bytes ? bytes - prev_bytes : bytes;
+      const uint64_t d_frames = frames >= prev_frames ? frames - prev_frames : frames;
+      const uint64_t d_keys = keys >= prev_keys ? keys - prev_keys : keys;
+      const int64_t span_us = std::max<int64_t>(1, now_us - prev_us);
+
+      if (d_frames > 0) {
+        sample_frame_bytes_.store(
+            static_cast<uint32_t>(std::min<uint64_t>(d_bytes / d_frames, 0xFFFFFFFFu)),
+            std::memory_order_relaxed);
+        sample_bitrate_kbps_.store(
+            static_cast<uint32_t>(std::min<uint64_t>(
+                d_bytes * 8 * 1000000ULL / static_cast<uint64_t>(span_us) / 1000ULL, 0xFFFFFFFFu)),
+            std::memory_order_relaxed);
+        sample_keyframe_.store(d_keys > 0 ? 1u : 0u, std::memory_order_relaxed);
+      } else {
+        // 这一窗没有编码帧（例如 DTLS 还没通）：key 归 0，byte/码率沿用上次读数。
+        sample_keyframe_.store(0, std::memory_order_relaxed);
+      }
+
+      Log(4,
+          "pc stats: framesEncoded=%llu (+%llu) bytesSent=%llu (+%llu) "
+          "keyFramesEncoded=%llu (+%llu) -> %u B/frame, %u kbps",
+          static_cast<unsigned long long>(frames), static_cast<unsigned long long>(d_frames),
+          static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(d_bytes),
+          static_cast<unsigned long long>(keys), static_cast<unsigned long long>(d_keys),
+          sample_frame_bytes_.load(std::memory_order_relaxed),
+          sample_bitrate_kbps_.load(std::memory_order_relaxed));
+    }
+
+    prev_bytes = bytes;
+    prev_frames = frames;
+    prev_keys = keys;
+    prev_us = now_us;
+  };
+
+  // 先要一份：这样第一个 250 ms 窗口结束时就有可用的累计量做差。
+  RequestStats(pc.get());
+
+  while (!stats_stop_.load(std::memory_order_relaxed)) {
+    // 把 250 ms 切成 10 ms 的片，stop 时最多 10 ms 就能退出来。
+    for (int slept = 0; slept < kStatsSampleIntervalMs; slept += kStatsSleepSliceMs) {
+      if (stats_stop_.load(std::memory_order_relaxed)) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(kStatsSleepSliceMs));
+    }
+    if (stats_stop_.load(std::memory_order_relaxed)) break;
+    sample_once();
+    RequestStats(pc.get());  // 为下一拍取数
+  }
+
+  // 收尾：Stop() 里 pump 已经先停了（不会再有新帧），这里再取一份报告把
+  // framesEncoded 追到终值——调用方在 stop 之后读到的编码次数就不是「最多陈旧
+  // 250 ms」的数了。等报告也在本线程上等，绝不阻塞控制线程。
+  //
+  // 只在「已经拿到过报告」时才等：连 outbound 统计都还没有（例如对端还没连上）
+  // 的时候再等也不会有新东西，白白把 stop 拖慢几百毫秒。
+  if (pc_stats_->reports.load(std::memory_order_relaxed) > 0) {
+    const uint32_t reports_before = pc_stats_->reports.load(std::memory_order_relaxed);
+    RequestStats(pc.get());
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(kStatsFinalWaitMs);
+    while (std::chrono::steady_clock::now() < deadline &&
+           pc_stats_->reports.load(std::memory_order_relaxed) <= reports_before) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    sample_once();
+  }
 }
 
 pu_event MediaEngine::MakeEvent(uint32_t type) const {

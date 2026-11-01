@@ -8,6 +8,8 @@
 //   1. A、B 双方 pu_peer_stats 的 peer_state == PU_PEER_CONNECTED（ICE 连通 + DTLS 完成）；
 //   2. B 的 frames_received > 0，且真的收到过 PU_EVENT_REMOTE_FRAME（远端帧数硬判据）；
 //   3. 稳定窗口内「A 推帧增量 − B 收帧增量」= 丢帧数，可算出丢了多少帧；
+//   3b. v2.1：同一窗口内 PC 的 outbound-rtp.framesEncoded 增量 ≈ A 的推帧增量
+//      （1:1），并且不到 1.5 倍（2 倍就意味着同一帧被编码了两次）；
 //   4. 全程没有 PU_EVENT_ERROR；
 //   5. 负路径返回码正确：坏 JSON / 未知 type → PU_ERR_INVALID_ARG；共享中收到 offer
 //      （glare）→ PU_ERR_STATE；结构体过小 → PU_ERR_INVALID_ARG。
@@ -30,6 +32,9 @@ namespace {
 constexpr int kRunSeconds = 20;       // 整体超时
 constexpr int kMeasureWindowMs = 2000; // 丢帧统计窗口
 constexpr int kMinReceivedFrames = 10; // 进入测量前至少收到这么多帧
+// 编码计数按 250 ms 采样，一次比较涉及两个采样点，30 fps 下最多差 2×8 帧；
+// 留到 16 帧的余量，避免把采样抖动当成断言失败。
+constexpr int kWindowSampleLagFrames = 16;
 
 const char* PeerStateName(int state) {
   switch (state) {
@@ -318,6 +323,10 @@ int main() {
   const long long recv_delta =
       static_cast<long long>(after_b.frames_received) - before_b.frames_received;
   const long long lost = sent_delta > recv_delta ? sent_delta - recv_delta : 0;
+  // v2.1：A 的 PC 在同一窗口里编码了多少帧。这是「编码到底做了几次」的直接证据：
+  // 1:1 时等于 sent_delta；2 倍就意味着同一帧被两个编码器各编码了一次。
+  const long long encoded_delta = static_cast<long long>(after_a.frames_encoded) -
+                                  static_cast<long long>(before_a.frames_encoded);
 
   // ---- 4. 负路径：信封/状态错误必须被区分开 ----
   int negative_failures = 0;
@@ -392,6 +401,8 @@ int main() {
               tally_b.forwarded);
   std::printf("  loss window           : %lld ms\n", static_cast<long long>(window_ms));
   std::printf("  sent delta            : %lld frames (A)\n", sent_delta);
+  std::printf("  encoded delta         : %lld frames (A, PC outbound-rtp.framesEncoded)\n",
+              encoded_delta);
   std::printf("  received delta        : %lld frames (B)\n", recv_delta);
   std::printf("  LOST in window        : %lld frame(s) (%.2f%%)\n", lost,
               sent_delta > 0 ? 100.0 * static_cast<double>(lost) / static_cast<double>(sent_delta)
@@ -424,6 +435,17 @@ int main() {
   }
   if (tally_a.error_events != 0 || tally_b.error_events != 0) {
     std::printf("FAIL: error events were emitted\n");
+    ++failures;
+  }
+  // v2.1：每帧只编码一次。判定沿用「稳定窗口」口径——只有连上之后 A 才真的在编码。
+  if (sent_delta > 0 && encoded_delta * 2 >= sent_delta * 3) {
+    std::printf("FAIL: encoding looks doubled in the window (%lld encoded for %lld pushed)\n",
+                encoded_delta, sent_delta);
+    ++failures;
+  }
+  if (encoded_delta + kWindowSampleLagFrames < sent_delta) {
+    std::printf("FAIL: PC encoded only %lld of the %lld frame(s) pushed in the window\n",
+                encoded_delta, sent_delta);
     ++failures;
   }
   if (negative_failures != 0) {

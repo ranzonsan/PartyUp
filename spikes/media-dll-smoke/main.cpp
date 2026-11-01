@@ -196,6 +196,9 @@ int main() {
   int state_events = 0;
   int error_events = 0;
   int other_events = 0;
+  int signal_events = 0;      // v2: PU_EVENT_SIGNAL_OUT
+  bool saw_offer_signal = false;
+  int remote_frames = 0;      // v2: PU_EVENT_REMOTE_FRAME（本测试没有对端，恒为 0）
   bool saw_running = false;
   uint64_t total_bytes = 0;
   uint64_t key_frames = 0;
@@ -251,6 +254,22 @@ int main() {
         ++error_events;
         std::printf("error event: code=%d message=%s\n", event.data.error.code,
                     event.data.error.message);
+        break;
+      case PU_EVENT_SIGNAL_OUT: {
+        // v2：start 之后引擎会把自己生成的 offer 交出来，UI 负责发给服务端。
+        // 本测试没有服务端也没有对端，只确认这条通道真的会冒事件、payload 是合法 JSON。
+        const pu_signal_event& signal = event.data.signal;
+        ++signal_events;
+        if (signal.kind == PU_SIGNAL_OFFER) saw_offer_signal = true;
+        std::printf("signal out: kind=%u len=%u payload=%s%s\n", signal.kind,
+                    signal.payload_len,
+                    signal.payload != nullptr ? std::string(signal.payload).substr(0, 48).c_str()
+                                              : "(null)",
+                    signal.payload_len > 48 ? "..." : "");
+        break;
+      }
+      case PU_EVENT_REMOTE_FRAME:
+        ++remote_frames;
         break;
       default:
         ++other_events;
@@ -324,6 +343,9 @@ int main() {
               saw_running ? "yes" : "no");
   std::printf("  error events      : %d\n", error_events);
   std::printf("  other events      : %d\n", other_events);
+  std::printf("  signal events     : %d (saw offer: %s)\n", signal_events,
+              saw_offer_signal ? "yes" : "no");
+  std::printf("  remote frames     : %d\n", remote_frames);
   if (frames > 1) {
     const double span_s = static_cast<double>(last_capture_us - first_capture_us) / 1e6;
     std::printf("  capture span      : %.3f s (%.1f fps)\n", span_s,
@@ -351,6 +373,11 @@ int main() {
   }
   if (error_events != 0) {
     std::printf("FAIL: %d error event(s)\n", error_events);
+    return 1;
+  }
+  if (!saw_offer_signal) {
+    // v2：start 之后必须能看到一条 offer 信令出去，否则「信令通道 + PC」等于没接上。
+    std::printf("FAIL: no PU_EVENT_SIGNAL_OUT offer was emitted after pu_screen_start\n");
     return 1;
   }
   if (stop_rc != PU_OK || second_stop_rc != PU_OK) {

@@ -1,32 +1,42 @@
-/* PartyUp 媒体核心 · 窄 C ABI（v1）
+/* PartyUp 媒体核心 · 窄 C ABI（v2）
  *
- * 设计约束（见 docs/ARCHITECTURE.md §2.1 与 docs/spikes/2026-11-01-c-abi.md）：
+ * 设计约束（见 docs/ARCHITECTURE.md §2.1 与 docs/spikes/2026-11-01-c-abi.md、
+ * docs/spikes/2026-11-01-signaling-abi.md）：
  *   * 纯 C 接口，只暴露 C 类型：不透明句柄 + 定长 POD 结构 + 返回码；
  *   * 不跨边界传 std::string / std::vector，字符串一律 const char*（UTF-8，0 结尾），
  *     内存由调用方或库持有，所有权在函数注释里写死；
  *   * 任何 C++ 异常都不会穿越 ABI：失败一律用负返回码 + pu_last_error()；
  *   * 头文件可被 C 与 C++ 同时包含；C++ 侧编译 DLL 时定义 PU_BUILD_SHARED。
  *
- * 本版（ABI v1，第一切片）只实现 6 个函数：
- *     pu_engine_create / pu_engine_destroy
- *     pu_screen_start / pu_screen_stop
- *     pu_poll_event / pu_last_error
- * 其余 10 个函数按 ARCHITECTURE 的签名先声明，统一返回 PU_NOT_IMPLEMENTED。
+ * 版本历史：
+ *   v1（第一切片）6 个函数：engine_create / engine_destroy / screen_start /
+ *       screen_stop / poll_event / last_error。只有合成采集源，没有网络。
+ *   v2（本版）补上信令通道并把真 PeerConnection 接进来：
+ *       - 新函数 pu_signal_in（UI 把服务端下发的信令 JSON 原样灌进来）、
+ *         pu_peer_stats（读回发/收帧计数，测试用来断言）；
+ *       - 新事件 PU_EVENT_SIGNAL_OUT（待发往服务端的信令 JSON）、
+ *         PU_EVENT_REMOTE_FRAME（解出的远端帧）；
+ *       - pu_screen_start 现在会建 PeerConnection、AddTrack、生成 offer；
+ *       - v1 的 6 个函数语义**不变**，v1 的调用方无需改代码。
  *
  * 线程约定：所有 pu_* 调用必须来自同一个「控制线程」（通常是 UI 线程），
- * 且不得在库触发的任何回调里重入（本版库里没有回调，全部走 pu_poll_event 轮询）。
+ * 且不得在库触发的任何回调里重入——本库没有任何回调，通知一律走 pu_poll_event。
  */
 #ifndef PARTYUP_MEDIA_H
 #define PARTYUP_MEDIA_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* ABI 版本。结构体或函数签名有不兼容改动时 +1。 */
-#define PU_ABI_VERSION 1
+/* ABI 版本。结构体或函数签名有不兼容改动时 +1。
+ * v1 → v2：只**新增**（事件类型、结构、函数），没有改动任何 v1 已有字段的
+ * 偏移与语义，所以 v1 编译出来的客户端仍能跑（除非它把 pu_event 的 type 当作
+ * 枚举全集做了穷举断言）。 */
+#define PU_ABI_VERSION 2
 
 #if defined(_WIN32)
 #  if defined(PU_BUILD_SHARED)
@@ -100,10 +110,57 @@ typedef enum pu_state_reason {
 /* 事件类型。 */
 typedef enum pu_event_type {
   PU_EVENT_NONE = 0,
-  PU_EVENT_STATE = 1, /* 状态迁移：data.state */
-  PU_EVENT_FRAME = 2, /* 一帧编码完成：data.frame */
-  PU_EVENT_ERROR = 3  /* 错误：data.error */
+  PU_EVENT_STATE = 1,        /* 状态迁移：data.state */
+  PU_EVENT_FRAME = 2,        /* 一帧本地编码完成：data.frame */
+  PU_EVENT_ERROR = 3,        /* 错误：data.error */
+  /* ---- v2 新增 ---- */
+  PU_EVENT_SIGNAL_OUT = 4,   /* 待发往服务端的信令 JSON：data.signal */
+  PU_EVENT_REMOTE_FRAME = 5  /* 解出一帧远端视频：data.remote */
 } pu_event_type;
+
+/* 信令种类（pu_signal_event.kind）。与信封里的 "type" 字段一一对应，
+ * 方便 UI 不解析 JSON 就能分类（日志/统计/选通道）。 */
+typedef enum pu_signal_kind {
+  PU_SIGNAL_OFFER = 1,
+  PU_SIGNAL_ANSWER = 2,
+  PU_SIGNAL_CANDIDATE = 3
+} pu_signal_kind;
+
+/* 待发往服务端的信令（PU_EVENT_SIGNAL_OUT）。
+ *
+ * payload 是**库持有**的 UTF-8 JSON，不是 0 结尾（按 payload_len 读；实现上额外
+ * 保证末尾有 0，方便 C 侧直接当字符串用，但不要依赖它）。指针有效期：
+ *   * 到 pu_engine_destroy 为止，或
+ *   * 到该引擎累计又有 64 条信令被取走、最旧这条被回收为止
+ *     （即「取走后再用一下」永远安全，长期持有指针不安全）。
+ * 因为 SDP 有几 KB，装不进定长事件结构，只能给指针——这与 v1 的「事件按值复制」
+ * 不同，是 v2 唯一的「库持有、调用方只读」输出。
+ *
+ * 信封格式见 docs/spikes/2026-11-01-signaling-abi.md：
+ *   {"type":"offer","sdp":"..."}
+ *   {"type":"answer","sdp":"..."}
+ *   {"type":"candidate","mid":"0","mline":0,"candidate":"candidate:..."}
+ */
+typedef struct pu_signal_event {
+  const char* payload;    /* UTF-8 JSON，库持有，见上；可能为 NULL（不应发生） */
+  uint32_t payload_len;   /* payload 的字节数，不含结尾 0 */
+  uint32_t kind;          /* pu_signal_kind */
+  uint32_t reserved;      /* 0 */
+} pu_signal_event;
+
+/* 解出的一帧远端视频（PU_EVENT_REMOTE_FRAME）。
+ * 这里只给「有一帧到了」的信息与尺寸，像素数据要等后续版本的 pu_frame_acquire；
+ * 真正权威的计数看 pu_peer_stats。 */
+typedef struct pu_remote_frame_event {
+  uint64_t sequence;       /* 该引擎收到的第 N 帧，0 起 */
+  int64_t timestamp_us;    /* 解码器重建的采样时间戳：不是 system_clock 纪元，
+                            * 只用来算帧间隔/抖动；对时用 received_at_us */
+  int64_t received_at_us;  /* 本端收到的时刻，system_clock 纪元微秒 */
+  uint32_t width;
+  uint32_t height;
+  uint32_t frames_received; /* 累计收到帧数 = sequence + 1 */
+  uint32_t reserved;
+} pu_remote_frame_event;
 
 /* 一帧编码完成。sequence 从 0 递增；bitrate_kbps 是最近 1 秒的编码码率。 */
 typedef struct pu_frame_event {
@@ -134,14 +191,17 @@ typedef struct pu_error_event {
 
 /* 事件。size 固定 256 字节、8 字节对齐；调用方先填 struct_size 再交给
  * pu_poll_event，库只写这一版认识的字段。
- * 布局：
+ * 布局（v2 只在 union 里追加成员，v1 的四个偏移一个没动）：
  *   0   struct_size   4   type
  *   8   timestamp_us
  *   16  data（union，240 字节）：
- *         frame: sequence@16 capture_ts_us@24 width@32 height@36
- *                bytes@40 bitrate_kbps@44 keyframe@48 reserved@52
- *         state: state@16 previous_state@20 reason@24 reserved@28
- *         error: code@16 reserved@20 message[232]@24
+ *         frame:   sequence@16 capture_ts_us@24 width@32 height@36
+ *                  bytes@40 bitrate_kbps@44 keyframe@48 reserved@52
+ *         state:   state@16 previous_state@20 reason@24 reserved@28
+ *         error:   code@16 reserved@20 message[232]@24
+ *         signal:  payload@16 payload_len@24 kind@28 reserved@32   （v2，24 字节）
+ *         remote:  sequence@16 timestamp_us@24 received_at_us@32 width@40
+ *                  height@44 frames_received@48 reserved@52          （v2，40 字节）
  */
 typedef struct pu_event {
   uint32_t struct_size;      /* 调用方填 sizeof(pu_event) */
@@ -151,8 +211,56 @@ typedef struct pu_event {
     pu_frame_event frame;
     pu_state_event state;
     pu_error_event error;
+    pu_signal_event signal;  /* v2: PU_EVENT_SIGNAL_OUT */
+    pu_remote_frame_event remote; /* v2: PU_EVENT_REMOTE_FRAME */
   } data;
 } pu_event;
+
+/* PeerConnection 状态（pu_stats.peer_state）。取值与 libwebrtc 的
+ * PeerConnectionInterface::PeerConnectionState 一致，直接映射，不重新编号。 */
+typedef enum pu_peer_state {
+  PU_PEER_NONE = -1,        /* 引擎里还没有 PeerConnection（还没 start，也没收到 offer） */
+  PU_PEER_NEW = 0,
+  PU_PEER_CONNECTING = 1,
+  PU_PEER_CONNECTED = 2,    /* ICE 连通 + DTLS 握手完成，媒体可通 */
+  PU_PEER_DISCONNECTED = 3,
+  PU_PEER_FAILED = 4,
+  PU_PEER_CLOSED = 5
+} pu_peer_state;
+
+/* ICE 状态（pu_stats.ice_state）。同样与 libwebrtc 的 IceConnectionState 对齐。 */
+typedef enum pu_ice_state {
+  PU_ICE_NEW = 0,
+  PU_ICE_CHECKING = 1,
+  PU_ICE_CONNECTED = 2,
+  PU_ICE_COMPLETED = 3,
+  PU_ICE_FAILED = 4,
+  PU_ICE_DISCONNECTED = 5,
+  PU_ICE_CLOSED = 6
+} pu_ice_state;
+
+/* 引擎实时统计（pu_peer_stats 输出）。全字段由引擎在内部原子量上快照，不加锁、
+ * 不发起异步 GetStats，因此这个调用是即时的（微秒级）。
+ *
+ * 「丢了多少帧」的算法：发送端 frames_sent（推进采集源的帧数）减去接收端
+ * frames_received（解码后回调到的帧数）。两个引擎各读一次就能算出来；同一引擎
+ * 自环时 frames_sent - frames_received 也成立（发送与接收在同一个引擎上时）。 */
+typedef struct pu_stats {
+  uint32_t struct_size;        /* 调用方填 sizeof(pu_stats) */
+  int32_t  peer_state;         /* pu_peer_state；无 PC 时是 PU_PEER_NONE */
+  int32_t  ice_state;          /* pu_ice_state；无 PC 时是 0 */
+  uint32_t has_peer;           /* 1 = 引擎内已建 PeerConnection */
+  uint32_t frames_sent;        /* 推进采集源的帧数（本地发送侧） */
+  uint32_t frames_encoded;     /* 本地编码完成的帧数（= PU_EVENT_FRAME 的条数） */
+  uint32_t frames_dropped;     /* 被编码器主动丢弃的帧（过期/降帧） */
+  uint32_t frames_received;    /* 远端解码后回调到引擎的帧数（接收侧硬判据） */
+  uint32_t signal_out_count;   /* 已产生的信令事件数（offer/answer/candidate 合计） */
+  uint32_t event_drops;        /* 事件队列满导致的丢事件数 */
+  uint32_t remote_width;       /* 最近一帧远端视频的宽，0 = 还没收到 */
+  uint32_t remote_height;      /* 最近一帧远端视频的高 */
+  uint32_t reserved;           /* 0 */
+  uint64_t last_remote_frame_us; /* 最近一帧远端帧的接收时刻，0 = 还没收到 */
+} pu_stats;
 
 /* 后续函数用到的结构（本版只声明，字段在实现对应功能时定稿）。 */
 
@@ -210,10 +318,15 @@ PU_API void pu_engine_destroy(pu_engine* e);
 
 /* 开始一路屏幕共享。screen_id 为 NULL 或 "synthetic" 时使用内置合成源。
  * 成功返回 PU_OK；已在运行返回 PU_ERR_STATE；媒体初始化失败返回 PU_ERR_MEDIA，
- * 细节见 pu_last_error()。 */
+ * 细节见 pu_last_error()。
+ *
+ * v2 起本调用还会：建 PeerConnection → AddTrack(视频轨) → CreateOffer →
+ * SetLocalDescription → 等 ICE 收集完成后推一个 PU_EVENT_SIGNAL_OUT（offer）。
+ * 也就是说 start 返回时 offer 可能还没生成，UI 要照常 poll 事件。 */
 PU_API int pu_screen_start(pu_engine* e, pu_screen_id screen_id);
 
-/* 停止屏幕共享。未在运行时返回 PU_OK（幂等）。 */
+/* 停止屏幕共享。未在运行时返回 PU_OK（幂等）。
+ * v2 起还会 Close 掉 PeerConnection、摘掉远端 sink，并释放 track/pc。 */
 PU_API int pu_screen_stop(pu_engine* e);
 
 /* 取一个事件，事件被复制到 out 指向的调用方内存。
@@ -221,12 +334,47 @@ PU_API int pu_screen_stop(pu_engine* e);
  *   timeout_ms = 0：非阻塞；
  *   timeout_ms < 0：一直等到有事件。
  * 返回 PU_OK 表示取到事件；PU_ERR_TIMEOUT 表示超时；其他为错误。
- * 单消费者：同一引擎不要从多个线程同时调用。 */
+ * 单消费者：同一引擎不要从多个线程同时调用。
+ *
+ * 例外：PU_EVENT_SIGNAL_OUT 里的 payload 不复制，是指向库内存的指针，
+ * 有效期见 pu_signal_event 的注释（取走后 64 条信令内仍有效，或到 destroy）。 */
 PU_API int pu_poll_event(pu_engine* e, pu_event* out, int timeout_ms);
 
 /* 最近一次错误描述（UTF-8，0 结尾）。指针由引擎持有，有效期到下一次调用本函数
  * 或其他 pu_* 函数。e 为 NULL 时返回最近一次 pu_engine_create 失败的原因。 */
 PU_API const char* pu_last_error(pu_engine* e);
+
+/* ---- v2 新增 ---- */
+
+/* 把服务端下发的一条信令原样灌进引擎（同步执行，返回时该做的都做了）。
+ *
+ * payload 指向 UTF-8 JSON，长度 len（不必 0 结尾，中间可以有 0）；字符串由
+ * **调用方持有**，只在本次调用期间读取。
+ *
+ * 接受的信封（与 docs/PROTOCOL.md 对齐，见 docs/spikes/2026-11-01-signaling-abi.md）：
+ *   {"type":"offer","sdp":"..."}                          → 建/复用接收侧 PC，
+ *                                                           SetRemoteDescription，
+ *                                                           生成并推回 SIGNAL_OUT answer
+ *   {"type":"answer","sdp":"..."}                         → SetRemoteDescription(answer)
+ *   {"type":"candidate","mid":"0","mline":0,"candidate":"..."} → AddIceCandidate
+ * 另外也接受 PROTOCOL.md 的服务端形状，引擎会剥一层 payload：
+ *   {"type":"media.offer","payload":{"sdp":"..."}}
+ *   {"type":"p2p.signal","payload":{"kind":"ice","candidate":"..."}}
+ *
+ * 返回：PU_OK / PU_ERR_INVALID_ARG（不是合法 JSON、缺字段、candidate 解析失败）/
+ * PU_ERR_STATE（例如正在作为共享方却收到 offer：v2 不做 glare 处理）/
+ * PU_ERR_MEDIA（SetRemote/CreateAnswer 等 webrtc 操作失败）/ PU_ERR_INTERNAL。
+ * 详细原因在 pu_last_error()。
+ *
+ * 线程：与其它 pu_* 一样，只能从控制线程调用；内部会阻塞最多几秒（等 SDP 往返），
+ * 不要在 UI 线程的渲染路径上直接调——C# 侧应放到后台队列。 */
+PU_API int pu_signal_in(pu_engine* e, const char* payload, size_t len);
+
+/* 读引擎统计（发/收帧数、PC/ICE 状态、信令条数、事件丢弃数）。
+ * out->struct_size 必须 ≥ sizeof(pu_stats)（库只写这一版认识的字段），
+ * 小于则 PU_ERR_INVALID_ARG。
+ * 不加锁、不发异步 GetStats，微秒级返回，可以从任意线程周期性调用。 */
+PU_API int pu_peer_stats(pu_engine* e, pu_stats* out);
 
 /* ---- 以下 10 个为下一版实现，签名冻结、当前统一返回 PU_NOT_IMPLEMENTED ---- */
 

@@ -6,10 +6,11 @@
   * 工具链与 scripts/build-media-spike.ps1 完全一致：MSVC + /MT /std:c++20 /utf-8，
     libwebrtc 静态库（含 abseil 第二个 include 根）与同一组系统库。
   * 产物默认放 <repo>/src/media-core/out/：
-        partyup_media.dll   导出库（只有 pu_*）
-        partyup_media.lib   导入库
-        media_smoke.exe     冒烟测试
-        exports.txt         dumpbin /exports 结果
+        partyup_media.dll        导出库（只有 pu_*）
+        partyup_media.lib        导入库
+        media_smoke.exe          单引擎生命周期冒烟（v1 的 6 个函数 + v2 的 offer 事件）
+        media_signaling_smoke.exe 双引擎信令冒烟（offer/answer/DTLS/远端帧）
+        exports.txt              dumpbin /exports 结果
   * 编译工作目录固定在 Windows 本机磁盘（$StageDir\build），不在 UNC 下跑 cmd/cl；
     只有读写源码与头文件走 UNC。
 
@@ -57,20 +58,27 @@ $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
 $include = Join-Path $Root 'third_party\libwebrtc\include'
 $libDir = Join-Path $Root 'third_party\libwebrtc\release'
 $hdrDir = Join-Path $Root 'src\media-core\include'
+# vendored 的 nlohmann/json 单头文件（信令信封解析用），见 src/media-core/vendor/nlohmann/README.md
+$vendorDir = Join-Path $Root 'src\media-core\vendor'
 $dllSrc = Join-Path $Root 'src\media-core\src\media_engine.cpp'
 $smokeSrc = Join-Path $Root 'spikes\media-dll-smoke\main.cpp'
+$signalingSrc = Join-Path $Root 'spikes\media-dll-smoke\signaling.cpp'
 
-foreach ($required in @($vcvars, $include, $libDir, $dllSrc, $smokeSrc)) {
+foreach ($required in @($vcvars, $include, $libDir, $dllSrc, $smokeSrc, $signalingSrc, $vendorDir)) {
   if (-not (Test-Path $required)) { throw "missing required path: $required" }
 }
 if (-not (Test-Path (Join-Path $include 'api\peer_connection_interface.h'))) {
   throw "libwebrtc headers not found under $include (download third_party/libwebrtc first)"
+}
+if (-not (Test-Path (Join-Path $vendorDir 'nlohmann\json.hpp'))) {
+  throw "vendor/nlohmann/json.hpp not found (it is required by the signaling envelope parser)"
 }
 
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $dllOut = Join-Path $OutDir 'partyup_media.dll'
 $dllLib = Join-Path $OutDir 'partyup_media.lib'
 $smokeOut = Join-Path $OutDir 'media_smoke.exe'
+$signalingOut = Join-Path $OutDir 'media_signaling_smoke.exe'
 $exportsTxt = Join-Path $OutDir 'exports.txt'
 
 # 编译中间文件与本机运行目录都放本机盘：cmd.exe 不支持 UNC 作为工作目录，
@@ -78,14 +86,16 @@ $exportsTxt = Join-Path $OutDir 'exports.txt'
 $workRoot = Join-Path $StageDir 'build'
 $objDll = Join-Path $workRoot 'obj-dll'
 $objSmoke = Join-Path $workRoot 'obj-smoke'
-New-Item -ItemType Directory -Force -Path $objDll, $objSmoke | Out-Null
+$objSignaling = Join-Path $workRoot 'obj-signaling'
+New-Item -ItemType Directory -Force -Path $objDll, $objSmoke, $objSignaling | Out-Null
 
 $common = @(
   '/nologo', '/MT', '/std:c++20', '/EHsc', '/O2', '/W3', '/utf-8', '/DNDEBUG',
   '/DWEBRTC_WIN', '/DNOMINMAX', '/DWIN32_LEAN_AND_MEAN',
   "/I`"$include`"",
   "/I`"$include\third_party\abseil-cpp`"",
-  "/I`"$hdrDir`""
+  "/I`"$hdrDir`"",
+  "/I`"$vendorDir`""
 ) -join ' '
 
 # 与 spike 完全相同的系统库清单；缺哪个链接器会报 unresolved external，按提示补。
@@ -122,6 +132,17 @@ try {
   Pop-Location
 }
 
+# ---- 2b. 双实例信令冒烟 exe（v2：两个 engine 同进程互相喂 SIGNAL_OUT） ----
+$signalingCmd = "cl $common `"$signalingSrc`" /Fe:`"$signalingOut`" /link `"$dllLib`""
+
+Push-Location $objSignaling
+try {
+  cmd /c "call `"$vcvars`" >nul 2>&1 && $signalingCmd"
+  if ($LASTEXITCODE -ne 0) { throw "cl failed building media_signaling_smoke.exe (exit $LASTEXITCODE)" }
+} finally {
+  Pop-Location
+}
+
 # ---- 3. 导出符号检查：必须只有 pu_* ----
 New-Item -ItemType Directory -Force -Path $StageDir | Out-Null
 Push-Location $StageDir
@@ -151,12 +172,13 @@ Write-Host ("== partyup_media.dll : {0:N0} bytes ({1:N2} MB)" -f $dllInfo.Length
 Write-Host ("== partyup_media.lib : {0:N0} bytes ({1:N2} MB)" -f $libInfo.Length, ($libInfo.Length / 1MB))
 Write-Host ("== exports ({0})     : {1}" -f $exportNames.Count, ($exportNames -join ' '))
 
-# ---- 4. 可选：在本机盘运行冒烟测试 ----
+# ---- 4. 可选：在本机盘运行两个冒烟测试 ----
 if ($Run) {
   New-Item -ItemType Directory -Force -Path $StageDir | Out-Null
   Copy-Item -Force $dllOut (Join-Path $StageDir 'partyup_media.dll')
   Copy-Item -Force $smokeOut (Join-Path $StageDir 'media_smoke.exe')
-  Write-Host "== running smoke from local disk: $StageDir"
+  Copy-Item -Force $signalingOut (Join-Path $StageDir 'media_signaling_smoke.exe')
+  Write-Host "== [1/2] smoke (single engine lifecycle) from local disk: $StageDir"
   Push-Location $StageDir
   try {
     & (Join-Path $StageDir 'media_smoke.exe')
@@ -164,8 +186,19 @@ if ($Run) {
   } finally {
     Pop-Location
   }
-  if ($exitCode -ne 0) { throw "smoke test failed: exit=$exitCode" }
-  Write-Host "== smoke exit=0"
+  if ($exitCode -ne 0) { throw "media_smoke failed: exit=$exitCode" }
+  Write-Host "== media_smoke exit=0"
+
+  Write-Host "== [2/2] signaling smoke (two engines, offer/answer/DTLS/remote frames)"
+  Push-Location $StageDir
+  try {
+    & (Join-Path $StageDir 'media_signaling_smoke.exe')
+    $sigExitCode = $LASTEXITCODE
+  } finally {
+    Pop-Location
+  }
+  if ($sigExitCode -ne 0) { throw "media_signaling_smoke failed: exit=$sigExitCode" }
+  Write-Host "== media_signaling_smoke exit=0"
 }
 
 Write-Host "== done" -ForegroundColor Green

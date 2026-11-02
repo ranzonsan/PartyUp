@@ -25,7 +25,11 @@ param(
   [string]$OutDir,
   [string]$StageDir = (Join-Path $env:LOCALAPPDATA 'PartyUp\media-stage\probe'),
   [switch]$Encode,
-  [switch]$Texture
+  [switch]$Texture,
+  # 隔离对照：同一批合成帧上跑硬件 H.264 MFT 与软件 VP8（libwebrtc），
+  # 输出「每帧 CPU / 墙钟 / 平均字节」对照表。需要链接 webrtc.lib。
+  [switch]$Ab,
+  [int]$Frames = 300
 )
 
 $ErrorActionPreference = 'Stop'
@@ -43,7 +47,7 @@ $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 if (-not $vs) { throw 'MSVC not found (vswhere returned nothing)' }
 $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
 
-$probe = if ($Encode) { 'mft_encode_probe' } else { 'mft_probe' }
+$probe = if ($Encode -or $Ab) { 'mft_encode_probe' } else { 'mft_probe' }
 $src = Join-Path $Root "spikes\media-dll-smoke\$probe.cpp"
 if (-not (Test-Path $src)) { throw "missing probe source: $src" }
 
@@ -55,6 +59,24 @@ $common = @('/nologo', '/MT', '/std:c++20', '/EHsc', '/O2', '/utf-8', '/DNDEBUG'
             '/DNOMINMAX', '/DWIN32_LEAN_AND_MEAN') -join ' '
 $libs = @('mfplat.lib', 'mfuuid.lib', 'ole32.lib', 'oleaut32.lib', 'd3d11.lib',
           'dxgi.lib') -join ' '
+
+# 隔离对照要链 libwebrtc（软件 VP8 在 webrtc.lib 里，libyuv 符号也在里面）。
+if ($Ab) {
+  $include = Join-Path $Root 'third_party\libwebrtc\include'
+  $libDir = Join-Path $Root 'third_party\libwebrtc\release'
+  $common = @(
+    $common, '/DWEBRTC_WIN',
+    "/I`"$include`"",
+    "/I`"$include\third_party\abseil-cpp`"",
+    "/I`"$include\third_party\libyuv\include`""
+  ) -join ' '
+  $common = "/I`"$include`" /I`"$include\third_party\abseil-cpp`" " +
+            "/I`"$include\third_party\libyuv\include`"" + ' ' + $common
+  $libs = "$libs /LIBPATH:`"$libDir`" webrtc.lib ws2_32.lib secur32.lib crypt32.lib " +
+          'iphlpapi.lib winmm.lib shlwapi.lib dmoguids.lib wmcodecdspuuid.lib msdmo.lib ' +
+          'strmiids.lib advapi32.lib runtimeobject.lib windowscodecs.lib user32.lib shcore.lib ' +
+          'mf.lib'
+}
 
 # .obj 落在 cwd（Push-Location 到本机 $StageDir），不要给 /Fo 带尾反斜杠的路径：
 # 反斜杠会把引号转义掉，cl 会把 "/link ..." 当成输出文件名。
@@ -70,6 +92,7 @@ try {
 
 $probeArgs = @()
 if ($Encode -and $Texture) { $probeArgs += '--texture' }
+if ($Ab) { $probeArgs += @('--ab', '--frames', "$Frames") }
 Write-Host "== run: $exe $probeArgs"
 Push-Location $StageDir
 try {

@@ -33,6 +33,18 @@
 #include <string>
 #include <vector>
 
+// 隔离对照用：直接用 libwebrtc 的 VP8 编码器（不经过 PeerConnection），
+// 在同一批合成帧上量「每帧 CPU 成本」，和硬件 H.264 MFT 对比。
+#include "api/environment/environment_factory.h"
+#include "api/video/i420_buffer.h"
+#include "api/video/video_frame.h"
+#include "api/video/video_frame_type.h"
+#include "api/video_codecs/sdp_video_format.h"
+#include "api/video_codecs/video_encoder.h"
+#include "api/video_codecs/video_encoder_factory_template.h"
+#include "api/video_codecs/video_encoder_factory_template_libvpx_vp8_adapter.h"
+#include "modules/video_coding/include/video_error_codes.h"  // WEBRTC_VIDEO_CODEC_OK
+
 using Microsoft::WRL::ComPtr;
 
 namespace {
@@ -811,6 +823,152 @@ bool OpenHardwareEncoder(bool unlock_on_activate, bool unlock_on_transform,
   return opened;
 }
 
+// ---------------------------------------------------------------------------
+// 软件 VP8 对照组（隔离测量）：与硬件 H.264 用同一批合成帧、同样帧数、同样码率档，
+// 只量编码器本身的每帧 CPU 与墙钟吞吐。不经过 PeerConnection，排除采集/转换/解码。
+// ---------------------------------------------------------------------------
+
+// I420 合成帧：竖条纹 + 每帧平移，保证帧间真实变化（否则 VP8 会把它编成空帧）。
+void FillI420(uint8_t* y, int y_stride, uint8_t* u, int u_stride, uint8_t* v,
+              int v_stride, UINT32 width, UINT32 height, UINT32 frame) {
+  const UINT32 shift = (frame * 7) % width;
+  for (UINT32 row = 0; row < height; ++row) {
+    uint8_t* dst = y + static_cast<size_t>(row) * y_stride;
+    for (UINT32 col = 0; col < width; ++col) {
+      const UINT32 x = (col + shift) % width;
+      const UINT32 stripe = (x / 32) & 1u;
+      dst[col] = static_cast<uint8_t>((stripe ? 200 : 40) + ((x * 255 / width) / 8) + (row & 15));
+    }
+  }
+  const UINT32 cw = (width + 1) / 2;
+  const UINT32 ch = (height + 1) / 2;
+  for (UINT32 row = 0; row < ch; ++row) {
+    uint8_t* du = u + static_cast<size_t>(row) * u_stride;
+    uint8_t* dv = v + static_cast<size_t>(row) * v_stride;
+    for (UINT32 col = 0; col < cw; ++col) {
+      const UINT32 x = (col + shift / 2) % cw;
+      du[col] = static_cast<uint8_t>(96 + (x & 63));
+      dv[col] = static_cast<uint8_t>(160 - (x & 63));
+    }
+  }
+}
+
+class CountingEncodedCallback : public webrtc::EncodedImageCallback {
+ public:
+  Result OnEncodedImage(const webrtc::EncodedImage& image,
+                        const webrtc::CodecSpecificInfo* /*info*/) override {
+    ++frames;
+    bytes += image.size();
+    if (image._frameType == webrtc::VideoFrameType::kVideoFrameKey) ++keyframes;
+    return Result(Result::OK);
+  }
+  void OnFrameDropped(uint32_t /*rtp_timestamp*/, int /*spatial_id*/,
+                      bool /*is_end_of_temporal_unit*/) override {
+    ++dropped;
+  }
+
+  uint32_t frames = 0;
+  uint64_t bytes = 0;
+  uint32_t keyframes = 0;
+  uint32_t dropped = 0;
+};
+
+struct IsolatedStats {
+  uint32_t frames_in = 0;
+  uint32_t frames_out = 0;
+  uint32_t keyframes = 0;
+  uint64_t bytes_out = 0;
+  double wall_ms = 0.0;
+  double cpu_ms = 0.0;  // 整进程 CPU（编码 + 合成帧生成），基线另测后相减
+};
+
+// 只跑合成帧生成、不编码：用来把「生成数据的 CPU」从两条路径里都减掉。
+double MeasureFillBaseline(UINT32 width, UINT32 height, uint32_t frame_count,
+                           bool nv12) {
+  const double cpu0 = ProcessCpuSeconds();
+  if (nv12) {
+    const UINT32 stride = width;
+    std::vector<uint8_t> buffer(static_cast<size_t>(stride) * height * 3 / 2);
+    for (uint32_t i = 0; i < frame_count; ++i) {
+      FillNv12(buffer.data(), width, height, stride, i);
+    }
+  } else {
+    webrtc::scoped_refptr<webrtc::I420Buffer> i420 =
+        webrtc::I420Buffer::Create(width, height);
+    for (uint32_t i = 0; i < frame_count; ++i) {
+      FillI420(i420->MutableDataY(), i420->StrideY(), i420->MutableDataU(),
+               i420->StrideU(), i420->MutableDataV(), i420->StrideV(), width, height, i);
+    }
+  }
+  return (ProcessCpuSeconds() - cpu0) * 1000.0;
+}
+
+bool RunVp8Session(UINT32 width, UINT32 height, UINT32 fps, uint32_t frame_count,
+                   uint32_t bitrate_bps, IsolatedStats* stats, std::string* error) {
+  webrtc::Environment env = webrtc::EnvironmentFactory().Create();
+  webrtc::VideoEncoderFactoryTemplate<webrtc::LibvpxVp8EncoderTemplateAdapter> factory;
+  std::unique_ptr<webrtc::VideoEncoder> encoder =
+      factory.Create(env, webrtc::SdpVideoFormat("VP8"));
+  if (!encoder) {
+    *error = "VideoEncoderFactoryTemplate<VP8>::Create returned null";
+    return false;
+  }
+
+  CountingEncodedCallback callback;
+  if (encoder->RegisterEncodeCompleteCallback(&callback) != WEBRTC_VIDEO_CODEC_OK) {
+    *error = "RegisterEncodeCompleteCallback failed";
+    return false;
+  }
+
+  webrtc::VideoCodec codec = {};
+  codec.codecType = webrtc::kVideoCodecVP8;
+  codec.width = width;
+  codec.height = height;
+  codec.maxFramerate = fps;
+  codec.startBitrate = bitrate_bps / 1000;
+  codec.minBitrate = 300;
+  codec.maxBitrate = bitrate_bps / 1000;
+  const webrtc::VideoEncoder::Settings settings(
+      webrtc::VideoEncoder::Capabilities(/*loss_notification=*/false),
+      /*number_of_cores=*/1, /*max_payload_size=*/1200);
+  if (encoder->InitEncode(&codec, settings) != WEBRTC_VIDEO_CODEC_OK) {
+    *error = "VP8 InitEncode failed";
+    return false;
+  }
+
+  webrtc::scoped_refptr<webrtc::I420Buffer> i420 = webrtc::I420Buffer::Create(width, height);
+  const uint32_t rtp_step = 90000 / (fps > 0 ? fps : 60);
+  const double cpu0 = ProcessCpuSeconds();
+  const int64_t wall0 = NowUs();
+  for (uint32_t i = 0; i < frame_count; ++i) {
+    FillI420(i420->MutableDataY(), i420->StrideY(), i420->MutableDataU(), i420->StrideU(),
+             i420->MutableDataV(), i420->StrideV(), width, height, i);
+    webrtc::VideoFrame frame = webrtc::VideoFrame::Builder()
+                                  .set_video_frame_buffer(i420)
+                                  .set_rtp_timestamp(i * rtp_step)
+                                  .build();
+    std::vector<webrtc::VideoFrameType> types{
+        i == 0 ? webrtc::VideoFrameType::kVideoFrameKey
+               : webrtc::VideoFrameType::kVideoFrameDelta};
+    if (encoder->Encode(frame, &types) != WEBRTC_VIDEO_CODEC_OK) {
+      *error = "VP8 Encode failed";
+      encoder->Release();
+      return false;
+    }
+    ++stats->frames_in;
+  }
+  const double cpu1 = ProcessCpuSeconds();
+  const int64_t wall1 = NowUs();
+  encoder->Release();
+
+  stats->frames_out = callback.frames;
+  stats->keyframes = callback.keyframes;
+  stats->bytes_out = callback.bytes;
+  stats->wall_ms = static_cast<double>(wall1 - wall0) / 1000.0;
+  stats->cpu_ms = (cpu1 - cpu0) * 1000.0;
+  return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -818,12 +976,19 @@ int main(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   bool run_texture = false;
   bool use_d3d_manager = true;
+  bool compare_vp8 = false;
+  uint32_t frame_count = kFrameCount;
   for (int i = 1; i < argc; ++i) {
     if (std::strcmp(argv[i], "--texture") == 0) run_texture = true;
     if (std::strcmp(argv[i], "--memory-nod3d") == 0) use_d3d_manager = false;
+    if (std::strcmp(argv[i], "--ab") == 0) compare_vp8 = true;
+    if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
+      frame_count = static_cast<uint32_t>(std::atoi(argv[++i]));
+      if (frame_count == 0) frame_count = kFrameCount;
+    }
   }
   std::printf("=== MFT H.264 encode probe  %ux%u @%u  frames=%u  input=%s  d3d_mgr=%d ===\n",
-              kWidth, kHeight, kFps, kFrameCount, run_texture ? "texture" : "memory",
+              kWidth, kHeight, kFps, frame_count, run_texture ? "texture" : "memory",
               use_d3d_manager ? 1 : 0);
 
   const HRESULT co_hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -886,7 +1051,7 @@ int main(int argc, char** argv) {
   std::vector<EncodedPacket> packets;
   EncodeStats stats;
   const double cpu_before = ProcessCpuSeconds();
-  if (!RunEncodeSession(encoder.Get(), async != 0, kWidth, kHeight, kFps, kFrameCount,
+  if (!RunEncodeSession(encoder.Get(), async != 0, kWidth, kHeight, kFps, frame_count,
                         device.Get(), context.Get(), run_texture, &packets, &stats,
                         &error)) {
     std::printf("encode session FAILED: %s\n", error.c_str());
@@ -920,6 +1085,49 @@ int main(int argc, char** argv) {
 
   PrintHr("ProcessMessage(FLUSH)", encoder->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0));
   encoder.Reset();
+
+  // ---- 隔离对照：软件 VP8（同一批合成帧、同样帧数、同样码率档）----
+  if (compare_vp8) {
+    std::printf("\n=== isolated A/B: hardware H.264 MFT vs software VP8 "
+                "(%ux%u @%u, %u frames, %u kbps) ===\n",
+                kWidth, kHeight, kFps, frame_count, kBitrate / 1000);
+
+    // 生成数据的 CPU 两边都要减掉，否则「谁的数据生成更贵」会污染结论。
+    const double fill_nv12_ms = MeasureFillBaseline(kWidth, kHeight, frame_count, true);
+    const double fill_i420_ms = MeasureFillBaseline(kWidth, kHeight, frame_count, false);
+
+    IsolatedStats vp8;
+    if (!RunVp8Session(kWidth, kHeight, kFps, frame_count, kBitrate, &vp8, &error)) {
+      std::printf("VP8 session FAILED: %s\n", error.c_str());
+    } else {
+      const double h264_pure_cpu_ms = cpu_seconds * 1000.0 - fill_nv12_ms;
+      const double vp8_pure_cpu_ms = vp8.cpu_ms - fill_i420_ms;
+      const double h264_frames = stats.frames_out > 0 ? stats.frames_out : 1;
+      const double vp8_frames = vp8.frames_out > 0 ? vp8.frames_out : 1;
+      const double h264_wall_ms = stats.avg_ms;
+      const double vp8_wall_ms = vp8.wall_ms / vp8.frames_in;
+      std::printf(
+          "\n%-16s %8s %12s %12s %9s %14s\n", "path", "frames", "CPU ms/frame",
+          "wall ms/frame", "fps", "avg bytes/frame");
+      std::printf("%-16s %8u %12.3f %12.2f %9.1f %14llu\n", "hw H.264 MFT",
+                  stats.frames_out, h264_pure_cpu_ms / h264_frames, h264_wall_ms,
+                  h264_wall_ms > 0 ? 1000.0 / h264_wall_ms : 0.0,
+                  static_cast<unsigned long long>(stats.bytes_out /
+                                                  static_cast<uint64_t>(h264_frames)));
+      std::printf("%-16s %8u %12.3f %12.2f %9.1f %14llu\n", "sw VP8",
+                  vp8.frames_out, vp8_pure_cpu_ms / vp8_frames, vp8_wall_ms,
+                  vp8_wall_ms > 0 ? 1000.0 / vp8_wall_ms : 0.0,
+                  static_cast<unsigned long long>(vp8.bytes_out /
+                                                  static_cast<uint64_t>(vp8_frames)));
+      std::printf(
+          "\n(CPU = whole-process CPU minus the synthetic-frame fill baseline: "
+          "nv12 fill %.1f ms, i420 fill %.1f ms over %u frames)\n",
+          fill_nv12_ms, fill_i420_ms, frame_count);
+      std::printf("(hw keyframes=%u, sw keyframes=%u; both fed the same content pattern)\n",
+                  stats.keyframes, vp8.keyframes);
+    }
+  }
+
   MFShutdown();
   CoUninitialize();
   std::printf("\nprobe done\n");

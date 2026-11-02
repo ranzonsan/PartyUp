@@ -15,6 +15,7 @@
 
 #include <windows.h>
 #include <d3d11.h>
+#include <d3d11_1.h>  // ID3D11VideoDevice / ID3D11VideoContext / VideoProcessorBlt
 #include <dxgi1_2.h>
 #include <roapi.h>
 #include <shellscalingapi.h>
@@ -519,6 +520,30 @@ struct WgcCapture::Impl {
   uint32_t staging_height = 0;
   DXGI_FORMAT staging_format = DXGI_FORMAT_UNKNOWN;
 
+  // ---- 纹理路径（零拷贝第一步）的 GPU 侧状态 ----
+  // 第 1 片只做「建好但不启用」：Open() 里初始化，失败则 texture_ready=false，
+  // 旧 I420 路径照常工作；Run() 里暂时不调用 ConvertFrameToTexture()。
+  //
+  // 生命周期契约（第 2 片接进 Run() 时必须遵守）：
+  //   WGC 的帧纹理在 frame->Close() 之后失效，所以顺序**只能是**
+  //     Surface → ID3D11Texture2D → VideoProcessorBlt 进 NV12 池纹理
+  //     → 调用 sink（此时池纹理有效）→ 返回后再 Close WGC 原始帧。
+  //   绝不能让 WGC 纹理句柄活过 Close，也绝不能把池纹理指针交给 sink 跨回调保存。
+  bool texture_ready = false;
+  // 失败原因只留在本字段：本层没有日志通道（见文件头），且**绝不能**写进
+  // last_error —— 那是「这次采集出过错」的对外语义，把纹理路径的降级原因塞进去
+  // 会让正常的 I420 会话看起来像坏了。
+  std::string texture_error;
+  ComPtr<ID3D11VideoDevice> video_device;
+  ComPtr<ID3D11VideoContext> video_context;
+  ComPtr<ID3D11VideoProcessorEnumerator> vp_enum;
+  ComPtr<ID3D11VideoProcessor> vp;
+  std::vector<ComPtr<ID3D11Texture2D>> nv12_pool;
+  std::vector<ComPtr<ID3D11VideoProcessorOutputView>> nv12_out_views;
+  uint32_t vp_width = 0;
+  uint32_t vp_height = 0;
+  size_t nv12_next = 0;
+
   FrameQueue queue;
   std::atomic<bool> stop_requested{false};
   std::string last_error;
@@ -530,6 +555,18 @@ struct WgcCapture::Impl {
   bool ConvertFrame(FrameArrival* arrival,
                     webrtc::scoped_refptr<webrtc::I420Buffer>* out_buffer,
                     CaptureStageTimings* timings);
+  // 建 VideoDevice / VideoContext / VideoProcessor + NV12 纹理池。任何一步失败只写
+  // texture_error 并返回 false，不 fatal —— 调用方不得让它影响 Open 的成败。尺寸
+  // 由调用方给（Open 用 capture item 的尺寸），所以调用前尺寸必须已确定。
+  bool InitTexturePath(uint32_t target_width, uint32_t target_height);
+  // BGRA 源纹理 → VideoProcessorBlt → 池内一张 NV12 纹理（不回读、不做 CPU 颜色
+  // 转换）。*out_pool_texture 指向池内纹理，**调用方不得 Release**：所有权在
+  // Impl，有效期到池轮转一圈（5 帧）为止。
+  //
+  // 调用契约：src 只能来自 WGC 帧，而 WGC 的帧纹理在 frame->Close() 之后失效，
+  // 所以必须在 Close 之前调用本函数。第 1 片不接进 Run()，供第 2 片与探针复用。
+  bool ConvertFrameToTexture(ID3D11Texture2D* src,
+                             ID3D11Texture2D** out_pool_texture);
   void MaybeDumpPng(const uint8_t* y, int y_stride, const uint8_t* u, int u_stride,
                     const uint8_t* v, int v_stride, int width, int height,
                     int64_t timestamp_us);
@@ -619,7 +656,10 @@ bool WgcCapture::Open(std::string* error) {
   }
 
   // 1. D3D11 设备（硬件优先，失败回落 WARP —— 虚拟机/远程桌面下会走到这里）
-  const UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+  // VIDEO_SUPPORT 是 ID3D11VideoDevice / VideoProcessorBlt 的前置条件（纹理路径用）；
+  // 对 I420 路径无影响，缺失时只是 texture_ready 会保持 false。
+  const UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT |
+                     D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
   const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
   hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, levels,
                          ARRAYSIZE(levels), D3D11_SDK_VERSION, &self.device, nullptr,
@@ -632,6 +672,15 @@ bool WgcCapture::Open(std::string* error) {
   if (FAILED(hr) || self.device == nullptr) {
     if (error != nullptr) *error = "D3D11CreateDevice failed: " + HrText(hr);
     return false;
+  }
+
+  // VideoProcessor 在 NVIDIA 驱动上需要 multithread protection，否则偶发 E_FAIL。
+  // 与探针（capture-texture-probe）里的处理保持一致。
+  {
+    ComPtr<ID3D10Multithread> multithread;
+    if (SUCCEEDED(self.device.As(&multithread))) {
+      multithread->SetMultithreadProtected(TRUE);
+    }
   }
 
   // 2. capture item（按 HMONITOR；绝不用 DisplayName 反查）
@@ -656,6 +705,12 @@ bool WgcCapture::Open(std::string* error) {
   }
   self.width = static_cast<uint32_t>(item_size.Width);
   self.height = static_cast<uint32_t>(item_size.Height);
+
+  // 2b. 纹理路径（零拷贝第一步）的 GPU 资源：**建好，但不接进任何调用链**。
+  // 必须放在尺寸确定之后：VideoProcessor 的 content desc 与 NV12 池都按分辨率建。
+  // 失败一律不 fatal（虚拟机 / WARP / 老驱动上可能建不出来）：InitTexturePath()
+  // 自己把原因写进 texture_error 并让 texture_ready 保持 false，旧 I420 路径照常。
+  self.InitTexturePath(self.width, self.height);
 
   // 3. WinRT Direct3D 设备（帧池要的是 IDirect3DDevice，不是 ID3D11Device）
   ComPtr<IDXGIDevice> dxgi_device;
@@ -749,6 +804,186 @@ bool WgcCapture::WaitFirstFrame(int timeout_ms, std::string* error) {
 void WgcCapture::RequestStop() {
   impl_->stop_requested.store(true, std::memory_order_release);
   impl_->queue.Stop();
+}
+
+// ---- 纹理路径（零拷贝第一步 · 第 1 片：建好但不启用）----------------------
+//
+// 这一步只准备 GPU 资源与「一帧 BGRA 纹理 → 一帧 NV12 池纹理」的转换能力，
+// Run() 仍然走旧的 staging + libyuv I420 路径，行为完全不变。等第 2 片把
+// RunTexture() 接上之后，才会真正用到这里建的东西。
+//
+// 为什么 NV12 池要 5 张：下游（编码器）可能还握着上一两张纹理，池太小会在
+// 转换时覆盖正在被读的那张。池满时的策略在第 2 片里定为「丢最旧 + 计数」。
+//
+// 只建纹理路径自己的对象，不碰任何 I420 路径的状态；失败时把原因写进
+// texture_error 并让 texture_ready=false，调用方（Open/ConvertFrameToTexture）
+// 继续走旧路径。
+bool WgcCapture::Impl::InitTexturePath(uint32_t target_width, uint32_t target_height) {
+  texture_ready = false;
+  texture_error.clear();
+  video_device.Reset();
+  video_context.Reset();
+  vp_enum.Reset();
+  vp.Reset();
+  nv12_pool.clear();
+  nv12_out_views.clear();
+  vp_width = 0;
+  vp_height = 0;
+  nv12_next = 0;
+
+  if (device == nullptr || context == nullptr || target_width == 0 ||
+      target_height == 0) {
+    texture_error = "texture path: device/context/size not ready";
+    return false;
+  }
+
+  HRESULT hr = device.As(&video_device);
+  if (FAILED(hr) || video_device == nullptr) {
+    texture_error = "ID3D11VideoDevice failed: " + HrText(hr);
+    return false;
+  }
+  hr = context.As(&video_context);
+  if (FAILED(hr) || video_context == nullptr) {
+    texture_error = "ID3D11VideoContext failed: " + HrText(hr);
+    return false;
+  }
+
+  // 只有 GPU 支持把 NV12 当 VideoProcessor 输出时，这条路才有意义。
+  UINT support = 0;
+  hr = device->CheckFormatSupport(DXGI_FORMAT_NV12, &support);
+  if (FAILED(hr) || !(support & D3D11_FORMAT_SUPPORT_VIDEO_PROCESSOR_OUTPUT)) {
+    texture_error = "NV12 is not a video-processor output (hr=" + HrText(hr) + ")";
+    return false;
+  }
+
+  D3D11_VIDEO_PROCESSOR_CONTENT_DESC content{};
+  content.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+  content.InputFrameRate.Numerator = 60;
+  content.InputFrameRate.Denominator = 1;
+  content.InputWidth = target_width;
+  content.InputHeight = target_height;
+  content.OutputFrameRate = content.InputFrameRate;
+  content.OutputWidth = target_width;
+  content.OutputHeight = target_height;
+  content.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+  hr = video_device->CreateVideoProcessorEnumerator(&content, &vp_enum);
+  if (FAILED(hr) || vp_enum == nullptr) {
+    texture_error = "CreateVideoProcessorEnumerator failed: " + HrText(hr);
+    return false;
+  }
+  hr = video_device->CreateVideoProcessor(vp_enum.Get(), 0, &vp);
+  if (FAILED(hr) || vp == nullptr) {
+    texture_error = "CreateVideoProcessor failed: " + HrText(hr);
+    return false;
+  }
+  video_context->VideoProcessorSetStreamFrameFormat(
+      vp.Get(), 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+  // 第 4 个参数是 repeat_frame，第 5 个是自定义帧率（nullptr 表示不自定义）。
+  video_context->VideoProcessorSetStreamOutputRate(
+      vp.Get(), 0, D3D11_VIDEO_PROCESSOR_OUTPUT_RATE_NORMAL, FALSE, nullptr);
+  video_context->VideoProcessorSetOutputTargetRect(vp.Get(), TRUE, nullptr);
+
+  constexpr size_t kTexturePoolSize = 5;
+  nv12_pool.resize(kTexturePoolSize);
+  nv12_out_views.resize(kTexturePoolSize);
+  for (size_t i = 0; i < nv12_pool.size(); ++i) {
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = target_width;
+    desc.Height = target_height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_NV12;
+    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Quality = 0;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_RENDER_TARGET;  // VideoProcessor 输出的必要条件
+    desc.CPUAccessFlags = 0;
+    desc.MiscFlags = 0;
+    hr = device->CreateTexture2D(&desc, nullptr, &nv12_pool[i]);
+    if (FAILED(hr) || nv12_pool[i] == nullptr) {
+      texture_error = "CreateTexture2D(NV12 pool) failed: " + HrText(hr);
+      nv12_pool.clear();
+      nv12_out_views.clear();
+      return false;
+    }
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ov{};
+    ov.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+    ov.Texture2D.MipSlice = 0;
+    hr = video_device->CreateVideoProcessorOutputView(nv12_pool[i].Get(),
+                                                      vp_enum.Get(), &ov,
+                                                      &nv12_out_views[i]);
+    if (FAILED(hr) || nv12_out_views[i] == nullptr) {
+      texture_error = "CreateVideoProcessorOutputView failed: " + HrText(hr);
+      nv12_pool.clear();
+      nv12_out_views.clear();
+      return false;
+    }
+  }
+
+  vp_width = target_width;
+  vp_height = target_height;
+  texture_ready = true;
+  return true;
+}
+
+// 一帧 BGRA 纹理 → 池内一张 NV12 纹理。不回读、不做 CPU 颜色转换。
+//
+// **调用方契约**（第 2 片接进 Run() 时照着写）：
+//   * src 只能来自 WGC 帧：get_Surface → IDirect3DDxgiInterfaceAccess →
+//     GetInterface(ID3D11Texture2D)。WGC 的帧纹理在 frame->Close() 之后失效，
+//     所以 Blt 必须发生在 Close 之前。
+//   * *out_pool_texture 指向池内纹理，所有权在 Impl：调用方不得 Release，也不得
+//     存下来跨帧用（池轮转一圈后会被下一帧覆盖）。
+bool WgcCapture::Impl::ConvertFrameToTexture(ID3D11Texture2D* src,
+                                             ID3D11Texture2D** out_pool_texture) {
+  if (out_pool_texture != nullptr) *out_pool_texture = nullptr;
+  if (!texture_ready || vp == nullptr || vp_enum == nullptr ||
+      video_device == nullptr || video_context == nullptr || context == nullptr ||
+      nv12_pool.empty() || nv12_out_views.size() != nv12_pool.size()) {
+    if (texture_error.empty()) texture_error = "texture path is not ready";
+    return false;
+  }
+  if (src == nullptr || out_pool_texture == nullptr) {
+    texture_error = "texture path: null source texture / output pointer";
+    return false;
+  }
+
+  // 尺寸变了（改缩放、远程桌面重连）就按新尺寸重建一次池；失败就保持降级。
+  D3D11_TEXTURE2D_DESC source_desc{};
+  src->GetDesc(&source_desc);
+  if (source_desc.Width != vp_width || source_desc.Height != vp_height) {
+    if (!InitTexturePath(source_desc.Width, source_desc.Height)) return false;
+  }
+
+  D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC iv{};
+  iv.FourCC = 0;
+  iv.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+  iv.Texture2D.MipSlice = 0;
+  iv.Texture2D.ArraySlice = 0;
+  ComPtr<ID3D11VideoProcessorInputView> in_view;
+  HRESULT hr = video_device->CreateVideoProcessorInputView(src, vp_enum.Get(), &iv,
+                                                           &in_view);
+  if (FAILED(hr) || in_view == nullptr) {
+    texture_error = "CreateVideoProcessorInputView failed: " + HrText(hr);
+    return false;
+  }
+
+  D3D11_VIDEO_PROCESSOR_STREAM stream{};
+  stream.Enable = TRUE;
+  stream.pInputSurface = in_view.Get();
+  hr = video_context->VideoProcessorBlt(vp.Get(), nv12_out_views[nv12_next].Get(), 0,
+                                        1, &stream);
+  if (FAILED(hr)) {
+    texture_error = "VideoProcessorBlt failed: " + HrText(hr);
+    return false;
+  }
+  // 必须 Flush：VideoProcessorBlt 只是提交命令，不 Flush 的话（a）计时只量到提交、
+  // 会虚低，（b）下游可能在 GPU 写完之前就去读这张池纹理。
+  context->Flush();
+
+  *out_pool_texture = nv12_pool[nv12_next].Get();
+  nv12_next = (nv12_next + 1) % nv12_pool.size();
+  return true;
 }
 
 bool WgcCapture::Impl::ConvertFrame(FrameArrival* arrival,
@@ -947,6 +1182,20 @@ void WgcCapture::Close() {
   self.frame_pool.Reset();
   self.item.Reset();
   self.staging.Reset();
+  // 纹理路径的 GPU 对象：按依赖反序释放（output view 持有纹理的引用，所以先放
+  // view 再放池；processor 依赖 enumerator；video context/device 是 device/context
+  // 的同一批 COM 对象的另一组接口，最后放）。每张 ComPtr 各自负责一次 Release，
+  // 这里全部 Reset 后引用计数归零，不留任何可泄漏的纹理。
+  self.nv12_out_views.clear();
+  self.nv12_pool.clear();
+  self.vp.Reset();
+  self.vp_enum.Reset();
+  self.video_context.Reset();
+  self.video_device.Reset();
+  self.texture_ready = false;
+  self.vp_width = 0;
+  self.vp_height = 0;
+  self.nv12_next = 0;
   self.context.Reset();
   self.device.Reset();
   if (self.ro_initialized) {

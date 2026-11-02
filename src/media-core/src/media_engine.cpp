@@ -66,6 +66,12 @@
 // 不依赖 libwebrtc 的 PeerConnection；DLL 里另一支编译单元见 wgc_screen.cpp。
 #include "wgc_screen.h"
 
+// v2.4 硬件 H.264 编解码（Media Foundation MFT）：编/解码器工厂 + 能力探测。
+#include "hw_encoder.h"
+
+// Media Foundation 进程级初始化（MFTEnumEx / MFCreateSample 都依赖 MFStartup）。
+#include <mfapi.h>
+
 // libwebrtc（m152）—— 与 spikes/media-link/main.cpp 同一组头文件
 #include "api/audio/audio_device.h"
 #include "api/audio_codecs/builtin_audio_decoder_factory.h"
@@ -738,6 +744,8 @@ class MediaEngine {
   // 可选的引擎日志文件（环境变量 PARTYUP_MEDIA_LOG）。teardown 压测用它把每个引擎
   // 实例的收尾阶段落到每次迭代自己的文件里；默认（未设置）只写 stderr。
   std::FILE* log_file_ = nullptr;
+  // v2.4：本引擎是否成功调过 MFStartup（析构时配对 MFShutdown）。
+  bool mf_started_ = false;
 };
 
 // 远端视频轨的 sink：OnFrame 在解码线程（worker）回调，只做计数 + 推事件。
@@ -888,6 +896,13 @@ MediaEngine::~MediaEngine() {
   delete pc_observer_;
   pc_observer_ = nullptr;
   Log(3, "dtor: sinks/observer deleted");
+  // v2.4：与 Init 里的 MFStartup 配对。放在最后：编码/解码器线程已在
+  // ReleaseStreamObjects() 里拆完，MFT 与 D3D 设备都已释放。
+  if (mf_started_) {
+    MFShutdown();
+    mf_started_ = false;
+    Log(3, "dtor: MFShutdown ok");
+  }
   if (log_file_ != nullptr) {
     std::fclose(log_file_);
     log_file_ = nullptr;
@@ -963,6 +978,17 @@ bool MediaEngine::Init(const pu_config* cfg, std::string* error) {
   }
   Log(3, "winsock ok");
 
+  // v2.4：Media Foundation 进程级初始化。硬件 H.264 的 MFT 枚举 / 样本创建 /
+  // DXGI device manager 全部依赖它；失败不致命（会回落到软件 VP8），但日志要留证。
+  const HRESULT mf_hr = MFStartup(MF_VERSION, MFSTARTUP_LITE);
+  mf_started_ = SUCCEEDED(mf_hr);
+  if (!mf_started_) {
+    Log(1, "MFStartup failed hr=0x%08X; hardware H.264 unavailable",
+        static_cast<unsigned>(mf_hr));
+  } else {
+    Log(3, "MFStartup ok");
+  }
+
   network_ = webrtc::Thread::CreateWithSocketServer();
   worker_ = webrtc::Thread::Create();
   signaling_ = webrtc::Thread::Create();
@@ -984,10 +1010,31 @@ bool MediaEngine::Init(const pu_config* cfg, std::string* error) {
 
   // 媒体默认关闭：不装编/解码器工厂、不调 EnableMedia 的话 media_factory 为 null，
   // AddTrack 出来的 m=video 不会挂编码器、RTP 静默不出包。
-  deps.video_encoder_factory = std::make_unique<
-      webrtc::VideoEncoderFactoryTemplate<webrtc::LibvpxVp8EncoderTemplateAdapter>>();
-  deps.video_decoder_factory = std::make_unique<
-      webrtc::VideoDecoderFactoryTemplate<webrtc::LibvpxVp8DecoderTemplateAdapter>>();
+  //
+  // v2.4：视频编解码器换成「硬件 H.264 优先、软件 VP8 兜底」的工厂（hw_encoder.cpp）。
+  // 工厂在 GetSupportedFormats() 里按 H.264 在前返回，SDP 协商就优先选 H.264；
+  // 硬件 H.264 MFT 不可用时工厂不声明 H.264，协商自然只剩 VP8 —— 这就是
+  // 「硬件不可用回落软件 VP8」的落点，不需要额外开关。
+  const partyup::H264Availability& h264_availability = partyup::QueryH264Availability();
+  {
+    std::string summary;
+    if (h264_availability.hardware) {
+      summary = "hardware=" + h264_availability.hardware_name;
+    } else {
+      summary = "hardware=none";
+    }
+    if (h264_availability.software) summary += ", software=" + h264_availability.software_name;
+    if (!h264_availability.hardware) {
+      // 明确的回落警告：产品上 1440p60 靠硬件 NVENC，这条日志是「为什么 CPU 高」的答案。
+      Log(1, "h264 encoder: %s; falling back to %s (%s)", summary.c_str(),
+          h264_availability.software ? "software H.264 MFT" : "software VP8",
+          h264_availability.error.empty() ? "unknown reason" : h264_availability.error.c_str());
+    } else {
+      Log(3, "h264 encoder: %s", summary.c_str());
+    }
+  }
+  deps.video_encoder_factory = partyup::CreatePartyUpVideoEncoderFactory();
+  deps.video_decoder_factory = partyup::CreatePartyUpVideoDecoderFactory();
   deps.audio_encoder_factory = webrtc::CreateBuiltinAudioEncoderFactory();
   deps.audio_decoder_factory = webrtc::CreateBuiltinAudioDecoderFactory();
   // v2.2：注入空 ADM（见 NullAudioDeviceModule 的注释）——必须在 EnableMedia 之前，
@@ -1464,6 +1511,33 @@ bool MediaEngine::EnsurePeerConnection(bool for_sending, std::string* error) {
       if (!added.ok()) {
         create_error = std::string("AddTrack(video) failed: ") + added.error().message();
         pc = nullptr;
+        return;
+      }
+      // v2.4：把 H.264 钉到编解码器偏好首位。硬件 NVENC 只做 H.264，VP8 只能
+      // 软件编码；工厂已经按 H.264 在前返回，这里再把偏好显式写一次，免得 SDP
+      // 里 VP8 的 payload type 更小而被对端优先选中。H.264 不可用时列表里没有
+      // 它，循环原样保序，等于什么都没改。
+      const webrtc::RtpCapabilities sender_caps =
+          pc_factory_->GetRtpSenderCapabilities(webrtc::MediaType::VIDEO);
+      std::vector<webrtc::RtpCodecCapability> preferred;
+      for (const webrtc::RtpCodecCapability& codec : sender_caps.codecs) {
+        if (codec.name == "H264") preferred.push_back(codec);
+      }
+      for (const webrtc::RtpCodecCapability& codec : sender_caps.codecs) {
+        if (codec.name != "H264") preferred.push_back(codec);
+      }
+      for (const webrtc::scoped_refptr<webrtc::RtpTransceiverInterface>& transceiver :
+           pc->GetTransceivers()) {
+        if (transceiver->media_type() != webrtc::MediaType::VIDEO) continue;
+        const webrtc::RTCError preference_error =
+            transceiver->SetCodecPreferences(preferred);
+        if (!preference_error.ok()) {
+          Log(1, "SetCodecPreferences failed: %s", preference_error.message());
+        } else {
+          Log(3, "video codec preference: %s first (%zu codecs)",
+              preferred.empty() ? "(none)" : preferred.front().name.c_str(),
+              preferred.size());
+        }
       }
     }
   });
@@ -1785,6 +1859,17 @@ int MediaEngine::PeerStats(pu_stats* out) {
   out->remote_width = stat_remote_width_.load(std::memory_order_relaxed);
   out->remote_height = stat_remote_height_.load(std::memory_order_relaxed);
   out->last_remote_frame_us = stat_last_remote_us_.load(std::memory_order_relaxed);
+  // v2.4：reserved 复用为「本次实际用的视频编码器」——0=还没有编码器，
+  // 1=硬件 H.264 MFT，2=软件 H.264 MFT，3=软件 VP8（硬件/软件 H.264 都不可用）。
+  // 布局不变（还是 uint32_t reserved），ABI 仍是 v2。
+  {
+    const partyup::H264EncoderKind kind = partyup::LastCreatedEncoderKind();
+    if (kind != partyup::H264EncoderKind::kNone) {
+      out->reserved = static_cast<uint32_t>(kind);
+    } else if (pc_ != nullptr) {
+      out->reserved = 3;  // 有 PC 但没有 H.264 编码器 = 走软件 VP8
+    }
+  }
   return PU_OK;
 }
 

@@ -284,7 +284,12 @@ typedef struct pu_stats {
   uint32_t event_drops;        /* 事件队列满导致的丢事件数 */
   uint32_t remote_width;       /* 最近一帧远端视频的宽，0 = 还没收到 */
   uint32_t remote_height;      /* 最近一帧远端视频的高 */
-  uint32_t reserved;           /* 0 */
+  uint32_t reserved;           /* v2.4 起复用为「实际使用的视频编码器」：
+                                *   0 = 还没有编码器（未 start / 未协商）
+                                *   1 = 硬件 H.264 MFT（NVENC / QSV / VCE）
+                                *   2 = 软件 H.264 MFT（系统 H264 Encoder MFT）
+                                *   3 = 软件 VP8（H.264 不可用时的回落）
+                                * 类型与偏移不变，ABI 仍是 v2。 */
   uint64_t last_remote_frame_us; /* 最近一帧远端帧的接收时刻，0 = 还没收到 */
 } pu_stats;
 

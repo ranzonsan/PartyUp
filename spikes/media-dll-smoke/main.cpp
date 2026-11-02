@@ -426,6 +426,31 @@ int main() {
     }
   }
 
+  // ---- 排空窗口（为异步编码器准备）----
+  // 硬件编码走 MF async MFT：`Encode()` 只把帧入队，真正的 ProcessInput/ProcessOutput
+  // 在编码器自己的线程上跑，所以「推送结束」到「最后一帧编码完成」之间有几十到几百
+  // 毫秒在途。同步 VP8 的这段窗口约等于 0，于是同一个冒烟在 VP8 下是 0.96x、在异步
+  // 硬件编码下只有 0.71x —— 差额是 teardown 截断在途帧，不是丢帧（编码器内部计数
+  // 是 encode_calls==pushed==out、enqueue_drops=0）。这里给 400 ms 让在途帧走完，
+  // 1:1 判据才有可比性。
+  {
+    const auto drain_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+    while (std::chrono::steady_clock::now() < drain_deadline) {
+      pu_event drain_event;
+      std::memset(&drain_event, 0, sizeof(drain_event));
+      drain_event.struct_size = static_cast<uint32_t>(sizeof(drain_event));
+      if (pu_poll_event(engine, &drain_event, 20) != PU_OK) continue;
+      if (drain_event.type == PU_EVENT_FRAME) {
+        ++frames;
+        total_bytes += drain_event.data.frame.bytes;
+        key_frames += drain_event.data.frame.keyframe;
+      } else if (drain_event.type == PU_EVENT_REMOTE_FRAME) {
+        ++remote_frames;
+      }
+    }
+  }
+
   const int stop_rc = pu_screen_stop(engine);
   // 再停一次必须幂等返回 PU_OK。
   const int second_stop_rc = pu_screen_stop(engine);

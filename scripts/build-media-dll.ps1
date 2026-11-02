@@ -88,12 +88,14 @@ $vendorDir = Join-Path $Root 'src\media-core\vendor'
 $dllSrc = Join-Path $Root 'src\media-core\src\media_engine.cpp'
 # v2.3：真实屏幕采集（Windows Graphics Capture）单独一个编译单元，见文件头注释。
 $wgcSrc = Join-Path $Root 'src\media-core\src\wgc_screen.cpp'
+# v2.4：硬件 H.264 编解码（Media Foundation MFT）单独一个编译单元，见文件头注释。
+$hwSrc = Join-Path $Root 'src\media-core\src\hw_encoder.cpp'
 $smokeSrc = Join-Path $Root 'spikes\media-dll-smoke\main.cpp'
 $signalingSrc = Join-Path $Root 'spikes\media-dll-smoke\signaling.cpp'
 $stressSrc = Join-Path $Root 'spikes\media-dll-smoke\teardown_stress.cpp'
 $captureSrc = Join-Path $Root 'spikes\media-dll-smoke\screen_capture.cpp'
 
-foreach ($required in @($vcvars, $include, $libDir, $dllSrc, $wgcSrc, $smokeSrc, $signalingSrc, $stressSrc, $captureSrc, $vendorDir)) {
+foreach ($required in @($vcvars, $include, $libDir, $dllSrc, $wgcSrc, $hwSrc, $smokeSrc, $signalingSrc, $stressSrc, $captureSrc, $vendorDir)) {
   if (-not (Test-Path $required)) { throw "missing required path: $required" }
 }
 if (-not (Test-Path (Join-Path $include 'api\peer_connection_interface.h'))) {
@@ -157,7 +159,11 @@ $sysLibs = @(
   'dmoguids.lib', 'wmcodecdspuuid.lib', 'msdmo.lib', 'strmiids.lib', 'advapi32.lib', 'ole32.lib',
   # v2.3 真实屏幕采集新增：WGC 自身（d3d11/dxgi/runtimeobject=RoGetActivationFactory）、
   # 首帧回写 PNG（windowscodecs=WIC）、DPI/显示器枚举（user32/shcore）。
-  'd3d11.lib', 'dxgi.lib', 'runtimeobject.lib', 'windowscodecs.lib', 'user32.lib', 'shcore.lib'
+  'd3d11.lib', 'dxgi.lib', 'runtimeobject.lib', 'windowscodecs.lib', 'user32.lib', 'shcore.lib',
+  # v2.4 硬件 H.264 编解码新增：Media Foundation 平台库（MFTEnumEx / MFCreateSample /
+  # MFCreateDXGIDeviceManager / MFStartup）+ MF 的 GUID（MFVideoFormat_* / MFSampleExtension_*）+ 
+  # ICodecAPI 的 CODECAPI_* GUID（strmiids）+ VariantInit/VariantClear（oleaut32）。
+  'mfplat.lib', 'mfuuid.lib', 'mf.lib', 'strmiids.lib', 'oleaut32.lib'
 ) -join ' '
 
 Write-Host "== vcvars : $vcvars"
@@ -166,7 +172,7 @@ Write-Host "== out    : $OutDir"
 Write-Host "== stage  : $StageDir"
 
 # ---- 1. 动态库 ----
-$dllCmd = "cl $common$debugCompile /LD /DPU_BUILD_SHARED `"$dllSrc`" `"$wgcSrc`" /Fe:`"$dllOut`" " +
+$dllCmd = "cl $common$debugCompile /LD /DPU_BUILD_SHARED `"$dllSrc`" `"$wgcSrc`" `"$hwSrc`" /Fe:`"$dllOut`" " +
           "/link$debugLinkDll /LIBPATH:`"$libDir`" webrtc.lib $sysLibs /IMPLIB:`"$dllLib`""
 
 Push-Location $objDll

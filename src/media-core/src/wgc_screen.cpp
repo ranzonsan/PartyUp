@@ -544,6 +544,11 @@ struct WgcCapture::Impl {
   uint32_t vp_height = 0;
   size_t nv12_next = 0;
 
+  // 输出模式：默认 I420（旧行为）。SetOutputMode() 显式设置后 env 不再覆盖。
+  CaptureOutput output_mode = CaptureOutput::kI420;
+  bool output_mode_explicit = false;
+  uint64_t texture_drops = 0;  // 纹理路径转换失败而跳过的帧（不阻塞采集线程）
+
   FrameQueue queue;
   std::atomic<bool> stop_requested{false};
   std::string last_error;
@@ -578,6 +583,91 @@ WgcCapture::~WgcCapture() { Close(); }
 uint32_t WgcCapture::width() const { return impl_->width; }
 uint32_t WgcCapture::height() const { return impl_->height; }
 uint64_t WgcCapture::dropped_frames() const { return impl_->queue.dropped(); }
+
+void WgcCapture::SetOutputMode(CaptureOutput mode) {
+  impl_->output_mode = mode;
+  impl_->output_mode_explicit = true;
+}
+CaptureOutput WgcCapture::output_mode() const { return impl_->output_mode; }
+bool WgcCapture::texture_ready() const { return impl_->texture_ready; }
+uint64_t WgcCapture::texture_drops() const { return impl_->texture_drops; }
+
+// 纹理路径主循环。取帧/停止/间隔逻辑与 Run() 保持一致（同样的 pop 超时与
+// 停止标志检查），只在出帧处换成「Surface → Blt 进 NV12 池纹理 → sink」。
+//
+// **生命周期契约**：Blt 与 sink 都在 WGC 原始帧 Close 之前完成（见
+// Nv12TextureFrame 注释）。转换失败的帧丢掉并计数，绝不阻塞采集线程。
+void WgcCapture::RunTexture(const TextureSink& sink, const TimingSink& on_timing,
+                            const std::atomic<bool>* stop_requested) {
+  Impl& self = *impl_;
+  if (!self.texture_ready) return;  // 没准备好就立刻返回，调用方自行回落 Run()
+
+  Clock::time_point previous_arrival{};
+  bool have_previous = false;
+
+  for (;;) {
+    if (stop_requested != nullptr &&
+        stop_requested->load(std::memory_order_relaxed)) {
+      break;
+    }
+    if (self.stop_requested.load(std::memory_order_relaxed)) break;
+
+    FrameArrival arrival;
+    if (!self.queue.Pop(&arrival, kPopTimeoutMs)) {
+      if (self.queue.stopping()) break;
+      continue;
+    }
+
+    // capture 段：两帧到达的间隔（DWM 节奏）。首帧没有前一段，记 0。
+    CaptureStageTimings timings;
+    if (have_previous) {
+      timings.interval_ms = MsBetween(previous_arrival, arrival.arrived);
+    }
+    previous_arrival = arrival.arrived;
+    have_previous = true;
+
+    // Blt 段：Surface → ID3D11Texture2D → VideoProcessorBlt → 池内 NV12 纹理。
+    const auto t_blt = Clock::now();
+    ComPtr<wgd3d::IDirect3DSurface> surface;
+    HRESULT hr = arrival.frame->get_Surface(&surface);
+    ComPtr<Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>
+        access;
+    if (SUCCEEDED(hr) && surface != nullptr) hr = surface.As(&access);
+    ComPtr<ID3D11Texture2D> source;
+    if (SUCCEEDED(hr) && access != nullptr) {
+      hr = access->GetInterface(IID_PPV_ARGS(&source));
+    }
+    ID3D11Texture2D* pool_texture = nullptr;
+    const bool converted =
+        SUCCEEDED(hr) && source != nullptr &&
+        self.ConvertFrameToTexture(source.Get(), &pool_texture) &&
+        pool_texture != nullptr;
+    timings.blt_ms = MsSince(t_blt);
+    timings.total_ms = timings.blt_ms;
+
+    bool keep_going = true;
+    if (converted) {
+      Nv12TextureFrame frame;
+      frame.texture = pool_texture;
+      frame.width = self.vp_width;
+      frame.height = self.vp_height;
+      frame.capture_us =
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              arrival.arrived.time_since_epoch())
+              .count();
+      frame.blt_ms = timings.blt_ms;
+      if (sink) keep_going = sink(frame);
+    } else {
+      // 这一帧转换不出来：丢掉并计数，不阻断采集、不终止会话。
+      ++self.texture_drops;
+    }
+
+    // 只有 sink 消费完之后才 Close WGC 原始帧（生命周期契约）。
+    CloseFrame(&arrival);
+    if (on_timing) on_timing(timings);
+    if (!keep_going) break;
+  }
+}
 const std::string& WgcCapture::last_error() const { return impl_->last_error; }
 const std::string& WgcCapture::dumped_png_path() const { return impl_->dump_png_path; }
 
@@ -711,6 +801,19 @@ bool WgcCapture::Open(std::string* error) {
   // 失败一律不 fatal（虚拟机 / WARP / 老驱动上可能建不出来）：InitTexturePath()
   // 自己把原因写进 texture_error 并让 texture_ready 保持 false，旧 I420 路径照常。
   self.InitTexturePath(self.width, self.height);
+
+  // 运行时开关：PARTYUP_CAPTURE_TEXTURE=1 → 默认走纹理路径；默认仍是 I420。
+  // 显式 SetOutputMode() 优先（output_mode_explicit），出问题可立刻切回 I420。
+  if (!self.output_mode_explicit) {
+    char env_value[8] = {};
+    const DWORD env_len = GetEnvironmentVariableA(
+        "PARTYUP_CAPTURE_TEXTURE", env_value,
+        static_cast<DWORD>(sizeof(env_value)));
+    if (env_len > 0 && env_len < sizeof(env_value) && env_value[0] != '0' &&
+        self.texture_ready) {
+      self.output_mode = CaptureOutput::kNv12Texture;
+    }
+  }
 
   // 3. WinRT Direct3D 设备（帧池要的是 IDirect3DDevice，不是 ID3D11Device）
   ComPtr<IDXGIDevice> dxgi_device;

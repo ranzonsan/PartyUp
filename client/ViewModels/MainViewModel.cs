@@ -1,0 +1,407 @@
+using System.Collections.ObjectModel;
+using Avalonia.Threading;
+using CommunityToolkit.Mvvm.ComponentModel;
+using PartyUp.Client.Models;
+using PartyUp.Client.Services;
+
+namespace PartyUp.Client.ViewModels;
+
+/// <summary>频道列表项。</summary>
+public sealed record ChannelItem(string Id, string Name);
+
+/// <summary>一条待显示的消息（已把 member_id 解析成名字、时间戳格式化成 HH:mm）。</summary>
+public sealed record MessageItem(string Author, string Body, string TimeText, bool IsSelf);
+
+/// <summary>
+/// 主窗口的视图模型：登录/注册、连接、频道、聊天、presence、媒体引擎状态。
+///
+/// 线程约定：网络事件从接收循环线程进来，所有改集合的操作都经
+/// <see cref="Dispatcher.UIThread"/> 回到 UI 线程；媒体引擎的 poll 由窗口里的
+/// DispatcherTimer 驱动（每 100ms 一次），不在这里起线程。
+/// </summary>
+public sealed partial class MainViewModel : ObservableObject
+{
+    private readonly Dictionary<string, string> _memberNames = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _messageIds = new(StringComparer.Ordinal);
+    private PartyUpConnection? _connection;
+    private MediaEngine? _media;
+    private string? _subscribedChannelId;
+    private bool _busy;
+    private bool _openInFlight;
+
+    public MainViewModel()
+    {
+        // --server 同时用于登录框初值与 GUI 自动登录：同一个参数，两处不各写一份默认值。
+        ServerUrl = Program.Options.Server;
+        TryInitMedia();
+        FooterText = "就绪。填服务器地址后登录，或用邀请码注册；左侧「新建频道」建第一个频道。";
+    }
+
+    public ObservableCollection<ChannelItem> Channels { get; } = new();
+
+    public ObservableCollection<MessageItem> Messages { get; } = new();
+
+    public ObservableCollection<PresenceMemberDto> Members { get; } = new();
+
+    public string SelfName { get; private set; } = string.Empty;
+
+    [ObservableProperty]
+    private bool _isLoggedIn;
+
+    [ObservableProperty]
+    private string _serverUrl = "http://127.0.0.1:8080";
+
+    [ObservableProperty]
+    private string _username = string.Empty;
+
+    [ObservableProperty]
+    private string _password = string.Empty;
+
+    [ObservableProperty]
+    private string _inviteCode = string.Empty;
+
+    [ObservableProperty]
+    private string _messageInput = string.Empty;
+
+    [ObservableProperty]
+    private string _newChannelName = string.Empty;
+
+    [ObservableProperty]
+    private ChannelItem? _selectedChannel;
+
+    [ObservableProperty]
+    private string _statusText = "未连接";
+
+    [ObservableProperty]
+    private string _mediaStatusText = "媒体引擎：初始化中…";
+
+    [ObservableProperty]
+    private string _footerText = string.Empty;
+
+    // ------------------------------------------------------------------
+    // 媒体引擎
+    // ------------------------------------------------------------------
+
+    /// <summary>加载 DLL 并创建引擎；失败只降级状态文本，不影响聊天功能。</summary>
+    private void TryInitMedia()
+    {
+        try
+        {
+            _media = MediaEngine.Load();
+            if (_media.MissingExports.Count > 0)
+            {
+                MediaStatusText = $"媒体引擎：缺 {_media.MissingExports.Count}/18 个导出";
+                AppLog.Fail($"media: missing exports: {string.Join(", ", _media.MissingExports)}");
+                return;
+            }
+            _media.Create("partyup-ui");
+            MediaStatusText = "媒体引擎：已就绪（ABI v2，18/18 导出）";
+            AppLog.Pass($"media: pu_engine_create ok, dll={Path.GetFileName(_media.LibraryPath)}, exports=18/18");
+        }
+        catch (Exception ex)
+        {
+            MediaStatusText = "媒体引擎不可用：" + ex.Message;
+            AppLog.Warn("media: " + ex.Message);
+        }
+    }
+
+    /// <summary>由窗口的 DispatcherTimer 调用：把事件队列里已经到的事件全部取出来。</summary>
+    public void PollMedia()
+    {
+        if (_media is not { IsCreated: true })
+        {
+            return;
+        }
+        try
+        {
+            while (_media.Poll(0) is { } ev)
+            {
+                switch (ev.Kind)
+                {
+                    case MediaEventKind.State:
+                        MediaStatusText = $"媒体引擎：{ev.PreviousStateValue} → {ev.StateValue}";
+                        AppLog.Info($"media: state {ev.PreviousStateValue} -> {ev.StateValue} (reason={ev.Reason})");
+                        break;
+                    case MediaEventKind.Error:
+                        MediaStatusText = "媒体引擎错误：" + ev.ErrorMessage;
+                        AppLog.Fail("media: " + ev.ErrorMessage);
+                        break;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            MediaStatusText = "媒体引擎异常：" + ex.Message;
+            AppLog.Fail("media: " + ex.Message);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 登录 / 注册
+    // ------------------------------------------------------------------
+
+    public async Task LoginAsync()
+    {
+        await ConnectAsync(async api =>
+        {
+            var session = await api.LoginAsync(Username.Trim(), Password);
+            await AttachSessionAsync(api.BaseUri, session.Token, session.Member);
+        });
+    }
+
+    public async Task RegisterAsync()
+    {
+        if (string.IsNullOrWhiteSpace(InviteCode))
+        {
+            StatusText = "请填写邀请码";
+            return;
+        }
+        await ConnectAsync(async api =>
+        {
+            var session = await api.RegisterWithInviteAsync(InviteCode.Trim(), Username.Trim(), Password);
+            await AttachSessionAsync(api.BaseUri, session.Token, session.Member);
+        });
+    }
+
+    /// <summary>GUI 自动登录（--token）：先 /api/me 校验，再建 WS。</summary>
+    public async Task AutoLoginAsync(string token)
+    {
+        await ConnectAsync(async api =>
+        {
+            var member = await api.MeAsync(token);
+            await AttachSessionAsync(api.BaseUri, token, member);
+        });
+    }
+
+    private async Task ConnectAsync(Func<PartyUpApi, Task> flow)
+    {
+        if (_busy)
+        {
+            return;
+        }
+        _busy = true;
+        try
+        {
+            StatusText = "连接中…";
+            var baseUri = new Uri(ServerUrl.Trim());
+            using var api = new PartyUpApi(baseUri);
+            await flow(api);
+            IsLoggedIn = true;
+            StatusText = $"已连接：{SelfName}";
+            AppLog.Pass($"gui: connected as {SelfName} @ {baseUri}");
+        }
+        catch (Exception ex)
+        {
+            StatusText = "连接失败：" + ex.Message;
+            AppLog.Fail("gui: connect failed: " + ex.Message);
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private async Task AttachSessionAsync(Uri baseUri, string token, MemberDto member)
+    {
+        if (_connection is not null)
+        {
+            await _connection.DisposeAsync();
+            _connection = null;
+        }
+        var connection = await PartyUpConnection.ConnectAsync(baseUri, token);
+        connection.TextReceived += OnTextReceived;
+        connection.PresenceChanged += OnPresenceChanged;
+        connection.Closed += OnConnectionClosed;
+        _connection = connection;
+
+        SelfName = member.Name;
+        _memberNames[member.Id] = member.Name;
+        OnPropertyChanged(nameof(SelfName));
+
+        await RefreshChannelsAsync();
+    }
+
+    private async Task RefreshChannelsAsync()
+    {
+        if (_connection is null)
+        {
+            return;
+        }
+        var list = await _connection.ListChannelsAsync();
+        Channels.Clear();
+        foreach (var channel in list.Channels)
+        {
+            Channels.Add(new ChannelItem(channel.Id, channel.Name));
+        }
+        FooterText = $"已加载 {Channels.Count} 个频道";
+        AppLog.Pass($"gui: channel list loaded ({Channels.Count} channels)");
+        if (Channels.Count > 0)
+        {
+            await OpenChannelAsync(Channels[0]);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 频道与消息
+    // ------------------------------------------------------------------
+
+    public async Task CreateChannelAsync()
+    {
+        if (_connection is null)
+        {
+            StatusText = "请先登录";
+            return;
+        }
+        var name = NewChannelName.Trim();
+        if (name.Length == 0)
+        {
+            StatusText = "频道名不能为空";
+            return;
+        }
+        try
+        {
+            var created = await _connection.CreateChannelAsync(name);
+            Channels.Add(new ChannelItem(created.Id, created.Name));
+            NewChannelName = string.Empty;
+            FooterText = $"已创建频道 #{created.Name}";
+            AppLog.Pass($"gui: channel created #{created.Name} ({created.Id})");
+            await OpenChannelAsync(new ChannelItem(created.Id, created.Name));
+        }
+        catch (Exception ex)
+        {
+            StatusText = "创建频道失败：" + ex.Message;
+            AppLog.Fail("gui: create channel failed: " + ex.Message);
+        }
+    }
+
+    public async Task OpenChannelAsync(ChannelItem? channel)
+    {
+        if (channel is null || _connection is null)
+        {
+            return;
+        }
+        // SelectedChannel 的赋值会触发 ListBox.SelectionChanged → 再调一次本方法；
+        // 已经切到该频道或正在切时直接返回，否则会把历史消息加载两遍。
+        if (channel.Id == _subscribedChannelId || _openInFlight)
+        {
+            return;
+        }
+
+        _openInFlight = true;
+        try
+        {
+            if (_subscribedChannelId is not null && _subscribedChannelId != channel.Id)
+            {
+                await _connection.UnsubscribeAsync(_subscribedChannelId);
+            }
+            await _connection.SubscribeAsync(channel.Id);
+            _subscribedChannelId = channel.Id;
+            SelectedChannel = channel;
+
+            Messages.Clear();
+            Members.Clear();
+            _messageIds.Clear();
+            var history = await _connection.HistoryAsync(channel.Id, 0, 50);
+            foreach (var message in history)
+            {
+                AppendMessage(message);
+            }
+            AppLog.Pass($"gui: opened #{channel.Name} (history={history.Count})");
+            StatusText = $"频道 #{channel.Name}（{history.Count} 条历史消息）";
+            FooterText = $"已进入 #{channel.Name}；输入消息回车发送";
+        }
+        catch (Exception ex)
+        {
+            StatusText = "进入频道失败：" + ex.Message;
+            AppLog.Fail("gui: open channel failed: " + ex.Message);
+        }
+        finally
+        {
+            _openInFlight = false;
+        }
+    }
+
+    public async Task SendMessageAsync()
+    {
+        if (_connection is null || SelectedChannel is null)
+        {
+            StatusText = "请先进入一个频道";
+            return;
+        }
+        var body = MessageInput.Trim();
+        if (body.Length == 0)
+        {
+            return;
+        }
+        try
+        {
+            MessageInput = string.Empty;
+            await _connection.SendTextAsync(SelectedChannel.Id, body);
+        }
+        catch (Exception ex)
+        {
+            StatusText = "发送失败：" + ex.Message;
+            AppLog.Fail("gui: send failed: " + ex.Message);
+        }
+    }
+
+    private void OnTextReceived(TextMessageDto message)
+    {
+        Dispatcher.UIThread.Post(() =>
+        {
+            if (message.ChannelId != _subscribedChannelId)
+            {
+                return;
+            }
+            AppendMessage(message);
+        });
+    }
+
+    private void OnPresenceChanged(PresenceDto presence)
+    {
+        Dispatcher.UIThread.Post(() =>
+        {
+            if (presence.ChannelId != _subscribedChannelId)
+            {
+                return;
+            }
+            foreach (var member in presence.Members)
+            {
+                _memberNames[member.MemberId] = member.Name;
+            }
+            Members.Clear();
+            foreach (var member in presence.Members)
+            {
+                Members.Add(member);
+            }
+            AppLog.Info($"gui: presence {presence.Members.Count} member(s): {string.Join(", ", presence.Members.Select(m => m.Name))}");
+            FooterText = $"频道内 {presence.Members.Count} 人在线";
+        });
+    }
+
+    private void OnConnectionClosed(string reason)
+    {
+        Dispatcher.UIThread.Post(() =>
+        {
+            StatusText = "连接已断开：" + reason;
+            IsLoggedIn = false;
+            AppLog.Warn("gui: connection closed: " + reason);
+        });
+    }
+
+    private void AppendMessage(TextMessageDto message)
+    {
+        // 同一条消息可能来自历史加载 + 实时 text.new 两条路径，按消息 id 去重。
+        if (!_messageIds.Add(message.Id))
+        {
+            return;
+        }
+        // presence 会带来成员名；没见过的人退化成 id 前缀，避免 UI 里出现空白作者。
+        var author = _memberNames.TryGetValue(message.MemberId, out var name)
+            ? name
+            : message.MemberId.Length >= 6 ? message.MemberId[..6] : message.MemberId;
+        var time = DateTimeOffset.FromUnixTimeMilliseconds(message.Ts).ToLocalTime().ToString("HH:mm");
+        Messages.Add(new MessageItem(author, message.Body, time, message.MemberId == _connection?.Member.Id));
+        AppLog.Pass($"gui: message seq={message.Seq} author={author} body=\"{message.Body}\"");
+    }
+}

@@ -1,0 +1,2 @@
+# 本地 NuGet 包缓存（WSL 的 ~/.nuget 只读，构建时用 NUGET_PACKAGES 指到这里）。
+.cache/

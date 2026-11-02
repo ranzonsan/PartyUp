@@ -1,0 +1,402 @@
+using System.Reflection;
+using System.Runtime.InteropServices;
+
+namespace PartyUp.Client.Services;
+
+/// <summary>媒体核心调用失败（DLL 缺失/加载失败/返回负值）。</summary>
+public sealed class MediaEngineException : Exception
+{
+    public MediaEngineException(string message) : base(message) { }
+}
+
+/// <summary>
+/// 从 pu_event 里摊平出来的一条事件。只用骨架需要的信息：
+/// 状态迁移（state/previous_state/reason）、错误文本；帧/信令/远端帧只带类型与时间戳。
+/// </summary>
+public sealed record MediaEvent(
+    MediaEventKind Kind,
+    uint RawType,
+    long TimestampUs,
+    int State,
+    int PreviousState,
+    int Reason,
+    string? ErrorMessage)
+{
+    public PuStreamState StateValue => (PuStreamState)State;
+
+    public PuStreamState PreviousStateValue => (PuStreamState)PreviousState;
+}
+
+/// <summary>pu_screen_sources 的一项（骨架 UI 只用 id/title 展示，不启动共享）。</summary>
+public sealed record MediaSource(string Id, string Title, uint Width, uint Height, uint Kind);
+
+/// <summary>
+/// 媒体核心（partyup_media.dll，ABI v2）的托管包装。
+///
+/// 设计要点：
+///   * 显式从 AppContext.BaseDirectory 加载 DLL（不靠 PATH 搜索），避免被同名旧库抢走——
+///     这是 Spike 1 记下的坑；
+///   * 加载后校验 18 个导出全部可解析（ABI 契约的运行时检查）；
+///   * 只封装骨架要用的 create/destroy/poll_event/peer_stats/screen_start|stop/sources，
+///     其余导出的签名也一并声明（NativeMethods），但未接进 UI——语音/共享不在本轮范围。
+/// </summary>
+public sealed class MediaEngine : IDisposable
+{
+    /// <summary>ABI v2 的 18 个导出，顺序与 partyup_media.h 的声明顺序一致。</summary>
+    public static readonly IReadOnlyList<string> ExportNames = new[]
+    {
+        "pu_engine_create",
+        "pu_engine_destroy",
+        "pu_screen_start",
+        "pu_screen_stop",
+        "pu_poll_event",
+        "pu_last_error",
+        "pu_signal_in",
+        "pu_peer_stats",
+        "pu_voice_join",
+        "pu_voice_leave",
+        "pu_voice_set_mode",
+        "pu_voice_set_mute",
+        "pu_voice_set_deafen",
+        "pu_screen_sources",
+        "pu_screen_watch",
+        "pu_screen_unwatch",
+        "pu_frame_acquire",
+        "pu_frame_release",
+    };
+
+    private static readonly object ResolverGate = new();
+    private static bool _resolverInstalled;
+    private static string? _resolvedPath;
+
+    private IntPtr _engine;
+    private IntPtr _handle;
+    private bool _disposed;
+
+    private MediaEngine(string libraryPath, IntPtr handle, IReadOnlyList<string> missingExports)
+    {
+        LibraryPath = libraryPath;
+        _handle = handle;
+        MissingExports = missingExports;
+    }
+
+    public string LibraryPath { get; }
+
+    public IReadOnlyList<string> MissingExports { get; }
+
+    public bool IsCreated => _engine != IntPtr.Zero;
+
+    /// <summary>默认 DLL 位置：<c>&lt;应用目录&gt;/partyup_media.dll</c>（构建时从 src/media-core/out 拷入）。</summary>
+    public static string DefaultLibraryPath => Path.Combine(AppContext.BaseDirectory, "partyup_media.dll");
+
+    /// <summary>
+    /// 加载媒体核心。显式路径 &gt; 环境变量 PARTYUP_MEDIA_DLL &gt; 应用目录。
+    /// 加载成功但缺导出时也返回实例，由调用方决定是否降级（MissingExports 非空）。
+    /// </summary>
+    public static MediaEngine Load(string? explicitPath = null)
+    {
+        var path = explicitPath;
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            path = Environment.GetEnvironmentVariable("PARTYUP_MEDIA_DLL");
+        }
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            path = DefaultLibraryPath;
+        }
+        path = Path.GetFullPath(path);
+
+        if (!File.Exists(path))
+        {
+            throw new MediaEngineException(
+                $"找不到媒体核心 DLL：{path}。先运行 scripts/build-media-dll.ps1，或用 PARTYUP_MEDIA_DLL 指定路径。");
+        }
+
+        lock (ResolverGate)
+        {
+            _resolvedPath = path;
+            if (!_resolverInstalled)
+            {
+                NativeLibrary.SetDllImportResolver(typeof(MediaEngine).Assembly, ResolveLibrary);
+                _resolverInstalled = true;
+            }
+        }
+
+        if (!NativeLibrary.TryLoad(path, out var handle))
+        {
+            throw new MediaEngineException($"LoadLibrary 失败：{path}");
+        }
+
+        var missing = ExportNames
+            .Where(name => !NativeLibrary.TryGetExport(handle, name, out _))
+            .ToArray();
+        return new MediaEngine(path, handle, missing);
+    }
+
+    /// <summary>DllImport 解析器：只接管 partyup_media，其余交给默认逻辑。</summary>
+    private static IntPtr ResolveLibrary(string libraryName, Assembly assembly, DllImportSearchPath? searchPath)
+    {
+        if (!string.Equals(libraryName, NativeMethods.Library, StringComparison.Ordinal))
+        {
+            return IntPtr.Zero;
+        }
+        var candidate = _resolvedPath ?? DefaultLibraryPath;
+        return File.Exists(candidate) && NativeLibrary.TryLoad(candidate, out var handle) ? handle : IntPtr.Zero;
+    }
+
+    /// <summary>创建引擎。返回时事件队列已就绪；事件要用 <see cref="Poll"/> 主动取。</summary>
+    public void Create(string clientName = "partyup-ui")
+    {
+        ThrowIfDisposed();
+        if (_engine != IntPtr.Zero)
+        {
+            throw new MediaEngineException("引擎已创建，不能重复 pu_engine_create");
+        }
+
+        var namePtr = Marshal.StringToCoTaskMemUTF8(clientName);
+        try
+        {
+            var config = new PuConfig
+            {
+                StructSize = (uint)Marshal.SizeOf<PuConfig>(),
+                ClientName = namePtr,
+                LogLevel = 3,
+                EventQueueCapacity = 256,
+            };
+            var engine = NativeMethods.pu_engine_create(in config);
+            if (engine == IntPtr.Zero)
+            {
+                throw new MediaEngineException("pu_engine_create 返回 NULL：" + LastErrorText());
+            }
+            _engine = engine;
+        }
+        finally
+        {
+            Marshal.FreeCoTaskMem(namePtr);
+        }
+    }
+
+    /// <summary>非阻塞/阻塞取一条事件。<paramref name="timeoutMs"/> &lt; 0 表示一直等。无事件返回 null。</summary>
+    public MediaEvent? Poll(int timeoutMs = 0)
+    {
+        ThrowIfDisposed();
+        EnsureCreated();
+
+        // struct_size 必须由调用方填好：库用它与 sizeof(pu_event) 比对，判定客户端结构是否够新。
+        var ev = new PuEvent { StructSize = (uint)EventStructSize };
+        var status = NativeMethods.pu_poll_event(_engine, ref ev, timeoutMs);
+        if (status == (int)PuStatus.Timeout)
+        {
+            return null;
+        }
+        if (status != (int)PuStatus.Ok)
+        {
+            throw new MediaEngineException($"pu_poll_event 返回 {status}：{LastErrorText()}");
+        }
+        return Map(ev);
+    }
+
+    /// <summary>pu_event 在 C 侧 sizeof 为 256；这里暴露给自检做布局断言。</summary>
+    public static int EventStructSize { get; } = Marshal.SizeOf<PuEvent>();
+
+    /// <summary>pu_stats 在 C 侧 sizeof 为 64。</summary>
+    public static int StatsStructSize { get; } = Marshal.SizeOf<PuStats>();
+
+    /// <summary>开始一路内置合成源共享（不需要真实屏幕，也不改动窗口内容）。</summary>
+    public void StartSynthetic()
+    {
+        ThrowIfDisposed();
+        EnsureCreated();
+        Check(NativeMethods.pu_screen_start(_engine, "synthetic"), "pu_screen_start(synthetic)");
+    }
+
+    /// <summary>开始共享指定屏幕（id 来自 <see cref="EnumerateSources"/> 或 "\\.\DISPLAY1"）。</summary>
+    public void StartScreen(string screenId)
+    {
+        ThrowIfDisposed();
+        EnsureCreated();
+        Check(NativeMethods.pu_screen_start(_engine, screenId), "pu_screen_start");
+    }
+
+    /// <summary>停止共享（幂等）。</summary>
+    public void StopScreen()
+    {
+        ThrowIfDisposed();
+        EnsureCreated();
+        Check(NativeMethods.pu_screen_stop(_engine), "pu_screen_stop");
+    }
+
+    /// <summary>读引擎统计快照（微秒级，不发异步 GetStats）。</summary>
+    internal PuStats GetStats()
+    {
+        ThrowIfDisposed();
+        EnsureCreated();
+        var stats = new PuStats { StructSize = (uint)Marshal.SizeOf<PuStats>() };
+        Check(NativeMethods.pu_peer_stats(_engine, ref stats), "pu_peer_stats");
+        return stats;
+    }
+
+    /// <summary>枚举可共享的屏幕/窗口（v2.3 起返回真实显示器 + 末尾 synthetic 项）。</summary>
+    public IReadOnlyList<MediaSource> EnumerateSources()
+    {
+        ThrowIfDisposed();
+        EnsureCreated();
+
+        var list = new PuSourceList { StructSize = (uint)Marshal.SizeOf<PuSourceList>() };
+        Check(NativeMethods.pu_screen_sources(_engine, ref list), "pu_screen_sources");
+
+        var stride = Marshal.SizeOf<PuSourceInfo>();
+        var sources = new List<MediaSource>((int)list.Count);
+        for (var i = 0; i < list.Count; i++)
+        {
+            var info = Marshal.PtrToStructure<PuSourceInfo>(IntPtr.Add(list.Items, i * stride));
+            sources.Add(new MediaSource(
+                Marshal.PtrToStringUTF8(info.Id) ?? string.Empty,
+                Marshal.PtrToStringUTF8(info.Title) ?? string.Empty,
+                info.Width,
+                info.Height,
+                info.Kind));
+        }
+        return sources;
+    }
+
+    /// <summary>最近一次错误描述（UTF-8）。无引擎时读进程级错误串。</summary>
+    public string LastErrorText()
+    {
+        var ptr = NativeMethods.pu_last_error(_engine);
+        return ptr == IntPtr.Zero ? string.Empty : Marshal.PtrToStringUTF8(ptr) ?? string.Empty;
+    }
+
+    // ---- 以下导出为 ABI 完整性保留：骨架不调用，但签名与头文件对齐 ----
+
+    public int VoiceJoin(string channelId, int mode)
+    {
+        ThrowIfDisposed();
+        EnsureCreated();
+        var idPtr = Marshal.StringToCoTaskMemUTF8(channelId);
+        try
+        {
+            var parameters = new PuVoiceParams
+            {
+                StructSize = (uint)Marshal.SizeOf<PuVoiceParams>(),
+                ChannelId = idPtr,
+                Mode = mode,
+            };
+            return NativeMethods.pu_voice_join(_engine, in parameters);
+        }
+        finally
+        {
+            Marshal.FreeCoTaskMem(idPtr);
+        }
+    }
+
+    public int VoiceLeave() => NativeMethods.pu_voice_leave(_engine);
+
+    public int VoiceSetMode(int mode) => NativeMethods.pu_voice_set_mode(_engine, mode);
+
+    public int VoiceSetMute(bool muted) => NativeMethods.pu_voice_set_mute(_engine, muted ? 1 : 0);
+
+    public int VoiceSetDeafen(bool deafened) => NativeMethods.pu_voice_set_deafen(_engine, deafened ? 1 : 0);
+
+    public int Watch(string sharerId) => NativeMethods.pu_screen_watch(_engine, sharerId);
+
+    public int Unwatch(string sharerId) => NativeMethods.pu_screen_unwatch(_engine, sharerId);
+
+    public int SignalIn(byte[] payload)
+    {
+        var ptr = Marshal.AllocHGlobal(payload.Length);
+        try
+        {
+            Marshal.Copy(payload, 0, ptr, payload.Length);
+            return NativeMethods.pu_signal_in(_engine, ptr, (UIntPtr)(uint)payload.Length);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(ptr);
+        }
+    }
+
+    internal int FrameAcquire(string streamId, out PuFrame frame)
+    {
+        frame = new PuFrame { StructSize = (uint)Marshal.SizeOf<PuFrame>() };
+        return NativeMethods.pu_frame_acquire(_engine, streamId, ref frame);
+    }
+
+    internal void FrameRelease(ref PuFrame frame) => NativeMethods.pu_frame_release(_engine, ref frame);
+
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+        _disposed = true;
+        if (_engine != IntPtr.Zero)
+        {
+            NativeMethods.pu_engine_destroy(_engine);
+            _engine = IntPtr.Zero;
+        }
+        if (_handle != IntPtr.Zero)
+        {
+            NativeLibrary.Free(_handle);
+            _handle = IntPtr.Zero;
+        }
+    }
+
+    private void EnsureCreated()
+    {
+        if (_engine == IntPtr.Zero)
+        {
+            throw new MediaEngineException("引擎尚未创建（先调用 Create）");
+        }
+    }
+
+    private void Check(int status, string operation)
+    {
+        if (status != (int)PuStatus.Ok)
+        {
+            throw new MediaEngineException($"{operation} 返回 {status}：{LastErrorText()}");
+        }
+    }
+
+    private void ThrowIfDisposed()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+    }
+
+    private static unsafe MediaEvent Map(PuEvent ev)
+    {
+        var kind = (MediaEventKind)ev.Type;
+        switch (kind)
+        {
+            case MediaEventKind.State:
+                return new MediaEvent(
+                    kind,
+                    ev.Type,
+                    ev.TimestampUs,
+                    ev.Data.State.State,
+                    ev.Data.State.PreviousState,
+                    ev.Data.State.Reason,
+                    null);
+            case MediaEventKind.Error:
+                return new MediaEvent(
+                    kind,
+                    ev.Type,
+                    ev.TimestampUs,
+                    0,
+                    0,
+                    0,
+                    ReadFixedMessage(ev.Data.Error));
+            default:
+                return new MediaEvent(kind, ev.Type, ev.TimestampUs, 0, 0, 0, null);
+        }
+    }
+
+    /// <summary>把 pu_error_event.message[232] 这条 C 定长 UTF-8 字段读成字符串。</summary>
+    private static unsafe string ReadFixedMessage(PuErrorEvent error)
+    {
+        // 对 local 结构体的 fixed buffer 成员，在 unsafe 上下文里本身就是已固定指针。
+        byte* pointer = error.Message;
+        return Marshal.PtrToStringUTF8((IntPtr)pointer) ?? string.Empty;
+    }
+}

@@ -1,0 +1,218 @@
+// PartyUp 服务端单二进制入口。
+//
+// 子命令：
+//
+//	partyup serve  [--data DIR] [--http ADDR] [--name NAME] [--log-level L]   启动服务
+//	partyup invite [--data DIR] [--by MEMBER_ID]                             另发一个邀请码
+//	partyup version                                                          打印版本
+//
+// 输出约定：stdout 只放机器可读的行（KEY=VALUE 与 "READY"），日志全部走 stderr。
+// 这样一键复现脚本可以直接从 stdout 取 BOOTSTRAP_TOKEN / INVITE_CODE / LISTEN_ADDR，
+// 不需要解析日志，也不会被日志格式变化打断。
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
+
+	"partyup/internal/auth"
+	"partyup/internal/protocol"
+	"partyup/internal/server"
+	"partyup/internal/store"
+)
+
+// version 是二进制版本。协议版本在 protocol.Version（当前 1）。
+const version = "0.1.0"
+
+func main() {
+	if err := run(os.Args[1:]); err != nil {
+		fmt.Fprintln(os.Stderr, "partyup:", err)
+		os.Exit(1)
+	}
+}
+
+func run(args []string) error {
+	cmd := "serve"
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		cmd = args[0]
+		args = args[1:]
+	}
+	switch cmd {
+	case "serve":
+		return cmdServe(args)
+	case "invite":
+		return cmdInvite(args)
+	case "version":
+		fmt.Printf("partyup %s (protocol v%d)\n", version, protocol.Version)
+		return nil
+	case "help", "-h", "--help":
+		printUsage()
+		return nil
+	default:
+		printUsage()
+		return fmt.Errorf("unknown command %q", cmd)
+	}
+}
+
+func printUsage() {
+	fmt.Fprint(os.Stderr, `partyup — PartyUp 服务端
+
+用法:
+  partyup serve  [--data DIR] [--http ADDR] [--name NAME] [--log-level L]
+  partyup invite [--data DIR] [--by MEMBER_ID]
+  partyup version
+
+serve 的 stdout 输出（每行 KEY=VALUE，最后一行 READY）:
+  DATA_DIR / DB_PATH / BOOTSTRAP_TOKEN / INVITE_CODE / LISTEN_ADDR
+BOOTSTRAP_TOKEN 与 INVITE_CODE 只在本次启动新生成时出现。
+`)
+}
+
+func cmdServe(args []string) error {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	dataDir := fs.String("data", "./data", "数据目录（SQLite 库与未来附件都在这里）")
+	httpAddr := fs.String("http", "127.0.0.1:8080", "HTTP 监听地址")
+	name := fs.String("name", "PartyUp", "服务端展示名")
+	logLevel := fs.String("log-level", "info", "日志级别：debug|info|warn|error")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	logger := newLogger(*logLevel)
+
+	st, err := store.Open(*dataDir)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	srv := server.New(st, server.Options{
+		Name:    *name,
+		Version: version,
+		Logger:  logger,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	info, err := srv.EnsureFirstRun(ctx)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("first-run setup: %w", err)
+	}
+
+	absData, err := filepath.Abs(*dataDir)
+	if err != nil {
+		absData = *dataDir
+	}
+
+	// 先 bind 再打印：脚本看到 LISTEN_ADDR 就能立刻连，不存在「打印了但还没监听」的窗口。
+	ln, err := net.Listen("tcp", *httpAddr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", *httpAddr, err)
+	}
+
+	fmt.Printf("partyup %s\n", version)
+	fmt.Printf("PROTOCOL_VERSION=%d\n", protocol.Version)
+	fmt.Printf("DATA_DIR=%s\n", absData)
+	fmt.Printf("DB_PATH=%s\n", st.Path())
+	if info.Token != "" {
+		fmt.Printf("BOOTSTRAP_TOKEN=%s\n", info.Token)
+	}
+	if info.InviteCode != "" {
+		fmt.Printf("INVITE_CODE=%s\n", info.InviteCode)
+	}
+	fmt.Printf("LISTEN_ADDR=%s\n", ln.Addr().String())
+	fmt.Println("READY")
+
+	httpSrv := &http.Server{
+		Handler:           srv.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- httpSrv.Serve(ln) }()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	logger.Info("partyup server listening", "addr", ln.Addr().String(), "db", st.Path())
+
+	select {
+	case err := <-serveErr:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case sig := <-sigCh:
+		logger.Info("shutting down", "signal", sig.String())
+	}
+
+	// 先断 WS（否则 Shutdown 会等空闲连接直到超时），再停 HTTP。
+	srv.Hub().Close()
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelShutdown()
+	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+		logger.Warn("http shutdown", "err", err)
+	}
+	return nil
+}
+
+func cmdInvite(args []string) error {
+	fs := flag.NewFlagSet("invite", flag.ContinueOnError)
+	dataDir := fs.String("data", "./data", "数据目录")
+	createdBy := fs.String("by", "", "创建者成员 id（可选，仅记录用）")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	st, err := store.Open(*dataDir)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	for attempt := 0; attempt < 5; attempt++ {
+		code, err := auth.NewInviteCode()
+		if err != nil {
+			return err
+		}
+		if _, err := st.CreateInvite(ctx, code, *createdBy); errors.Is(err, store.ErrConflict) {
+			continue
+		} else if err != nil {
+			return err
+		}
+		fmt.Printf("INVITE_CODE=%s\n", code)
+		return nil
+	}
+	return errors.New("could not allocate a unique invite code")
+}
+
+// newLogger 输出到 stderr：stdout 留给机器可读的启动块。
+func newLogger(level string) *slog.Logger {
+	var lvl slog.Level
+	switch strings.ToLower(level) {
+	case "debug":
+		lvl = slog.LevelDebug
+	case "warn":
+		lvl = slog.LevelWarn
+	case "error":
+		lvl = slog.LevelError
+	default:
+		lvl = slog.LevelInfo
+	}
+	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl}))
+}

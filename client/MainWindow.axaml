@@ -1,0 +1,143 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:PartyUp.Client.ViewModels"
+        xmlns:models="using:PartyUp.Client.Models"
+        x:Class="PartyUp.Client.MainWindow"
+        x:DataType="vm:MainViewModel"
+        Width="1140" Height="760"
+        MinWidth="900" MinHeight="600"
+        Background="#FF0E1014"
+        Title="PartyUp · 文字频道">
+  <Grid RowDefinitions="Auto,*,Auto">
+
+    <!-- 顶栏：品牌 / 连接状态 / 媒体引擎状态 -->
+    <Border Grid.Row="0" Background="#FF161A22" Padding="18,12"
+            BorderBrush="#FF232936" BorderThickness="0,0,0,1">
+      <Grid ColumnDefinitions="Auto,*,Auto">
+        <StackPanel Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
+          <TextBlock Text="PartyUp" FontSize="19" FontWeight="Bold" Foreground="#FFF1F3F8" />
+          <Border Background="#FF232A38" CornerRadius="9" Padding="8,3" VerticalAlignment="Center">
+            <TextBlock Text="骨架 · tracer bullet" FontSize="11" Foreground="#FF9AA4B8" />
+          </Border>
+        </StackPanel>
+        <TextBlock Grid.Column="1" Text="{Binding StatusText}"
+                   HorizontalAlignment="Center" VerticalAlignment="Center"
+                   FontSize="12" Foreground="#FF8E98AB" />
+        <Border Grid.Column="2" Background="#FF15251B" CornerRadius="9" Padding="10,4"
+                VerticalAlignment="Center">
+          <TextBlock Text="{Binding MediaStatusText}" FontSize="12" Foreground="#FF8AD9A0" />
+        </Border>
+      </Grid>
+    </Border>
+
+    <!-- 未登录：登录 / 邀请码注册 -->
+    <Grid Grid.Row="1" IsVisible="{Binding !IsLoggedIn}">
+      <Border Width="460" Background="#FF161A22" CornerRadius="14" Padding="28"
+              VerticalAlignment="Center" HorizontalAlignment="Center"
+              BorderBrush="#FF232936" BorderThickness="1">
+        <StackPanel Spacing="12">
+          <TextBlock Text="连接服务器" FontSize="17" FontWeight="SemiBold" Foreground="#FFF1F3F8" />
+          <TextBlock FontSize="11" Foreground="#FF7C8698" TextWrapping="Wrap"
+                     Text="地址形如 http://127.0.0.1:8080。首次启动的 bootstrap token 与邀请码打印在服务端 stdout；本骨架的客户端只做登录、频道与文字。" />
+
+          <TextBlock Text="服务器地址" FontSize="11" Foreground="#FF9AA4B8" />
+          <TextBox Text="{Binding ServerUrl}" PlaceholderText="http://127.0.0.1:8080" />
+          <TextBlock Text="用户名" FontSize="11" Foreground="#FF9AA4B8" />
+          <TextBox Text="{Binding Username}" PlaceholderText="alice" />
+          <TextBlock Text="密码" FontSize="11" Foreground="#FF9AA4B8" />
+          <TextBox Text="{Binding Password}" PasswordChar="●" />
+          <TextBlock Text="邀请码（注册新成员时填）" FontSize="11" Foreground="#FF9AA4B8" />
+          <TextBox Text="{Binding InviteCode}" PlaceholderText="例如 QD32GJV1YZ" />
+
+          <Grid ColumnDefinitions="*,*" Margin="0,8,0,0">
+            <Button x:Name="LoginButton" Content="登录"
+                    HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+                    Background="#FF2C5BE6" Foreground="White" Padding="0,8" />
+            <Button x:Name="RegisterButton" Grid.Column="1" Content="用邀请码注册"
+                    Margin="10,0,0,0" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+                    Padding="0,8" />
+          </Grid>
+        </StackPanel>
+      </Border>
+    </Grid>
+
+    <!-- 已登录：频道列表 / 聊天 / 在线成员 -->
+    <Grid Grid.Row="1" IsVisible="{Binding IsLoggedIn}" ColumnDefinitions="250,*,210">
+      <Border Grid.Column="0" Background="#FF12151C" Padding="10"
+              BorderBrush="#FF232936" BorderThickness="0,0,1,0">
+        <DockPanel>
+          <StackPanel DockPanel.Dock="Top" Spacing="8">
+            <TextBlock Text="频道" FontSize="12" FontWeight="SemiBold" Foreground="#FF9AA4B8" />
+            <Grid ColumnDefinitions="*,Auto">
+              <TextBox Text="{Binding NewChannelName}" PlaceholderText="新频道名" FontSize="12" />
+              <Button x:Name="CreateChannelButton" Grid.Column="1" Content="+"
+                      Width="34" Margin="6,0,0,0" />
+            </Grid>
+          </StackPanel>
+          <ListBox x:Name="ChannelList" ItemsSource="{Binding Channels}"
+                   SelectedItem="{Binding SelectedChannel}"
+                   Background="Transparent" Margin="0,8,0,0">
+            <ListBox.ItemTemplate>
+              <DataTemplate x:DataType="vm:ChannelItem">
+                <TextBlock Text="{Binding Name}" Padding="6,3" FontSize="13" />
+              </DataTemplate>
+            </ListBox.ItemTemplate>
+          </ListBox>
+        </DockPanel>
+      </Border>
+
+      <Grid Grid.Column="1" RowDefinitions="*,Auto" Margin="14">
+        <Border Grid.Row="0" Background="#FF14171F" CornerRadius="12" Padding="12">
+          <ScrollViewer x:Name="MessageScroll">
+            <ItemsControl ItemsSource="{Binding Messages}">
+              <ItemsControl.ItemTemplate>
+                <DataTemplate x:DataType="vm:MessageItem">
+                  <Grid ColumnDefinitions="48,*" Margin="0,0,0,9">
+                    <TextBlock Text="{Binding TimeText}" FontSize="11"
+                               Foreground="#FF6C7688" Margin="0,2,6,0" />
+                    <StackPanel Grid.Column="1" Spacing="2">
+                      <TextBlock Text="{Binding Author}" FontSize="12" FontWeight="SemiBold"
+                                 Foreground="#FF9FB3D9" />
+                      <TextBlock Text="{Binding Body}" FontSize="13"
+                                 Foreground="#FFE7EAF1" TextWrapping="Wrap" />
+                    </StackPanel>
+                  </Grid>
+                </DataTemplate>
+              </ItemsControl.ItemTemplate>
+            </ItemsControl>
+          </ScrollViewer>
+        </Border>
+        <Grid Grid.Row="1" ColumnDefinitions="*,Auto" Margin="0,10,0,0">
+          <TextBox x:Name="MessageInput" Text="{Binding MessageInput}"
+                   PlaceholderText="输入消息，回车发送" FontSize="13" />
+          <Button x:Name="SendButton" Grid.Column="1" Content="发送" Margin="8,0,0,0"
+                  Padding="18,7" Background="#FF2C5BE6" Foreground="White" />
+        </Grid>
+      </Grid>
+
+      <Border Grid.Column="2" Background="#FF12151C" Padding="12"
+              BorderBrush="#FF232936" BorderThickness="1,0,0,0">
+        <DockPanel>
+          <TextBlock DockPanel.Dock="Top" Text="在线成员" FontSize="12"
+                     FontWeight="SemiBold" Foreground="#FF9AA4B8" />
+          <ItemsControl ItemsSource="{Binding Members}" Margin="0,8,0,0">
+            <ItemsControl.ItemTemplate>
+              <DataTemplate x:DataType="models:PresenceMemberDto">
+                <StackPanel Orientation="Horizontal" Spacing="6" Margin="0,3">
+                  <Ellipse Width="7" Height="7" Fill="#FF6FCF87" VerticalAlignment="Center" />
+                  <TextBlock Text="{Binding Name}" FontSize="12" Foreground="#FFD5DAE4" />
+                </StackPanel>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+        </DockPanel>
+      </Border>
+    </Grid>
+
+    <!-- 底栏 -->
+    <Border Grid.Row="2" Background="#FF11141A" Padding="16,7"
+            BorderBrush="#FF232936" BorderThickness="0,1,0,0">
+      <TextBlock Text="{Binding FooterText}" FontSize="11" Foreground="#FF7C8698" />
+    </Border>
+  </Grid>
+</Window>

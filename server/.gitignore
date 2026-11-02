@@ -1,0 +1,3 @@
+# Go 构建/模块缓存落在仓库内（本机 ~/go 只读），不进 git、不进 wdb 快照。
+.cache/
+cmd/partyup/partyup

@@ -1,0 +1,52 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
+    <AssemblyName>PartyUp.Client</AssemblyName>
+    <RootNamespace>PartyUp.Client</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+
+    <!--
+      必须指定 RID（与 Spike 1 同样的理由）：Avalonia 的原生依赖只落在
+      runtimes/win-x64/native，缺少 RID 时 SkiaSharp 会被 PATH 上的同名旧库抢走。
+    -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
+
+    <!-- P/Invoke 结构体布局与 NativeLibrary 探测需要 Unsafe。 -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
+    <!-- 媒体核心 DLL 的默认位置；可用 -p:PartyUpMediaDll=... 覆盖（CI 或别处构建时）。 -->
+    <PartyUpMediaDll Condition="'$(PartyUpMediaDll)' == ''">$(MSBuildThisFileDirectory)../src/media-core/out/partyup_media.dll</PartyUpMediaDll>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Avalonia" Version="12.1.4" />
+    <PackageReference Include="Avalonia.Desktop" Version="12.1.4" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="12.1.4" />
+    <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.2" />
+    <!-- ULID：PROTOCOL.md §0 规定消息 id 是 ULID，不自造编码。 -->
+    <PackageReference Include="NUlid" Version="1.7.3" />
+  </ItemGroup>
+
+  <!--
+    把媒体核心 DLL 拷进输出目录：客户端进程从 AppContext.BaseDirectory 显式加载它
+    （见 Services/MediaEngine.cs 的 DllImportResolver），不依赖 PATH 搜索顺序。
+  -->
+  <ItemGroup>
+    <None Include="$(PartyUpMediaDll)"
+          Condition="Exists('$(PartyUpMediaDll)')"
+          Link="partyup_media.dll"
+          CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <Target Name="WarnMissingPartyUpMediaDll" BeforeTargets="Build">
+    <Warning Condition="!Exists('$(PartyUpMediaDll)')"
+             Text="找不到媒体核心 $([MSBuild]::NormalizePath('$(PartyUpMediaDll)'))；UI 会显示「媒体引擎不可用」。用 scripts/build-media-dll.ps1 构建。" />
+  </Target>
+
+</Project>

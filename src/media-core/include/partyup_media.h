@@ -11,7 +11,12 @@
  * 版本历史：
  *   v1（第一切片）6 个函数：engine_create / engine_destroy / screen_start /
  *       screen_stop / poll_event / last_error。只有合成采集源，没有网络。
- *   v2（本版）补上信令通道并把真 PeerConnection 接进来：
+ *   v2.3（本版）把屏幕采集换成真实 WGC（Windows Graphics Capture），但 ABI 仍是
+ *       v2：pu_screen_sources 的返回格式没有变（用的是 v2 已有的 pu_source_info
+ *       的 id/title/width/height/kind 字段），只是终于实现了；pu_screen_start 的
+ *       参数语义扩展为「接受 pu_screen_sources 返回的 id」。结构体布局、函数签名
+ *       一个都没动，v2 客户端无需重编译。
+ *   v2 补上信令通道并把真 PeerConnection 接进来：
  *       - 新函数 pu_signal_in（UI 把服务端下发的信令 JSON 原样灌进来）、
  *         pu_peer_stats（读回发/收帧计数，测试用来断言）；
  *       - 新事件 PU_EVENT_SIGNAL_OUT（待发往服务端的信令 JSON）、
@@ -72,8 +77,13 @@ typedef enum pu_status {
 typedef struct pu_engine pu_engine;
 
 /* 屏幕共享源标识：UTF-8、0 结尾的字符串。
- *   "synthetic" / NULL  → 内置合成帧源（640x360 渐变 @30fps，本版唯一可用的源）
- * 真实屏幕/窗口枚举（pu_screen_sources）在下一版实现，届时返回的 id 才能传进来。
+ *   "synthetic" / NULL     → 内置合成帧源（640x360 渐变 @30fps），测试/兜底用；
+ *   pu_screen_sources 的 id → 真实屏幕采集（Windows Graphics Capture）。
+ * 屏幕 id 形如 "display:0x0000000000050001"，是 HMONITOR 的十六进制值：
+ *   * 它是「这块屏」的稳定标识，按它就能重新找回同一块屏；
+ *   * 不要用 GenericCaptureItem 的 DisplayName（"显示 2"）做匹配，它和 DXGI 的
+ *     \\.\DISPLAYn 编号不一致，多屏时会张冠李戴；
+ *   * 另外接受 "\\.\DISPLAY1" 这种设备名别名（方便命令行手工传入）。
  * 字符串由调用方持有，只在本次调用期间读取。 */
 typedef const char* pu_screen_id;
 
@@ -293,9 +303,9 @@ typedef struct pu_source_info {
   uint32_t struct_size;   /* sizeof(pu_source_info) */
   const char* id;         /* UTF-8，库持有，有效期同 pu_source_list */
   const char* title;      /* UTF-8，库持有 */
-  uint32_t width;
+  uint32_t width;         /* 物理像素（真实屏幕）/ 合成尺寸（synthetic） */
   uint32_t height;
-  uint32_t kind;          /* 0=屏幕 1=窗口 */
+  uint32_t kind;          /* 0=屏幕 1=窗口（预留） 2=合成源 */
   uint32_t reserved;
 } pu_source_info;
 
@@ -392,7 +402,7 @@ PU_API int pu_signal_in(pu_engine* e, const char* payload, size_t len);
  * 不加锁、不发异步 GetStats，微秒级返回，可以从任意线程周期性调用。 */
 PU_API int pu_peer_stats(pu_engine* e, pu_stats* out);
 
-/* ---- 以下 10 个为下一版实现，签名冻结、当前统一返回 PU_NOT_IMPLEMENTED ---- */
+/* ---- 以下 9 个为下一版实现，签名冻结、当前统一返回 PU_NOT_IMPLEMENTED ---- */
 
 PU_API int pu_voice_join(pu_engine* e, const pu_voice_params* p);
 PU_API int pu_voice_leave(pu_engine* e);
@@ -400,6 +410,11 @@ PU_API int pu_voice_set_mode(pu_engine* e, pu_mode mode);
 PU_API int pu_voice_set_mute(pu_engine* e, int muted);
 PU_API int pu_voice_set_deafen(pu_engine* e, int deafened);
 
+/* v2.3 起实现：枚举可共享的源。out->struct_size 必须 >= sizeof(pu_source_list)。
+ * 返回 PU_OK 时 out->items 指向库内存，有效期到下一次调用本函数或 pu_engine_destroy；
+ * 列表 = 本机所有显示器（kind=0，主屏在前，id 用 HMONITOR）+ 末尾一个 "synthetic"
+ * （kind=2）。items 里 id/title 是 UTF-8、库持有。显示器被拔掉/枚举失败时仍返回
+ * PU_OK，只是没有 kind=0 的项（合成源永远在）。 */
 PU_API int pu_screen_sources(pu_engine* e, pu_source_list* out);
 PU_API int pu_screen_watch(pu_engine* e, const char* sharer_id);
 PU_API int pu_screen_unwatch(pu_engine* e, const char* sharer_id);

@@ -86,11 +86,14 @@ $hdrDir = Join-Path $Root 'src\media-core\include'
 # vendored 的 nlohmann/json 单头文件（信令信封解析用），见 src/media-core/vendor/nlohmann/README.md
 $vendorDir = Join-Path $Root 'src\media-core\vendor'
 $dllSrc = Join-Path $Root 'src\media-core\src\media_engine.cpp'
+# v2.3：真实屏幕采集（Windows Graphics Capture）单独一个编译单元，见文件头注释。
+$wgcSrc = Join-Path $Root 'src\media-core\src\wgc_screen.cpp'
 $smokeSrc = Join-Path $Root 'spikes\media-dll-smoke\main.cpp'
 $signalingSrc = Join-Path $Root 'spikes\media-dll-smoke\signaling.cpp'
 $stressSrc = Join-Path $Root 'spikes\media-dll-smoke\teardown_stress.cpp'
+$captureSrc = Join-Path $Root 'spikes\media-dll-smoke\screen_capture.cpp'
 
-foreach ($required in @($vcvars, $include, $libDir, $dllSrc, $smokeSrc, $signalingSrc, $stressSrc, $vendorDir)) {
+foreach ($required in @($vcvars, $include, $libDir, $dllSrc, $wgcSrc, $smokeSrc, $signalingSrc, $stressSrc, $captureSrc, $vendorDir)) {
   if (-not (Test-Path $required)) { throw "missing required path: $required" }
 }
 if (-not (Test-Path (Join-Path $include 'api\peer_connection_interface.h'))) {
@@ -106,6 +109,7 @@ $dllLib = Join-Path $OutDir 'partyup_media.lib'
 $smokeOut = Join-Path $OutDir 'media_smoke.exe'
 $signalingOut = Join-Path $OutDir 'media_signaling_smoke.exe'
 $stressOut = Join-Path $OutDir 'teardown_stress.exe'
+$captureOut = Join-Path $OutDir 'screen_capture_smoke.exe'
 $exportsTxt = Join-Path $OutDir 'exports.txt'
 
 # 编译中间文件与本机运行目录都放本机盘：cmd.exe 不支持 UNC 作为工作目录，
@@ -115,7 +119,8 @@ $objDll = Join-Path $workRoot 'obj-dll'
 $objSmoke = Join-Path $workRoot 'obj-smoke'
 $objSignaling = Join-Path $workRoot 'obj-signaling'
 $objStress = Join-Path $workRoot 'obj-stress'
-New-Item -ItemType Directory -Force -Path $objDll, $objSmoke, $objSignaling, $objStress | Out-Null
+$objCapture = Join-Path $workRoot 'obj-capture'
+New-Item -ItemType Directory -Force -Path $objDll, $objSmoke, $objSignaling, $objStress, $objCapture | Out-Null
 
 # -Symbols：带调试信息构建，崩溃栈才能符号化到函数/行号（PDB 落在本机 $workRoot，
 # 避免大 PDB 写 UNC 时偶发 LNK1201，也方便 dbghelp 就地加载）。
@@ -124,12 +129,14 @@ $debugLinkDll = ''
 $debugLinkSmoke = ''
 $debugLinkSignaling = ''
 $debugLinkStress = ''
+$debugLinkCapture = ''
 if ($Symbols) {
   $debugCompile = ' /Zi'
   $debugLinkDll = " /DEBUG /INCREMENTAL:NO /PDB:`"$workRoot\partyup_media.pdb`""
   $debugLinkSmoke = " /DEBUG /INCREMENTAL:NO /PDB:`"$workRoot\media_smoke.pdb`""
   $debugLinkSignaling = " /DEBUG /INCREMENTAL:NO /PDB:`"$workRoot\media_signaling_smoke.pdb`""
   $debugLinkStress = " /DEBUG /INCREMENTAL:NO /PDB:`"$workRoot\teardown_stress.pdb`""
+  $debugLinkCapture = " /DEBUG /INCREMENTAL:NO /PDB:`"$workRoot\screen_capture_smoke.pdb`""
 }
 
 $common = @(
@@ -137,6 +144,9 @@ $common = @(
   '/DWEBRTC_WIN', '/DNOMINMAX', '/DWIN32_LEAN_AND_MEAN',
   "/I`"$include`"",
   "/I`"$include\third_party\abseil-cpp`"",
+  # libyuv 的公开头文件（ARGBToI420 / I420ToARGB）随 libwebrtc 一起 vendored，
+  # 其内部 include 形如 "libyuv/basic_types.h"，所以根目录是 ...\libyuv\include。
+  "/I`"$include\third_party\libyuv\include`"",
   "/I`"$hdrDir`"",
   "/I`"$vendorDir`""
 ) -join ' '
@@ -144,7 +154,10 @@ $common = @(
 # 与 spike 完全相同的系统库清单；缺哪个链接器会报 unresolved external，按提示补。
 $sysLibs = @(
   'ws2_32.lib', 'secur32.lib', 'crypt32.lib', 'iphlpapi.lib', 'winmm.lib', 'shlwapi.lib',
-  'dmoguids.lib', 'wmcodecdspuuid.lib', 'msdmo.lib', 'strmiids.lib', 'advapi32.lib', 'ole32.lib'
+  'dmoguids.lib', 'wmcodecdspuuid.lib', 'msdmo.lib', 'strmiids.lib', 'advapi32.lib', 'ole32.lib',
+  # v2.3 真实屏幕采集新增：WGC 自身（d3d11/dxgi/runtimeobject=RoGetActivationFactory）、
+  # 首帧回写 PNG（windowscodecs=WIC）、DPI/显示器枚举（user32/shcore）。
+  'd3d11.lib', 'dxgi.lib', 'runtimeobject.lib', 'windowscodecs.lib', 'user32.lib', 'shcore.lib'
 ) -join ' '
 
 Write-Host "== vcvars : $vcvars"
@@ -153,7 +166,7 @@ Write-Host "== out    : $OutDir"
 Write-Host "== stage  : $StageDir"
 
 # ---- 1. 动态库 ----
-$dllCmd = "cl $common$debugCompile /LD /DPU_BUILD_SHARED `"$dllSrc`" /Fe:`"$dllOut`" " +
+$dllCmd = "cl $common$debugCompile /LD /DPU_BUILD_SHARED `"$dllSrc`" `"$wgcSrc`" /Fe:`"$dllOut`" " +
           "/link$debugLinkDll /LIBPATH:`"$libDir`" webrtc.lib $sysLibs /IMPLIB:`"$dllLib`""
 
 Push-Location $objDll
@@ -198,6 +211,17 @@ try {
   Pop-Location
 }
 
+# ---- 2d. 真实屏幕采集冒烟 exe（抓 10 秒真桌面，报文 fps/分段耗时/码率） ----
+$captureCmd = "cl $common$debugCompile `"$captureSrc`" /Fe:`"$captureOut`" /link$debugLinkCapture `"$dllLib`""
+
+Push-Location $objCapture
+try {
+  cmd /c "call `"$vcvars`" >nul 2>&1 && $captureCmd"
+  if ($LASTEXITCODE -ne 0) { throw "cl failed building screen_capture_smoke.exe (exit $LASTEXITCODE)" }
+} finally {
+  Pop-Location
+}
+
 # ---- 3. 导出符号检查：必须只有 pu_* ----
 New-Item -ItemType Directory -Force -Path $StageDir | Out-Null
 Push-Location $StageDir
@@ -234,7 +258,8 @@ if ($Run) {
   Copy-Item -Force $dllOut (Join-Path $StageDir 'partyup_media.dll')
   Copy-Item -Force $smokeOut (Join-Path $StageDir 'media_smoke.exe')
   Copy-Item -Force $signalingOut (Join-Path $StageDir 'media_signaling_smoke.exe')
-  Write-Host "== [1/2] smoke (single engine lifecycle) from local disk: $StageDir"
+  Copy-Item -Force $captureOut (Join-Path $StageDir 'screen_capture_smoke.exe')
+  Write-Host "== [1/3] smoke (single engine lifecycle) from local disk: $StageDir"
   Push-Location $StageDir
   try {
     & (Join-Path $StageDir 'media_smoke.exe')
@@ -245,7 +270,7 @@ if ($Run) {
   if ($exitCode -ne 0) { throw "media_smoke failed: exit=$exitCode" }
   Write-Host "== media_smoke exit=0"
 
-  Write-Host "== [2/2] signaling smoke (two engines, offer/answer/DTLS/remote frames)"
+  Write-Host "== [2/3] signaling smoke (two engines, offer/answer/DTLS/remote frames)"
   Push-Location $StageDir
   try {
     & (Join-Path $StageDir 'media_signaling_smoke.exe')
@@ -255,6 +280,30 @@ if ($Run) {
   }
   if ($sigExitCode -ne 0) { throw "media_signaling_smoke failed: exit=$sigExitCode" }
   Write-Host "== media_signaling_smoke exit=0"
+
+  Write-Host "== [3/3] screen capture smoke (real WGC desktop, 10 s)"
+  Push-Location $StageDir
+  try {
+    & (Join-Path $StageDir 'screen_capture_smoke.exe') --seconds 10
+    $captureExitCode = $LASTEXITCODE
+  } finally {
+    Pop-Location
+  }
+  if ($captureExitCode -ne 0) { throw "screen_capture_smoke failed: exit=$captureExitCode" }
+  Write-Host "== screen_capture_smoke exit=0"
+  # 首帧 PNG 与引擎日志带回仓库，方便从 WSL 用 read_image / 文本工具直接看。
+  $stagePng = Join-Path $StageDir 'capture-first-frame.png'
+  if (Test-Path $stagePng) {
+    Copy-Item -Force $stagePng (Join-Path $OutDir 'capture-first-frame.png')
+    Write-Host "== first-frame png: $(Join-Path $OutDir 'capture-first-frame.png')"
+  } else {
+    Write-Host "== WARN: capture-first-frame.png was not produced"
+  }
+  $engineLog = Join-Path $env:TEMP 'partyup-screen-capture-smoke.log'
+  if (Test-Path $engineLog) {
+    Copy-Item -Force $engineLog (Join-Path $OutDir 'screen-capture-engine.log')
+    Write-Host "== engine log: $(Join-Path $OutDir 'screen-capture-engine.log')"
+  }
 }
 
 # ---- 5. 可选：teardown 压测（复现/验证收尾竞态） ----

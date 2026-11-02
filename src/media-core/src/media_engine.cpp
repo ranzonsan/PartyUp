@@ -26,6 +26,17 @@
 // bytesSent / framesEncoded / keyFramesEncoded 累计量写进原子量，采集线程逐帧
 // 发事件时读「最近一次采样窗口」的值。sequence / capture_ts_us / width / height
 // 仍然由采集侧给出。GetStats 是异步回调，绝不能在调用线程上等它（见 §8）。
+//
+// v2.3（本版）把采集源从「合成帧」换成**真实 WGC 采集**：
+//   pu_screen_sources  枚举真实显示器（id 用 HMONITOR，见 wgc_screen.h）+ 保留
+//                      "synthetic" 作为测试源；
+//   pu_screen_start    按 id 分派：synthetic 走原来的固定节拍合成循环，显示器 id
+//                      走 wgc_screen.cpp（D3D11 → WGC → staging → libyuv I420）；
+//   采集节拍          真实源是事件驱动的（WGC 的 FrameArrived），不用 16.7 ms 定时器；
+//   每帧耗时           拆成 capture / readback / convert / encode-wait 四段，
+//                      走 PARTYUP_MEDIA_LOG 的同一通道，停止时打印一行
+//                      ===CAPTURE_SUMMARY=== 便于脚本取数。
+// ABI 不变：pu_source_info 的布局没动，id/width/height/kind 都用 v2 已有字段。
 #include "partyup_media.h"
 
 #include <algorithm>
@@ -50,6 +61,10 @@
 // src/media-core/vendor/nlohmann/README.md）。不用仓库自带的 jsoncpp，因为
 // third_party/libwebrtc 只带了它的头文件、没有实现，webrtc.lib 里也没有符号。
 #include "nlohmann/json.hpp"
+
+// 真实屏幕采集（Windows Graphics Capture）：只做「显示器 → I420 帧」，
+// 不依赖 libwebrtc 的 PeerConnection；DLL 里另一支编译单元见 wgc_screen.cpp。
+#include "wgc_screen.h"
 
 // libwebrtc（m152）—— 与 spikes/media-link/main.cpp 同一组头文件
 #include "api/audio/audio_device.h"
@@ -179,10 +194,11 @@ const char* CreateErrorCString() {
 namespace {
 
 // ---------------------------------------------------------------------------
-// 合成视频源：直接实现 VideoTrackSourceInterface，帧分发交给 VideoBroadcaster
-// （线程安全）。类不能写 final —— 外面要套 webrtc::RefCountedObject<T>。
+// 本地视频源（合成帧与真实 WGC 采集共用）：直接实现 VideoTrackSourceInterface，
+// 帧分发交给 VideoBroadcaster（线程安全）。类不能写 final —— 外面要套
+// webrtc::RefCountedObject<T>。
 // ---------------------------------------------------------------------------
-class SyntheticVideoSource : public webrtc::VideoTrackSourceInterface {
+class ScreenVideoSource : public webrtc::VideoTrackSourceInterface {
  public:
   void AddOrUpdateSink(webrtc::VideoSinkInterface<webrtc::VideoFrame>* sink,
                        const webrtc::VideoSinkWants& wants) override {
@@ -564,6 +580,8 @@ class MediaEngine {
   bool Init(const pu_config* cfg, std::string* error);
   int Start(const char* screen_id, std::string* error);
   int Stop();
+  // v2.3：枚举可共享的源（真实显示器 + "synthetic"），结果缓存在成员里。
+  int Sources(pu_source_list* out);
   int Poll(pu_event* out, int timeout_ms);
   const char* LastError();
   void SetLastError(const std::string& message);
@@ -578,6 +596,8 @@ class MediaEngine {
 
  private:
   void PumpLoop();
+  // 真实采集（WGC）的事件驱动循环；由 PumpLoop 分派，不单独起线程。
+  void RealCaptureLoop();
   void SignalStart(bool ok, const std::string& error);
   void PushState(int32_t state, int32_t previous, int32_t reason);
   void PushError(int32_t code, const std::string& message);
@@ -624,8 +644,21 @@ class MediaEngine {
   webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> pc_factory_;
 
   // 一路共享流的对象
-  webrtc::scoped_refptr<SyntheticVideoSource> source_;
+  webrtc::scoped_refptr<ScreenVideoSource> source_;
   webrtc::scoped_refptr<webrtc::VideoTrack> track_;
+
+  // ---- v2.3：真实屏幕采集 ----
+  // capture_is_real_ / capture_source_id_ 只在控制线程读写（control_mu_ 保护），
+  // 采集线程在起跑时读一次；尺寸由采集线程写、事件路径读，所以用原子量。
+  std::atomic<bool> capture_is_real_{false};
+  std::string capture_source_id_;                  // "synthetic" 或 "display:0x..."
+  std::atomic<uint32_t> capture_width_{static_cast<uint32_t>(kWidth)};
+  std::atomic<uint32_t> capture_height_{static_cast<uint32_t>(kHeight)};
+  // pu_screen_sources 的输出缓存：id/title 的 c_str() 指针要活到下一次调用，
+  // 所以把字符串和结构体都留在成员里（不要指向即将销毁的临时量）。
+  std::vector<pu_source_info> source_items_;
+  std::vector<std::string> source_ids_;
+  std::vector<std::string> source_titles_;
   std::thread pump_;
   std::atomic<bool> stop_requested_{false};
   bool running_ = false;      // 只在控制线程读写（control_mu_ 保护）
@@ -1006,6 +1039,74 @@ void MediaEngine::Fail(const std::string& message, std::string* error) {
   Log(1, "error: %s", message.c_str());
 }
 
+
+// ---------------------------------------------------------------------------
+// v2.3：pu_screen_sources —— 真实显示器 + "synthetic"
+// ---------------------------------------------------------------------------
+int MediaEngine::Sources(pu_source_list* out) {
+  if (out == nullptr) {
+    SetLastError("pu_screen_sources: out is null");
+    return PU_ERR_INVALID_ARG;
+  }
+  if (out->struct_size < sizeof(pu_source_list)) {
+    SetLastError("pu_screen_sources: pu_source_list.struct_size is smaller than the ABI struct");
+    return PU_ERR_INVALID_ARG;
+  }
+
+  // 每次都重建缓存：上一次返回的指针本来也只在「下一次调用之前」有效。
+  source_items_.clear();
+  source_ids_.clear();
+  source_titles_.clear();
+
+  std::string enum_error;
+  const std::vector<ScreenTargetInfo> displays = EnumerateScreenTargets(&enum_error);
+  if (displays.empty()) {
+    Log(2, "pu_screen_sources: no displays (%s)", enum_error.c_str());
+  }
+  for (const ScreenTargetInfo& display : displays) {
+    source_ids_.push_back(display.id);
+    source_titles_.push_back(display.title);
+    pu_source_info info{};
+    info.struct_size = static_cast<uint32_t>(sizeof(pu_source_info));
+    info.width = display.width;
+    info.height = display.height;
+    info.kind = 0;  // 0 = 屏幕
+    info.reserved = 0;
+    source_items_.push_back(info);
+  }
+
+  // 合成源保留在列表末尾：冒烟测试与「没有显示器/被策略拦」的兜底路径都靠它。
+  source_ids_.push_back("synthetic");
+  source_titles_.push_back("Synthetic test pattern 640x360 @30fps");
+  {
+    pu_source_info info{};
+    info.struct_size = static_cast<uint32_t>(sizeof(pu_source_info));
+    info.width = static_cast<uint32_t>(kWidth);
+    info.height = static_cast<uint32_t>(kHeight);
+    info.kind = 2;  // 2 = 合成（0=屏幕 1=窗口预留）
+    info.reserved = 0;
+    source_items_.push_back(info);
+  }
+
+  // 指针最后再填：此时两个 vector 不再增长，c_str() 的地址稳定到下一次调用。
+  for (size_t i = 0; i < source_items_.size(); ++i) {
+    source_items_[i].id = source_ids_[i].c_str();
+    source_items_[i].title = source_titles_[i].c_str();
+  }
+
+  out->struct_size = static_cast<uint32_t>(sizeof(pu_source_list));
+  out->count = static_cast<uint32_t>(source_items_.size());
+  out->items = source_items_.data();
+
+  for (const ScreenTargetInfo& display : displays) {
+    Log(3, "screen source: id=%s title=\"%s\" %ux%u primary=%d", display.id.c_str(),
+        display.title.c_str(), display.width, display.height, display.primary ? 1 : 0);
+  }
+  Log(3, "screen sources: %zu total (%zu display(s) + synthetic)", source_items_.size(),
+      displays.size());
+  return PU_OK;
+}
+
 int MediaEngine::Start(const char* screen_id, std::string* error) {
   std::lock_guard<std::mutex> control_lock(control_mu_);
 
@@ -1014,14 +1115,43 @@ int MediaEngine::Start(const char* screen_id, std::string* error) {
     return PU_ERR_STATE;
   }
 
-  // 本版只有合成源。空指针与 "synthetic" 都算它；别的 id 明确拒绝，不假装支持。
-  const bool synthetic = (screen_id == nullptr || screen_id[0] == '\0' ||
-                          std::strcmp(screen_id, "synthetic") == 0);
-  if (!synthetic) {
-    Fail(std::string("unknown screen source id '") + screen_id +
-             "': only \"synthetic\" exists in ABI v1",
-         error);
-    return PU_ERR_INVALID_ARG;
+  // v2.3：源解析。空指针 / "synthetic" → 合成源；其余按真实显示器解析。
+  // 显示器 id 只认 pu_screen_sources 给出的 "display:0x<HMONITOR>"，另外接受
+  // "\\.\DISPLAY1" 这个别名（命令行手工传时方便）。两者都先翻译成 HMONITOR；
+  // 绝不拿 GraphicsCaptureItem::DisplayName 反查（它和 DXGI 的编号对不上）。
+  {
+    const std::string requested = (screen_id != nullptr) ? screen_id : "";
+    const bool synthetic = requested.empty() || requested == "synthetic";
+    if (synthetic) {
+      capture_is_real_ = false;
+      capture_source_id_ = "synthetic";
+      capture_width_.store(static_cast<uint32_t>(kWidth), std::memory_order_relaxed);
+      capture_height_.store(static_cast<uint32_t>(kHeight), std::memory_order_relaxed);
+    } else {
+      std::string enum_error;
+      const std::vector<ScreenTargetInfo> targets = EnumerateScreenTargets(&enum_error);
+      const std::string lower = ToLowerAscii(requested);
+      std::string matched;
+      for (const ScreenTargetInfo& target : targets) {
+        if (target.id == requested || ToLowerAscii(target.device) == lower) {
+          matched = target.id;
+          capture_width_.store(target.width, std::memory_order_relaxed);
+          capture_height_.store(target.height, std::memory_order_relaxed);
+          Log(3, "screen source resolved: %s -> %s %ux%u", requested.c_str(),
+              target.device.c_str(), target.width, target.height);
+          break;
+        }
+      }
+      if (matched.empty()) {
+        std::string message = "unknown screen source id '" + requested + "': " +
+                              std::to_string(targets.size()) + " display(s) reported";
+        if (!enum_error.empty()) message += " (" + enum_error + ")";
+        Fail(message, error);
+        return PU_ERR_INVALID_ARG;
+      }
+      capture_is_real_ = true;
+      capture_source_id_ = matched;
+    }
   }
 
   const int32_t previous_state = state_;
@@ -1029,8 +1159,8 @@ int MediaEngine::Start(const char* screen_id, std::string* error) {
   PushState(PU_STREAM_STARTING, previous_state, PU_REASON_REQUESTED);
 
   if (source_ == nullptr) {
-    source_ = webrtc::scoped_refptr<SyntheticVideoSource>(
-        new webrtc::RefCountedObject<SyntheticVideoSource>());
+    source_ = webrtc::scoped_refptr<ScreenVideoSource>(
+        new webrtc::RefCountedObject<ScreenVideoSource>());
   }
 
   // VideoTrack 的方法有 signaling 线程断言；worker 参数不能传 nullptr（spike 坑）。
@@ -1125,7 +1255,13 @@ int MediaEngine::Start(const char* screen_id, std::string* error) {
   PushState(PU_STREAM_RUNNING, PU_STREAM_STARTING, PU_REASON_REQUESTED);
   // offer 要等 ICE 收集完成才发得出去，交给独立的协商线程，不阻塞 start。
   StartNegotiationEmit("offer");
-  Log(3, "screen share started (synthetic %dx%d @%dfps)", kWidth, kHeight, kFps);
+  if (capture_is_real_) {
+    Log(3, "screen share started (wgc %s %ux%u, event-driven)", capture_source_id_.c_str(),
+        capture_width_.load(std::memory_order_relaxed),
+        capture_height_.load(std::memory_order_relaxed));
+  } else {
+    Log(3, "screen share started (synthetic %dx%d @%dfps)", kWidth, kHeight, kFps);
+  }
   return PU_OK;
 }
 
@@ -1679,6 +1815,13 @@ void MediaEngine::OnRemoteFrame(const webrtc::VideoFrame& frame) {
 // 采集 / 发事件（v2.1：本地编码器已删除）
 // ---------------------------------------------------------------------------
 void MediaEngine::PumpLoop() {
+  // 真实采集自己会做「起跑能不能成功」的握手（建 WGC 会话 / 等首帧），失败要让
+  // pu_screen_start 返回错误，所以分派到独立实现。
+  if (capture_is_real_.load(std::memory_order_relaxed)) {
+    RealCaptureLoop();
+    return;
+  }
+
   // 以前这里先 InitEncode 一个本地 VP8 编码器、把它挂成采集源的 sink。现在采集源
   // 只挂 VideoTrack，唯一的编码点就是 PC 的 VideoStreamEncoder，所以起跑时没有
   // 可失败的东西，直接通知控制线程「采集线程已在跑」。
@@ -1722,6 +1865,134 @@ void MediaEngine::PumpLoop() {
   Log(3, "capture stopped after %llu frames", static_cast<unsigned long long>(index));
 }
 
+
+// ---------------------------------------------------------------------------
+// v2.3：真实屏幕采集（Windows Graphics Capture）
+//
+// 与合成循环的区别：
+//   * 节拍：WGC 的 FrameArrived 驱动，不是 sleep_until(16.7 ms)。本机实测到达节奏
+//     约 21 ms、抖动到 55 ms，按固定节拍取样只会把抖动变成丢帧/重复帧；
+//   * 起跑握手：Open() + 首帧都成功之后才 SignalStart(true)，失败让 start 报错；
+//   * 每帧耗时拆四段：capture（到达间隔）/ readback / convert / encode-wait，
+//     停止时打一行 ===CAPTURE_SUMMARY===，冒烟测试直接抓这行。
+// ---------------------------------------------------------------------------
+void MediaEngine::RealCaptureLoop() {
+  const auto loop_start = std::chrono::steady_clock::now();
+  std::string error;
+
+  std::unique_ptr<WgcCapture> capture = WgcCapture::Create(capture_source_id_, &error);
+  if (capture == nullptr) {
+    Log(1, "wgc capture create failed: %s", error.c_str());
+    SignalStart(false, error);
+    return;
+  }
+  if (!capture->Open(&error)) {
+    Log(1, "wgc capture open failed: %s", error.c_str());
+    SignalStart(false, error);
+    return;
+  }
+  capture_width_.store(capture->width(), std::memory_order_relaxed);
+  capture_height_.store(capture->height(), std::memory_order_relaxed);
+  const double open_ms = std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - loop_start)
+                             .count();
+  Log(3, "wgc capture open: source=%s %ux%u open_ms=%.1f", capture_source_id_.c_str(),
+      capture->width(), capture->height(), open_ms);
+
+  // 首帧超时 = 起跑失败：锁屏 / 捕获策略禁用时 WGC 一帧都不给，不能让 start
+  // 返回 OK 然后永远黑屏。
+  if (!capture->WaitFirstFrame(5000, &error)) {
+    Log(1, "wgc capture first frame timeout: %s", error.c_str());
+    capture->Close();
+    SignalStart(false, error);
+    return;
+  }
+  const double first_frame_ms = std::chrono::duration<double, std::milli>(
+                                    std::chrono::steady_clock::now() - loop_start)
+                                    .count();
+  Log(3, "wgc capture first frame ready (cold start %.1f ms), start handshake ok",
+      first_frame_ms);
+  SignalStart(true, "");
+
+  // 逐帧统计：唯一写者是本线程，不需要原子量。
+  uint64_t frames = 0;
+  double interval_sum = 0.0;
+  double interval_max = 0.0;
+  double readback_sum = 0.0;
+  double readback_max = 0.0;
+  double convert_sum = 0.0;
+  double convert_max = 0.0;
+  double push_sum = 0.0;
+  double push_max = 0.0;
+  double total_sum = 0.0;
+  double total_max = 0.0;
+
+  const auto sink = [this, &frames](const webrtc::VideoFrame& frame) -> bool {
+    // 唯一的编码点是 PC 的 VideoStreamEncoder（v2.1 删掉了本地编码器）。
+    source_->PushFrame(frame);
+    stat_frames_sent_.fetch_add(1, std::memory_order_relaxed);
+    PushFrameEvent(frame.timestamp_us());
+    ++frames;
+    return !stop_requested_.load(std::memory_order_relaxed);
+  };
+
+  const auto on_timing = [&](const CaptureStageTimings& timings) {
+    interval_sum += timings.interval_ms;
+    interval_max = std::max(interval_max, timings.interval_ms);
+    readback_sum += timings.readback_ms;
+    readback_max = std::max(readback_max, timings.readback_ms);
+    convert_sum += timings.convert_ms;
+    convert_max = std::max(convert_max, timings.convert_ms);
+    push_sum += timings.push_ms;
+    push_max = std::max(push_max, timings.push_ms);
+    total_sum += timings.total_ms;
+    total_max = std::max(total_max, timings.total_ms);
+    // 长间隔单独打一条：WGC 正常情况下 16-25 ms 到一帧，出现 >200 ms 的空档
+    // 要么是 DWM 停了（锁屏/全屏独显切换），要么是采集线程被别的活堵住了。
+    if (timings.interval_ms > 200.0) {
+      Log(2, "capture gap %.1f ms before frame %llu", timings.interval_ms,
+          static_cast<unsigned long long>(frames));
+    }
+    // 前 3 帧 + 每 30 帧一条：够看出稳态，又不会把日志刷爆。
+    if (frames <= 3 || frames % 30 == 0) {
+      Log(3,
+          "capture frame=%llu capture_ms=%.2f readback_ms=%.2f convert_ms=%.2f "
+          "encode_wait_ms=%.2f total_ms=%.2f",
+          static_cast<unsigned long long>(frames), timings.interval_ms, timings.readback_ms,
+          timings.convert_ms, timings.push_ms, timings.total_ms);
+    }
+  };
+
+  capture->Run(sink, on_timing, &stop_requested_);
+
+  const uint64_t dropped = capture->dropped_frames();
+  const double measured = frames > 0 ? static_cast<double>(frames) : 1.0;
+  // fps 用「到达间隔之和」算（不含最后一帧之后的空档），比用墙钟更接近采集节奏。
+  const double fps = (frames > 1 && interval_sum > 0.0)
+                         ? (static_cast<double>(frames) - 1.0) * 1000.0 / interval_sum
+                         : 0.0;
+  Log(3,
+      "===CAPTURE_SUMMARY=== source=%s frames=%llu dropped=%llu fps=%.2f "
+      "interval_avg_ms=%.2f interval_max_ms=%.2f readback_avg_ms=%.2f "
+      "readback_max_ms=%.2f convert_avg_ms=%.2f convert_max_ms=%.2f "
+      "push_avg_ms=%.2f push_max_ms=%.2f total_avg_ms=%.2f total_max_ms=%.2f",
+      capture_source_id_.c_str(), static_cast<unsigned long long>(frames),
+      static_cast<unsigned long long>(dropped), fps, interval_sum / measured, interval_max,
+      readback_sum / measured, readback_max, convert_sum / measured, convert_max,
+      push_sum / measured, push_max, total_sum / measured, total_max);
+  if (!capture->dumped_png_path().empty()) {
+    Log(3, "capture first frame dumped to %s (verify it shows the real desktop)",
+        capture->dumped_png_path().c_str());
+  }
+  if (!capture->last_error().empty()) {
+    Log(1, "capture error: %s", capture->last_error().c_str());
+    PushError(PU_ERR_MEDIA, capture->last_error());
+  }
+  Log(3, "wgc capture stopped after %llu frames", static_cast<unsigned long long>(frames));
+  // 析构在采集线程上发生（本函数返回时 capture 离开作用域），COM/D3D 对象的
+  // 释放与创建落在同一个线程上。
+}
+
 void MediaEngine::SignalStart(bool ok, const std::string& error) {
   {
     std::lock_guard<std::mutex> lock(start_mu_);
@@ -1737,8 +2008,9 @@ void MediaEngine::PushFrameEvent(int64_t capture_ts_us) {
   pu_event event = MakeEvent(PU_EVENT_FRAME);
   event.data.frame.sequence = sequence;
   event.data.frame.capture_ts_us = capture_ts_us;
-  event.data.frame.width = kWidth;
-  event.data.frame.height = kHeight;
+  // 尺寸来自真正的采集源（合成 640x360 / 显示器原生分辨率）。
+  event.data.frame.width = capture_width_.load(std::memory_order_relaxed);
+  event.data.frame.height = capture_height_.load(std::memory_order_relaxed);
   // 下面三个字段来自 PC 的 GetStats 采样（见 StatsSampleLoop）：逐帧拿不到真实
   // 编码字节数，用「最近一个采样窗口的均值」代表一帧，码率同窗口。
   event.data.frame.bytes = sample_frame_bytes_.load(std::memory_order_relaxed);
@@ -2126,10 +2398,16 @@ PU_API int pu_voice_set_deafen(pu_engine* e, int deafened) {
 }
 
 PU_API int pu_screen_sources(pu_engine* e, pu_source_list* out) {
-  static_cast<void>(out);
   if (e == nullptr) return PU_ERR_INVALID_ARG;
-  e->core.SetLastError("pu_screen_sources: not implemented in ABI v2");
-  return PU_NOT_IMPLEMENTED;
+  try {
+    return e->core.Sources(out);
+  } catch (const std::exception& ex) {
+    e->core.SetLastError(std::string("pu_screen_sources exception: ") + ex.what());
+    return PU_ERR_INTERNAL;
+  } catch (...) {
+    e->core.SetLastError("pu_screen_sources: unknown exception");
+    return PU_ERR_INTERNAL;
+  }
 }
 
 PU_API int pu_screen_watch(pu_engine* e, const char* sharer_id) {

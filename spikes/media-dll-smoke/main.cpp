@@ -6,7 +6,8 @@
 //   * 10 秒内收到 >= 30 个 PU_EVENT_FRAME；
 //   * v2.1：PC 侧只编码一次——outbound-rtp.framesEncoded ≈ 连上之后推送的帧数，
 //     并且严格小于「推送帧数的 1.5 倍」（2 倍就意味着同一帧被编码了两次）；
-//   * 10 个未实现函数都返回 PU_NOT_IMPLEMENTED（证明导出表齐全）；
+//   * 9 个未实现函数都返回 PU_NOT_IMPLEMENTED（证明导出表齐全）；
+//   * v2.3：pu_screen_sources 已实现——至少 1 块真实显示器 + synthetic 在列表里；
 //   * 全程没有 PU_EVENT_ERROR；
 //   * pu_screen_stop / pu_engine_destroy 正常返回。
 // 任何一步失败都打印 pu_last_error 并以 exit=1 退出。
@@ -62,14 +63,12 @@ void PrintLastError(pu_engine* engine, const char* what) {
   std::printf("  pu_last_error: %s\n", pu_last_error(engine));
 }
 
-// 10 个未实现函数必须都存在且返回 PU_NOT_IMPLEMENTED。
+// 9 个未实现函数必须都存在且返回 PU_NOT_IMPLEMENTED（pu_screen_sources 在 v2.3
+// 已经实现了，改由 CheckScreenSources 断言，见下）。
 int CheckUnimplementedSurface(pu_engine* engine) {
   pu_voice_params voice;
   std::memset(&voice, 0, sizeof(voice));
   voice.struct_size = sizeof(voice);
-  pu_source_list sources;
-  std::memset(&sources, 0, sizeof(sources));
-  sources.struct_size = sizeof(sources);
   pu_frame frame;
   std::memset(&frame, 0, sizeof(frame));
   frame.struct_size = sizeof(frame);
@@ -83,7 +82,6 @@ int CheckUnimplementedSurface(pu_engine* engine) {
       {"pu_voice_set_mode", pu_voice_set_mode(engine, PU_MODE_DIRECT)},
       {"pu_voice_set_mute", pu_voice_set_mute(engine, 1)},
       {"pu_voice_set_deafen", pu_voice_set_deafen(engine, 1)},
-      {"pu_screen_sources", pu_screen_sources(engine, &sources)},
       {"pu_screen_watch", pu_screen_watch(engine, "peer-1")},
       {"pu_screen_unwatch", pu_screen_unwatch(engine, "peer-1")},
       {"pu_frame_acquire", pu_frame_acquire(engine, "stream-1", &frame)},
@@ -100,6 +98,64 @@ int CheckUnimplementedSurface(pu_engine* engine) {
   pu_frame_release(engine, &frame);  // void，也要能调用
   std::printf("unimplemented surface: %zu int calls + 1 void call checked, %d unexpected\n",
               sizeof(calls) / sizeof(calls[0]), failures);
+  return failures;
+}
+
+// v2.3：pu_screen_sources 现在必须实现。判据：至少 1 项、id/title 非空、
+// 尺寸非 0、末尾一定有 synthetic、连续两次调用都稳定（不是一次性缓冲）。
+int CheckScreenSources(pu_engine* engine) {
+  int failures = 0;
+  pu_source_list sources;
+  std::memset(&sources, 0, sizeof(sources));
+  sources.struct_size = static_cast<uint32_t>(sizeof(sources));
+  const int rc = pu_screen_sources(engine, &sources);
+  if (rc != PU_OK) {
+    std::printf("FAIL: pu_screen_sources rc=%d (%s)\n", rc, pu_last_error(engine));
+    return 1;
+  }
+  if (sources.count == 0 || sources.items == nullptr) {
+    std::printf("FAIL: pu_screen_sources returned no items\n");
+    return 1;
+  }
+  bool has_display = false;
+  bool has_synthetic = false;
+  for (uint32_t i = 0; i < sources.count; ++i) {
+    const pu_source_info& info = sources.items[i];
+    if (info.id == nullptr || info.id[0] == '\0') {
+      std::printf("FAIL: source[%u] has an empty id\n", i);
+      ++failures;
+      continue;
+    }
+    if (info.kind == 0) {
+      has_display = true;
+      if (info.width == 0 || info.height == 0) {
+        std::printf("FAIL: display source '%s' has a 0 dimension\n", info.id);
+        ++failures;
+      }
+    }
+    if (std::strcmp(info.id, "synthetic") == 0) has_synthetic = true;
+    std::printf("source[%u]: kind=%u %ux%u id=%s title=\"%s\"\n", i, info.kind, info.width,
+                info.height, info.id, info.title != nullptr ? info.title : "(null)");
+  }
+  if (!has_display) {
+    std::printf("FAIL: no display source (kind=0) reported\n");
+    ++failures;
+  }
+  if (!has_synthetic) {
+    std::printf("FAIL: \"synthetic\" is not in the source list\n");
+    ++failures;
+  }
+  // 第二次调用必须还能用（缓存被重建，不是把指针指向临时量）。
+  pu_source_list again;
+  std::memset(&again, 0, sizeof(again));
+  again.struct_size = static_cast<uint32_t>(sizeof(again));
+  if (pu_screen_sources(engine, &again) != PU_OK || again.count != sources.count) {
+    std::printf("FAIL: second pu_screen_sources call is inconsistent\n");
+    ++failures;
+  }
+  std::printf("screen sources: %u item(s), displays=%s, synthetic=%s, %d failure(s)\n",
+              sources.count, has_display ? "yes" : "no", has_synthetic ? "yes" : "no",
+              failures);
   return failures;
 }
 
@@ -201,7 +257,8 @@ int main() {
   EngineGuard viewer_guard{viewer};
   std::printf("viewer engine created (peer for the encoding check)\n");
 
-  // 未知源 id 必须被拒绝（本版只有合成源），且不能把引擎带进错误状态。
+  // 未知源 id 必须被拒绝（v2.3：真实显示器 id 之外只有 synthetic），
+  // 且不能把引擎带进错误状态。
   {
     const int bad_id_rc = pu_screen_start(engine, "no-such-monitor");
     if (bad_id_rc != PU_ERR_INVALID_ARG) {
@@ -410,6 +467,7 @@ int main() {
     }
   }
 
+  const int source_failures = CheckScreenSources(engine);
   const int surface_failures = CheckUnimplementedSurface(engine);
 
   // pu_last_error 的指针在 destroy 之后失效，先拷出来。
@@ -504,6 +562,10 @@ int main() {
   }
   if (stop_rc != PU_OK || second_stop_rc != PU_OK) {
     std::printf("FAIL: pu_screen_stop returned %d / %d\n", stop_rc, second_stop_rc);
+    return 1;
+  }
+  if (source_failures != 0) {
+    std::printf("FAIL: pu_screen_sources check found %d problem(s)\n", source_failures);
     return 1;
   }
   if (surface_failures != 0) {

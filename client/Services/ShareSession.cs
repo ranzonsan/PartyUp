@@ -45,6 +45,9 @@ public sealed class ShareSession : IAsyncDisposable
     private readonly Dictionary<int, VoiceSlotDto> _voiceSlots = new();
     private string _lastSlotSignature = string.Empty;
 
+    /// <summary>当前本端共享的源（断线重连后按原状恢复）。</summary>
+    private MediaSource? _sharingSource;
+
     // 路径变化历史（v1 验收第 7 条）：最近 20 条，新的在前。
     private const int PathHistoryCapacity = 20;
     private readonly List<PathHistoryEntry> _pathHistory = new(capacity: PathHistoryCapacity);
@@ -165,6 +168,7 @@ public sealed class ShareSession : IAsyncDisposable
                 "共享源 id 为空：native 会把空 id 当成合成源，已拒绝启动（请重新选择显示器）");
         }
         LastError = null;
+        _sharingSource = source;
         _engine.StartScreen(source.Id);
         await _connection.StartScreenAsync(
             _channelId,
@@ -187,6 +191,7 @@ public sealed class ShareSession : IAsyncDisposable
         {
             IsSharing = false;
             SharingSourceTitle = string.Empty;
+            _sharingSource = null;
             await _connection.StopScreenAsync(_channelId, ct);
             AppLog.Info("share: stopped");
             Changed?.Invoke();
@@ -513,6 +518,9 @@ public sealed class ShareSession : IAsyncDisposable
             {
                 member = _voiceMembers.Keys.FirstOrDefault(id => id != _thisMemberId);
             }
+            // 静音成员（服务端 voice.state.muted）一律不点亮：即使静音后仍有低电平噪声帧穿过原生门控，
+            // 也不该让用户看到「已静音的人还在说话」。
+            if (member is not null && _voiceMembers.TryGetValue(member, out var state) && state.Muted) continue;
             if (member is not null) active.Add(member);
         }
 
@@ -546,25 +554,59 @@ public sealed class ShareSession : IAsyncDisposable
     }
 
     /// <summary>
-    /// 控制连接恢复后的语音重入：不断开频道、不重建媒体引擎，只重建 PC/信令并重新协商。
+    /// 控制连接恢复后的媒体全量重建。语义上「断线重连 = 新会话」：
+    /// 服务端 PeerConnection 已随进程销毁，旧 PC 的 DTLS/ICE 凭据全部作废，
+    /// 所以不能只重 join 语音——共享那条 PC 同样是死的，必须一起重建。
+    /// 顺序按契约来：停共享（释放 PC）→ 语音 leave → 重新 voice.join → 恢复共享原 source。
+    /// 媒体引擎本身不重建（pu_engine 仍复用，只是 PC 由 VoiceLeave 拆掉后由 VoiceJoin 重建）。
     /// </summary>
     public async Task HandleConnectionRestoredAsync(CancellationToken ct = default)
     {
-        if (!_voiceJoined) return;
-        AppLog.Info("voice: connection restored, re-negotiating media session");
+        var wasInVoice = _voiceJoined;
+        var wasSharing = IsSharing;
+        var sharedSource = _sharingSource;
+        if (!wasInVoice && !wasSharing) return;
+
+        AppLog.Info($"media: connection restored, rebuilding session " +
+                    $"(voice={wasInVoice} sharing={wasSharing} source=\"{sharedSource?.Title}\")");
+        StopVoiceStatsLoop();
+        StopSpeakingLoop();
+        _speakingSince.Clear();
+
         try
         {
-            StopVoiceStatsLoop();
-            StopSpeakingLoop();
-            _speakingSince.Clear();
-            try { _engine.VoiceLeave(); } catch (Exception ex) { AppLog.Warn("voice: leave before rejoin failed: " + ex.Message); }
-            _voiceJoined = false;
-            await JoinVoiceAsync(afterReconnect: true, ct);
+            // 1) 共享先停：只停本地采集与 PC，不再向旧服务端上报（那边会话已经没了）。
+            if (wasSharing)
+            {
+                try { _engine.StopScreen(); } catch (Exception ex) { AppLog.Warn("share: stop before rebuild failed: " + ex.Message); }
+                IsSharing = false;
+                SharingSourceTitle = string.Empty;
+            }
+
+            // 2) 语音 leave：原生会移除 mic 轨；配合 encoder-dev 的「非共享时拆 PC」，下一次 join 会拿到全新 PC。
+            if (wasInVoice)
+            {
+                try { _engine.VoiceLeave(); } catch (Exception ex) { AppLog.Warn("voice: leave before rejoin failed: " + ex.Message); }
+                _voiceJoined = false;
+            }
+
+            // 3) 重新 voice.join（先 pu_voice_join 建好 passive PC，再向服务端发 voice.join 等 offer）。
+            if (wasInVoice)
+            {
+                await JoinVoiceAsync(afterReconnect: true, ct);
+            }
+
+            // 4) 重新共享原 source（用户不该因为网抖一下就要手动重新点共享）。
+            if (wasSharing && sharedSource is not null)
+            {
+                await StartSharingAsync(sharedSource, ct);
+                AppLog.Pass($"share: restored after reconnect source=\"{sharedSource.Title}\"");
+            }
         }
         catch (Exception ex)
         {
-            LastError = "重连后重入语音失败：" + ex.Message;
-            AppLog.Fail("voice: " + LastError);
+            LastError = "重连后媒体重建失败：" + ex.Message;
+            AppLog.Fail("media: " + LastError);
             Changed?.Invoke();
         }
     }

@@ -94,6 +94,8 @@ Windows 侧跑 GUI 的正确姿势走调试桥，不用手工 rsync。它来自 
 
 这解决了两个老问题：产物落在本机磁盘，原生库不会像 UNC 那样被 PATH 上的旧版本抢走；窗口跑在真实桌面上，同时 Job Object 保证 `stop` 能杀干净整棵进程树。
 
+客户端 stdout 日志固定是 **UTF-8**（`AppLog` 静态构造里设置 `Console.OutputEncoding`）：Windows 默认控制台代码页是 cp936，若把 stdout 重定向到文件后用 WSL 按 UTF-8 读，中文会变乱码——所以日志编码按 UTF-8 约定，读日志不需要 `iconv`。若遇到历史遗留的 cp936 日志，用 `iconv -f cp936 -t utf-8` 转。
+
 **启动 Worker（在 Windows 的 PowerShell 7 里执行，保持窗口开着）**
 
 ```powershell

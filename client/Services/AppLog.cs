@@ -8,6 +8,23 @@ internal static class AppLog
 {
     private static readonly object Gate = new();
 
+    /// <summary>
+    /// 强制 stdout 走 UTF-8：Windows 默认控制台代码页是 cp936，
+    /// wdb 把 stdout 原样落盘后，WSL 侧按 UTF-8 读会把中文日志读成乱码（验收排查踩过）。
+    /// 重定向场景下这里只影响 StreamWriter 的编码，不改控制台窗口代码页。
+    /// </summary>
+    static AppLog()
+    {
+        try
+        {
+            Console.OutputEncoding = new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+        }
+        catch (Exception)
+        {
+            // 没有控制台（比如被宿主重定向到管道）时不要因为设置编码把进程带崩。
+        }
+    }
+
     public static void Info(string message) => Write("INFO", message);
 
     public static void Warn(string message) => Write("WARN", message);

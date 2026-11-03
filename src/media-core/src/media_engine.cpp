@@ -1965,20 +1965,18 @@ int MediaEngine::SignalIn(const char* payload, size_t len, std::string* error) {
       return reject(PU_ERR_STATE,
                     "received an offer while sharing (glare): ABI v2 has no perfect negotiation");
     }
-    // 本端是观看方（不是共享方）却还留着一个 PC：那是上一轮共享会话的 answerer
-    // 残留。共享方「停止 → 再开始」在 ABI v2 里是**一个新的共享会话**，不是重协商，
-    // 所以这里必须把旧 answerer 会话整个拆掉，再按新 offer 建一个新的。
-    // 仍然不做 renegotiation —— 同一个会话里不会出现第二个 offer 走这条路。
-    // 本端是观看方（不是共享方）却还留着一个 PC：那是上一轮共享会话的 answerer
-    // 残留。共享方「停止 → 再开始」在 ABI v2 里是**一个新的共享会话**，不是重协商，
-    // 所以这里必须把旧 answerer 会话整个拆掉，再按新 offer 建一个新的。
-    // v2.6 例外：语音正在通话时收到第二个 offer = 屏幕共享加入的**重协商**，
-    // 不能拆 PC（拆了音频轨一起没了），直接走下面的 SetRemoteDescription 重协商。
-    if (pc_ != nullptr && !voice_joined_) {
+    // 收到 offer 时 PC 的三种状态要分清（这条日志是断线重连的验收门，不能误报）：
+    //   1) PC 上已有远端描述 → 同一个会话上的**真重协商**（语音通话中加屏幕共享走这条）；
+    //   2) PC 存在但没有远端描述、且当前不在语音里 → 上一轮会话的残留，拆掉重建；
+    //   3) PC 存在但没有远端描述、语音在通话中 → **全新 PC 的第一个 offer**
+    //      （断线重连后 VoiceLeave 已拆掉旧 PC、VoiceJoin 又建了新的），不是重协商。
+    if (pc_ != nullptr && has_remote_description_) {
+      Log(3, "offer: renegotiation on the existing session");
+    } else if (pc_ != nullptr && !voice_joined_) {
       Log(3, "offer: dropping stale answerer session (pc exists, local is viewer)");
       ReleaseStreamObjects();
     } else if (pc_ != nullptr) {
-      Log(3, "offer: renegotiation on the existing session (voice call is active)");
+      Log(3, "offer: first offer on a fresh session (pc has no remote description yet)");
     }
     std::string local_error;
     if (!EnsurePeerConnection(/*for_sending=*/false, &local_error)) {

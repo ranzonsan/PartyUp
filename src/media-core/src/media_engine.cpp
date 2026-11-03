@@ -731,10 +731,20 @@ class MediaEngine {
   webrtc::scoped_refptr<webrtc::AudioSourceInterface> voice_source_;
   webrtc::scoped_refptr<webrtc::AudioTrackInterface> voice_track_;
   webrtc::scoped_refptr<webrtc::RtpSenderInterface> voice_sender_;
-  std::unique_ptr<AudioCountSink> voice_remote_sink_;  // 接收侧计数，随引擎活
-  std::atomic<uint32_t> stat_audio_frames_{0};        // 远端解出的 PCM 帧数
-  std::atomic<uint32_t> stat_audio_peak_{0};          // 最近一帧峰值振幅
-  std::atomic<bool> stat_audio_sink_attached_{false}; // 防 OnTrack/OnAddTrack 重复挂载
+  // 每条远端音频轨一个计数器（v2.7）。SFU relay 下会有 N 路音频同时进来，
+  // 全局单 sink 只能数第一路，所以要按 track id 分别挂 sink。
+  // 线程：attach/detach 在 signaling 线程（audio_tracks_mu_ 保护）；
+  // OnData 回调在音频线程，只碰 TrackAudioStat 里的原子量，不碰容器。
+  struct TrackAudioStat {
+    std::string id;
+    webrtc::scoped_refptr<webrtc::AudioTrackInterface> track;
+    std::unique_ptr<AudioCountSink> sink;
+    std::atomic<uint32_t> frames{0};
+    std::atomic<uint32_t> peak{0};
+  };
+  std::mutex audio_tracks_mu_;
+  std::vector<std::unique_ptr<TrackAudioStat>> audio_tracks_;
+  void DetachAllAudioSinks();
 
   // 一路共享流的对象
   webrtc::scoped_refptr<ScreenVideoSource> source_;
@@ -941,22 +951,30 @@ class MediaEngine::PcObserver : public webrtc::PeerConnectionObserver {
                  track->kind().c_str());
   }
 
-  // 语音接收侧：把远端音频轨挂到计数 sink（mute 验收靠它看峰值振幅）。
-  // OnTrack 和 OnAddTrack 都会走到这里，AddSink 不幂等 → 用 attached 位防重复挂载
-  // （重复挂会让帧数翻倍）。
+  // 语音接收侧：每条远端音频轨挂**自己的**计数 sink（v2.7，relay 下多路）。
+  // OnTrack 和 OnAddTrack 都会走到这里 → 按 track id 去重，重复调用不会重复挂载。
   void AttachAudioSink(webrtc::scoped_refptr<webrtc::RtpReceiverInterface> receiver) {
-    if (engine_->voice_remote_sink_ == nullptr || receiver == nullptr) return;
+    if (receiver == nullptr) return;
     if (receiver->media_type() != webrtc::MediaType::AUDIO) return;
-    if (engine_->stat_audio_sink_attached_.exchange(true)) return;
     webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track = receiver->track();
     if (track == nullptr ||
         track->kind() != webrtc::MediaStreamTrackInterface::kAudioKind) {
-      engine_->stat_audio_sink_attached_.store(false);
       return;
     }
     auto* audio_track = static_cast<webrtc::AudioTrackInterface*>(track.get());
-    audio_track->AddSink(engine_->voice_remote_sink_.get());
-    engine_->Log(3, "remote audio track -> sink: id=%s", track->id().c_str());
+    const std::string id = track->id();
+    std::lock_guard<std::mutex> lock(engine_->audio_tracks_mu_);
+    for (const auto& existing : engine_->audio_tracks_) {
+      if (existing->id == id) return;  // 已挂过（OnTrack / OnAddTrack 重复回调）
+    }
+    auto stat = std::make_unique<TrackAudioStat>();
+    stat->id = id;
+    stat->track = audio_track;
+    stat->sink = std::make_unique<AudioCountSink>(&stat->frames, &stat->peak);
+    audio_track->AddSink(stat->sink.get());
+    engine_->audio_tracks_.push_back(std::move(stat));
+    engine_->Log(3, "remote audio track -> sink: id=%s (total tracks=%zu)", id.c_str(),
+                 engine_->audio_tracks_.size());
   }
 
   MediaEngine* const engine_;
@@ -1498,6 +1516,17 @@ int MediaEngine::Stop() {
   return PU_OK;
 }
 
+void MediaEngine::DetachAllAudioSinks() {
+  // 必须在 signaling 线程调用：AudioTrackInterface::RemoveSink 有线程断言。
+  std::lock_guard<std::mutex> lock(audio_tracks_mu_);
+  for (auto& stat : audio_tracks_) {
+    if (stat->track != nullptr && stat->sink != nullptr) {
+      stat->track->RemoveSink(stat->sink.get());
+    }
+  }
+  audio_tracks_.clear();
+}
+
 void MediaEngine::ReleaseStreamObjects() {
   Log(3, "release: enter (pc=%d track=%d remote_track=%d)", pc_ != nullptr ? 1 : 0,
       track_ != nullptr ? 1 : 0, remote_track_ != nullptr ? 1 : 0);
@@ -1511,6 +1540,8 @@ void MediaEngine::ReleaseStreamObjects() {
           remote_track_->RemoveSink(remote_sink_);
         }
         remote_track_ = nullptr;
+        // 音频计数 sink 也要摘干净，否则重进频道会因为「track id 已在集合里」而不重挂。
+        DetachAllAudioSinks();
         pc_->Close();
       }
       track_ = nullptr;
@@ -2010,12 +2041,25 @@ int MediaEngine::PeerStats(pu_stats* out) {
   out->frames_received = stat_frames_received_.load(std::memory_order_relaxed);
   // v2.6：语音模式下 frames_received 表示「远端解出的音频 PCM 帧数」（每帧 10 ms），
   // 因为语音没有视频帧可数；两者互斥，不会同时有值。峰值振幅靠日志观察（mute 验收）。
+  // v2.7：按轨聚合。relay 下 N 路音频各有自己的计数；frames_received 保持「远端
+  // 解出的 PCM 帧总数」语义（多路时是各轨之和），分轨明细走日志（track=<id>）。
   if (voice_joined_) {
-    out->frames_received = stat_audio_frames_.load(std::memory_order_relaxed);
-    // mute 验收：A 静音后峰值应掉到 0（帧数照常涨）。PeerStats 由调用方按秒轮询，
-    // 一行日志正好是采样节拍，不用另起线程。
-    Log(3, "voice stats: pcmFrames=%u peak=%u", out->frames_received,
-        stat_audio_peak_.load(std::memory_order_relaxed));
+    uint32_t total_frames = 0;
+    uint32_t max_peak = 0;
+    size_t tracks = 0;
+    {
+      std::lock_guard<std::mutex> lock(audio_tracks_mu_);
+      tracks = audio_tracks_.size();
+      for (const auto& stat : audio_tracks_) {
+        const uint32_t f = stat->frames.load(std::memory_order_relaxed);
+        const uint32_t p = stat->peak.load(std::memory_order_relaxed);
+        total_frames += f;
+        if (p > max_peak) max_peak = p;
+        Log(3, "voice track: id=%s pcmFrames=%u peak=%u", stat->id.c_str(), f, p);
+      }
+    }
+    out->frames_received = total_frames;
+    Log(3, "voice stats: tracks=%zu pcmFrames=%u peak=%u", tracks, total_frames, max_peak);
   }
   out->signal_out_count = stat_signal_out_.load(std::memory_order_relaxed);
   {
@@ -2433,10 +2477,13 @@ void MediaEngine::StatsSampleLoop(webrtc::scoped_refptr<webrtc::PeerConnectionIn
     const int64_t now_us = NowUsSteady();
 
     if (voice_joined_) {
-      // mute 验收：A 端静音后，B 端解出的 PCM 峰值应掉到 0（帧数照常涨）。
-      Log(3, "voice stats: pcmFrames=%u peak=%u",
-          stat_audio_frames_.load(std::memory_order_relaxed),
-          stat_audio_peak_.load(std::memory_order_relaxed));
+      // v2.7：分轨明细（relay 下每路一条），由各自的 AudioCountSink 累加。
+      std::lock_guard<std::mutex> lock(audio_tracks_mu_);
+      for (const auto& stat : audio_tracks_) {
+        Log(3, "voice track: id=%s pcmFrames=%u peak=%u", stat->id.c_str(),
+            stat->frames.load(std::memory_order_relaxed),
+            stat->peak.load(std::memory_order_relaxed));
+      }
     }
 
     if (reports > 0) {
@@ -2764,9 +2811,6 @@ int MediaEngine::VoiceJoin(const pu_voice_params* params, std::string* error) {
     if (error != nullptr) *error = add_error;
     return PU_ERR_STATE;
   }
-  if (voice_remote_sink_ == nullptr) {
-    voice_remote_sink_.reset(new AudioCountSink(&stat_audio_frames_, &stat_audio_peak_));
-  }
   // v2.6：显式选一个**物理**录音设备。默认设备可能是 NVIDIA Broadcast 这类虚拟麦，
   // 无输入时输出数字静音，mute 的音频效果就没法验证。
   signaling_->BlockingCall([&] {
@@ -2819,9 +2863,7 @@ int MediaEngine::VoiceJoin(const pu_voice_params* params, std::string* error) {
 int MediaEngine::VoiceLeave() {
   if (!voice_joined_) return PU_OK;
   signaling_->BlockingCall([this] {
-    if (voice_track_ != nullptr && voice_remote_sink_ != nullptr) {
-      voice_track_->RemoveSink(voice_remote_sink_.get());
-    }
+    DetachAllAudioSinks();
     if (pc_ != nullptr && voice_sender_ != nullptr) {
       (void)pc_->RemoveTrackOrError(voice_sender_);
     }

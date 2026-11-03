@@ -124,6 +124,29 @@ int main() {
     }
   }
 
+  // ---- 2b. 离开再重新加入：计数不能翻倍（sink 必须摘干净）----
+  for (pu_engine* e : {a, b}) pu_voice_leave(e);
+  for (auto* e : {a, b}) {
+    pu_voice_params join = params;
+    join.flags = (e == b) ? 1u : 0u;
+    if (pu_voice_join(e, &join) != PU_OK) {
+      std::printf("FAIL: re-join rc=%d (%s)\n", pu_last_error(e));
+      return 1;
+    }
+  }
+  const auto rejoin_start = std::chrono::steady_clock::now();
+  while (std::chrono::steady_clock::now() < rejoin_start + std::chrono::seconds(4)) {
+    if (PumpEngine(a, "A", b) < 0 || PumpEngine(b, "B", a) < 0) return 1;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  const uint32_t b_frames_rejoin = ReceivedFrames(b);
+  const double rejoin_rate = static_cast<double>(b_frames_rejoin) / 4.0;
+  std::printf("  re-join: B pcm frames=%u over 4 s (%.1f/s, want ~100 not ~200)\n",
+              b_frames_rejoin, rejoin_rate);
+  if (rejoin_rate > 150.0) {
+    std::printf("FAIL: re-join doubled the count (%.1f/s) — sink was not detached\n", rejoin_rate);
+    return 1;
+  }
   const uint32_t b_frames_end = ReceivedFrames(b);
 
   // ---- 3. 拆除 ----

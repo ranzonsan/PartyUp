@@ -64,11 +64,10 @@ type Hub struct {
 	// screenMode 是**屏幕共享**的独立传输策略（--screen-mode），与 voiceMode 无关：
 	// 语音走中继、共享走直连（或反过来）都是合法配置（ADR-0002 三类媒体各自决定路径）。
 	screenMode string
-	// sfuVideo 表示 SFU 中继是否已具备视频通道（屏幕共享）。
-	// v1 先只做音频；视频通道落地前 relay 下的 screen.start 必须干净失败，
-	// 绝不能落到「客户端当 offerer 发 offer」的旧路径——那会把语音 PC 一起搞坏。
-	sfuVideo bool
-	rooms    map[string]*sfu.Room // channel_id → 中继房间（仅 relay 策略下存在）
+	// sfuVideo 表示 SFU 中继是否已具备视频通道（屏幕共享，sfu.VideoRoom）。
+	sfuVideo   bool
+	rooms      map[string]*sfu.Room      // channel_id → 语音中继房间（仅 voice_mode=relay）
+	videoRooms map[string]*sfu.VideoRoom // channel_id → 屏幕共享视频房间（仅 screen_mode=relay）
 }
 
 // NewHub 构造会话中心。
@@ -85,8 +84,9 @@ func NewHub(st *store.Store, log *slog.Logger, name, version, voiceMode, screenM
 		voiceSeq:   make(map[string]int, 4),
 		voiceMode:  NormalizeVoiceMode(voiceMode),
 		screenMode: NormalizeScreenMode(screenMode),
-		sfuVideo:   false, // 视频通道待实现；实现后置 true
+		sfuVideo:   true, // SFU 视频转发（sfu.VideoRoom）已落地
 		rooms:      make(map[string]*sfu.Room, 4),
+		videoRooms: make(map[string]*sfu.VideoRoom, 4),
 		upgrader: websocket.Upgrader{
 			HandshakeTimeout: 10 * time.Second,
 			// 桌面客户端不是浏览器，没有同源概念；放开 Origin 检查。
@@ -169,8 +169,9 @@ func (h *Hub) remove(c *conn) {
 	for _, ch := range sharesChanged {
 		h.broadcastScreenState(ch)
 	}
-	// 语音同理：断线即视为离开语音（连接是成员存在的唯一凭据）。
+	// 语音/视频同理：断线即视为离开（连接是成员存在的唯一凭据）。
 	h.leaveVoiceEverywhere(c.member.ID)
+	h.leaveVideoRoomsEverywhere(c.member.ID, channels)
 }
 
 // subscribe 把连接加入频道订阅，并广播一次 presence。
@@ -585,6 +586,9 @@ func (c *conn) handleChannelSubscribe(env protocol.Envelope) {
 		return
 	}
 	c.hub.subscribe(c, channelID)
+	// 屏幕共享中继：订阅该频道即建视频 PC，观看者要在共享开始之前就绪。
+	// direct 模式下绝不建（用户以为屏幕是 P2P，实际却连服务器 = 资源浪费 + 隐私问题）。
+	c.hub.joinVideoRoom(channelID, c.member.ID)
 	c.replyOK(env, protocol.ChannelSubscribeOK{ChannelID: channelID})
 	// 订阅后立刻推一次语音快照：客户端由此得知「本频道传输模式」与已在语音的成员，
 	// 不必等有人加入语音才知道（PROTOCOL.md §4：模式由服务端策略决定）。
@@ -597,7 +601,9 @@ func (c *conn) handleChannelUnsubscribe(env protocol.Envelope) {
 		c.replyError(env.Type, protocol.CodeInvalidArgument, err.Error(), env.ID)
 		return
 	}
-	c.hub.unsubscribe(c, strings.TrimSpace(req.ChannelID))
+	channelID := strings.TrimSpace(req.ChannelID)
+	c.hub.unsubscribe(c, channelID)
+	c.hub.leaveVideoRoom(channelID, c.member.ID)
 	c.replyOK(env, protocol.ChannelSubscribeOK{ChannelID: req.ChannelID})
 }
 
@@ -798,8 +804,6 @@ func (c *conn) handleScreenStart(env protocol.Envelope) {
 	sfuVideo := c.hub.sfuVideo
 	c.hub.mu.RUnlock()
 	if mode == "relay" && !sfuVideo {
-		// 视频通道未就绪时必须在广播 screen.state 之前拒绝：否则客户端会开始采集
-		// 并向已有语音 PC 上挂视频轨，把语音一起拖坏（历史实测 role mismatch → PCM 冻结）。
 		c.replyError(env.Type, protocol.CodeNotImplemented,
 			"当前服务器为纯 SFU 中继模式，暂不支持屏幕共享（视频通道开发中）", env.ID)
 		return
@@ -952,8 +956,16 @@ func (c *conn) handleMediaSignal(env protocol.Envelope) {
 					"屏幕共享 SFU 视频通道尚未实现（screen_mode=relay）", env.ID)
 				return
 			}
-			c.replyError(env.Type, protocol.CodeNotImplemented,
-				"屏幕共享 SFU 视频通道尚未实现（screen_mode=relay）", env.ID)
+			// 视频 PC 的信令对象是服务端：answer/candidate 交给视频房间。
+			if err := c.hub.handleScreenSignal(c.member.ID, channelID, kind, req.Payload); err != nil {
+				code := protocol.CodeInvalidArgument
+				if errors.Is(err, sfu.ErrNotInRoom) {
+					code = protocol.CodeConflict
+				}
+				c.replyError(env.Type, code, err.Error(), env.ID)
+				return
+			}
+			c.replyOK(env, protocol.MediaSignalOK{ChannelID: channelID})
 			return
 		}
 		if target == "sfu" {

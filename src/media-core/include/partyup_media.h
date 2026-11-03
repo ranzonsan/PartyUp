@@ -29,6 +29,12 @@
  *       - pu_signal_in_media(e, media, payload, len)：显式指定 "voice" / "screen"；
  *       - pu_signal_media(event, out, capacity)：从 SIGNAL_OUT 事件读回它的 media；
  *       - pu_signal_in 保留为兼容入口（media==nullptr，退回 SDP 嗅探）。
+ *   v2.11（加法式扩张，ABI 仍 v2）：屏幕共享支持「被动方」（relay 里服务端 offer、
+ *       客户端 answer），并允许观看者预建屏幕会话。导出 21 → 23：
+ *       - pu_screen_start_ex(e, source_id, flags)：flags bit0 = passive
+ *         （采屏但不发 offer，等对端 offer 后挂轨回 answer）；flags==0 等价旧入口；
+ *       - pu_screen_prepare(e)：观看者预建 answerer 会话，幂等、不采屏不建轨；
+ *       - pu_screen_start 行为不变。
  *
  * 线程约定：所有 pu_* 调用必须来自同一个「控制线程」（通常是 UI 线程），
  * 且不得在库触发的任何回调里重入——本库没有任何回调，通知一律走 pu_poll_event。
@@ -375,6 +381,51 @@ PU_API void pu_engine_destroy(pu_engine* e);
  * SetLocalDescription → 等 ICE 收集完成后推一个 PU_EVENT_SIGNAL_OUT（offer）。
  * 也就是说 start 返回时 offer 可能还没生成，UI 要照常 poll 事件。 */
 PU_API int pu_screen_start(pu_engine* e, pu_screen_id screen_id);
+
+/* v2.11（第 22 个导出）：带**角色**标志的屏幕共享入口。
+ *
+ * 为什么需要：pu_screen_start 只会「本端当 offerer、自己发 offer」。relay 模式下
+ * 服务端是 offerer、客户端是 answerer——共享方也要按 answerer 的方式把视频挂到
+ * 服务端 offer 里那条视频段上，不能自己发 offer（会和服务端的 offer 撞车/glare）。
+ *
+ * flags 位定义（只定义 bit0，其余位**保留**）：
+ *   flags == 0        → 与 pu_screen_start(e, source_id) 完全等价（本端 offerer）。
+ *   0x1 (PU_SCREEN_START_PASSIVE)
+ *                     → 被动共享方：照常采屏并建视频轨，但**不生成 offer**；
+ *                       等对端 offer 通过 pu_signal_in_media(e, "screen", ...) 灌进来，
+ *                       引擎把视频轨挂到 offer 里那条视频段上并回 answer。
+ *   其它位非 0        → PU_ERR_INVALID_ARG（不猜、不静默当 0，否则调用方以为被动
+ *                       模式生效、实际却在发 offer，多人同时共享时极难排查）。
+ *
+ * 语义与 pu_screen_start 相同的部分：source_id 解析规则、采屏、PU_EVENT_FRAME、
+ * PU_STREAM_RUNNING 状态事件、pu_screen_stop 停止、pu_peer_stats 统计。
+ * 不同点：passive 下**不会**出现 offer 的 SIGNAL_OUT；answer 由对端 offer 触发。
+ *
+ * 调用顺序（passive）：pu_screen_start_ex(..., 1) → 把 screen.start 发给服务端 →
+ * 服务端下发 offer → pu_signal_in_media("screen", offer) → 引擎回 answer。
+ * 若 answer 已经发出之后才调本函数，返回 PU_ERR_STATE（那需要重协商，本版不支持；
+ * 先 start 再收 offer 即可）。
+ *
+ * 返回：PU_OK / PU_ERR_INVALID_ARG（未知 flags 位、未知 source id）/ PU_ERR_STATE
+ * （已在共享）/ PU_ERR_MEDIA（采集或 PC 初始化失败）。细节见 pu_last_error()。 */
+PU_API int pu_screen_start_ex(pu_engine* e, pu_screen_id screen_id, uint32_t flags);
+
+/* pu_screen_start_ex 的 flags bit0：被动共享方（answerer 发视频）。 */
+#define PU_SCREEN_START_PASSIVE 0x1u
+
+/* v2.11（第 23 个导出）：观看者**预建**屏幕会话（answerer），不采屏、不建轨。
+ *
+ * 用途：在服务端 offer 到达之前先把屏幕 PC 建好，offer 一到就能直接
+ * SetRemoteDescription + CreateAnswer（省掉建 PC 的延迟，也让信令路径更确定）。
+ * 本函数只创建 PeerConnection（role=answerer）；视频轨永远不由它创建。
+ *
+ * 幂等：PC 已存在（无论之前是 prepare 建的、还是被动 start 建的）直接返回 PU_OK，
+ * 不改变角色、不重建会话。重复调用安全。
+ *
+ * 返回：PU_OK / PU_ERR_MEDIA（建 PC 失败）/ PU_ERR_INVALID_ARG（e 为 NULL）。
+ * 线程：与其它 pu_* 相同，只能从控制线程调用。
+ * 收尾：pu_screen_stop 会把它关掉（此时没有采集线程，走 stop 的空闲路径）。 */
+PU_API int pu_screen_prepare(pu_engine* e);
 
 /* 停止屏幕共享。未在运行时返回 PU_OK（幂等）。
  * v2 起还会 Close 掉 PeerConnection、摘掉远端 sink，并释放 track/pc。 */

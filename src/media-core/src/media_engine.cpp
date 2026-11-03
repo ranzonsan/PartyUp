@@ -699,7 +699,11 @@ class MediaEngine {
   MediaEngine& operator=(const MediaEngine&) = delete;
 
   bool Init(const pu_config* cfg, std::string* error);
-  int Start(const char* screen_id, std::string* error);
+  // v2.11：flags bit0 = passive（被动共享方：采屏 + 等对端 offer，不发 offer）。
+  // flags == 0 与旧行为完全一致；其余 bit 保留、非 0 返回 PU_ERR_INVALID_ARG。
+  int Start(const char* screen_id, uint32_t flags, std::string* error);
+  // v2.11：观看者预建屏幕会话（answerer，不采屏、不建轨）。幂等。
+  int PrepareScreen(std::string* error);
   // v2.6：语音（1:1 直连）。全部在控制线程调用，内部把 PC/ADM 操作投 signaling 线程。
   int VoiceJoin(const pu_voice_params* params, std::string* error);
   int VoiceLeave();
@@ -913,6 +917,16 @@ class MediaEngine {
   std::atomic<bool> negotiator_stop_{false};
   bool sharing_ = false;               // 本引擎是 offerer（自己发 offer）
   bool has_remote_description_ = false;
+  // ---- v2.11（第 3 步）：屏幕会话的被动角色 ----
+  // screen_passive_：本端在采屏、但要发视频的一方是**对端**（relay 里服务端 offer，
+  //   客户端 answer）。它和 sharing_ 互斥：passive 时 sharing_ 恒 false（本端不发 offer）。
+  // screen_prepared_：屏幕 PC 已由 pu_screen_prepare 预建、还没被用过。首个 offer 进来时
+  //   不能把它当「上一轮的残留」拆掉（stale 判定要排除它）。
+  // video_sender_：passive 模式下把视频轨挂到对端 offer 的 m-line 上后留下的 sender，
+  //   用来保证只挂一次（重复 offer 重协商时不再 AddTrack）。
+  bool screen_passive_ = false;
+  bool screen_prepared_ = false;
+  webrtc::scoped_refptr<webrtc::RtpSenderInterface> video_sender_;
   std::atomic<bool> local_sdp_emitted_{false};
   mutable std::mutex cand_mu_;
   std::vector<CandidateCopy> gathered_candidates_;   // OnIceCandidate 写
@@ -1476,13 +1490,28 @@ int MediaEngine::Sources(pu_source_list* out) {
   return PU_OK;
 }
 
-int MediaEngine::Start(const char* screen_id, std::string* error) {
+int MediaEngine::Start(const char* screen_id, uint32_t flags, std::string* error) {
   std::lock_guard<std::mutex> control_lock(control_mu_);
+
+  // v2.11（第 3 步）：角色位先验。目前只定义 bit0（passive）；其余 bit 保留，
+  // 非 0 一律报错而不是静默忽略——「悄悄当 0 处理」会让调用方以为被动模式生效、
+  // 实际却在发 offer，两个人同时共享时的症状极难查。
+  if ((flags & ~1u) != 0u) {
+    Fail("pu_screen_start_ex: unknown flags bits (only bit0 = passive is defined)", error);
+    return PU_ERR_INVALID_ARG;
+  }
+  const bool passive = (flags & 1u) != 0u;
 
   if (running_) {
     Fail("screen share is already running", error);
     return PU_ERR_STATE;
   }
+
+  // 角色先落到成员上：passive 时本端不发 offer，PC 是 answerer；
+  // screen_prepared_ 表示「这个 PC 就是在等对端首个 offer」，SignalIn 的 stale 判定
+  // 要排除它，否则刚建好的 PC 会被当成上一轮的残留拆掉。
+  screen_passive_ = passive;
+  screen_prepared_ = passive;
 
   // v2.3：源解析。空指针 / "synthetic" → 合成源；其余按真实显示器解析。
   // 显示器 id 只认 pu_screen_sources 给出的 "display:0x<HMONITOR>"，另外接受
@@ -1555,9 +1584,11 @@ int MediaEngine::Start(const char* screen_id, std::string* error) {
 
   // v2：建 PeerConnection 并把视频轨挂上去。AddTrack 必须在 CreateOffer 之前，
   // 否则 offer 里不会有 m=video。
+  // v2.11：被动共享不在这里挂轨——PC 先以 answerer 身份建好，等对端 offer 到了再把
+  // 视频轨挂到它那条 recvonly 的 video m-line 上（见 SignalIn 的 passive 分支）。
   {
     std::string pc_error;
-    if (!EnsurePeerConnection(/*for_sending=*/true, &pc_error)) {
+    if (!EnsurePeerConnection(/*for_sending=*/!passive, &pc_error)) {
       ReleaseStreamObjects();
       state_ = PU_STREAM_FAILED;
       PushState(PU_STREAM_FAILED, PU_STREAM_STARTING, PU_REASON_MEDIA_FAILURE);
@@ -1604,7 +1635,9 @@ int MediaEngine::Start(const char* screen_id, std::string* error) {
 
   // v2：生成 offer 并设置本地描述。放在采集线程起来之后，这样采集线程起不来时
   // 不用回滚已经发出去的 SDP。
-  {
+  // v2.11：被动共享**不发 offer**——SDP 由对端给，本端只等 SetRemoteDescription +
+  // CreateAnswer，然后由 SignalIn 走协商线程把 answer 发出去。
+  if (!passive) {
     std::string sdp_error;
     if (!CreateOfferAndSetLocal(&sdp_error)) {
       stop_requested_.store(true, std::memory_order_relaxed);
@@ -1622,15 +1655,40 @@ int MediaEngine::Start(const char* screen_id, std::string* error) {
   running_ = true;
   state_ = PU_STREAM_RUNNING;
   PushState(PU_STREAM_RUNNING, PU_STREAM_STARTING, PU_REASON_REQUESTED);
-  // offer 要等 ICE 收集完成才发得出去，交给独立的协商线程，不阻塞 start。
-  StartNegotiationEmit("offer");
-  if (capture_is_real_) {
-    Log(3, "screen share started (wgc %s %ux%u, event-driven)", capture_source_id_.c_str(),
-        capture_width_.load(std::memory_order_relaxed),
-        capture_height_.load(std::memory_order_relaxed));
-  } else {
-    Log(3, "screen share started (synthetic %dx%d @%dfps)", kWidth, kHeight, kFps);
+  if (!passive) {
+    // offer 要等 ICE 收集完成才发得出去，交给独立的协商线程，不阻塞 start。
+    StartNegotiationEmit("offer");
   }
+  if (capture_is_real_) {
+    Log(3, "screen share started (wgc %s %ux%u, event-driven, role=%s)",
+        capture_source_id_.c_str(), capture_width_.load(std::memory_order_relaxed),
+        capture_height_.load(std::memory_order_relaxed), passive ? "answerer" : "offerer");
+  } else {
+    Log(3, "screen share started (synthetic %dx%d @%dfps, role=%s)", kWidth, kHeight, kFps,
+        passive ? "answerer (waiting for the peer's offer)" : "offerer");
+  }
+  return PU_OK;
+}
+
+// v2.11（第 3 步）：观看者预建屏幕会话（answerer），不采屏、不建轨。
+// 目的：在服务端 offer 到达之前就把 PC 建好（省掉 offer 到达时的建 PC 延迟），
+// 并让 `pu_signal_in_media("screen", offer)` 有一条确定的会话可落。
+// 幂等：PC 已存在直接 OK（不检查角色——如果已经有 PC，调用方的意图已经满足）。
+int MediaEngine::PrepareScreen(std::string* error) {
+  std::lock_guard<std::mutex> control_lock(control_mu_);
+  if (pc_ != nullptr) {
+    screen_prepared_ = true;
+    Log(3, "screen: prepare skipped (peer connection already exists, role=%s)",
+        sharing_ ? "offerer" : "answerer");
+    return PU_OK;
+  }
+  std::string pc_error;
+  if (!EnsurePeerConnection(/*for_sending=*/false, &pc_error)) {
+    Fail("pu_screen_prepare: " + pc_error, error);
+    return PU_ERR_MEDIA;
+  }
+  screen_prepared_ = true;
+  Log(3, "screen: prepared (answerer, no capture, waiting for the peer's offer)");
   return PU_OK;
 }
 
@@ -1718,10 +1776,13 @@ void MediaEngine::ReleaseStreamObjects() {
         pc_->Close();
       }
       track_ = nullptr;
+      // v2.11：被动共享挂上去的 sender 也要在这里放掉（它持有 PC 的引用）。
+      video_sender_ = nullptr;
       pc_ = nullptr;
     });
   } else {
     track_ = nullptr;
+    video_sender_ = nullptr;
     pc_ = nullptr;
     remote_track_ = nullptr;
   }
@@ -1734,6 +1795,11 @@ void MediaEngine::ReleaseStreamObjects() {
   source_ = nullptr;
   has_remote_description_ = false;
   sharing_ = false;
+  // v2.11：屏幕会话的角色状态随 PC 一起复位。漏掉 screen_passive_ 会让下一次
+  // （非被动的）共享在收到 offer 时误挂视频轨；漏掉 screen_prepared_ 会让新会话的
+  // 首个 offer 被误判成上一轮的残留。
+  screen_passive_ = false;
+  screen_prepared_ = false;
   local_sdp_emitted_.store(false, std::memory_order_relaxed);
   stat_peer_state_.store(PU_PEER_NONE, std::memory_order_relaxed);
   stat_ice_state_.store(PU_ICE_NEW, std::memory_order_relaxed);
@@ -2466,7 +2532,7 @@ int MediaEngine::SignalIn(const char* media, const char* payload, size_t len,
     //   3) PC 存在但没有远端描述、本端是 offerer → 全新 PC 的第一个 offer。
     if (pc_ != nullptr && has_remote_description_) {
       Log(3, "offer: renegotiation on the existing screen session");
-    } else if (pc_ != nullptr && !sharing_) {
+    } else if (pc_ != nullptr && !sharing_ && !screen_passive_ && !screen_prepared_) {
       Log(3, "offer: dropping stale answerer session (pc exists, local is viewer)");
       ReleaseStreamObjects();
     } else if (pc_ != nullptr) {
@@ -2483,6 +2549,27 @@ int MediaEngine::SignalIn(const char* media, const char* payload, size_t len,
     }
     has_remote_description_ = true;
     ApplyBufferedCandidates();
+    // v2.11（第 3 步）：被动共享方。对端 offer 里那条 video m-line 的方向是「对端收」，
+    // SetRemote 之后它已经变成一条 sendonly 的 transceiver（sender 上还没有轨）。此刻
+    // AddTrack 会被 libwebrtc 关联到这条 m-line 上，CreateAnswer 就带出了 sendonly 的
+    // 视频段——不需要任何重协商，也就不需要（也不能）发 offer。
+    if (screen_passive_ && video_sender_ == nullptr && track_ != nullptr) {
+      std::string add_error;
+      signaling_->BlockingCall([&] {
+        auto added = pc_->AddTrack(track_, {"partyup-screen"});
+        if (!added.ok()) {
+          add_error = std::string("AddTrack(video) on the passive screen session failed: ") +
+                      added.error().message();
+        } else {
+          video_sender_ = added.value();
+        }
+      });
+      if (!add_error.empty()) {
+        ReleaseStreamObjects();
+        return reject(PU_ERR_MEDIA, "pu_signal_in(passive screen): " + add_error);
+      }
+      Log(3, "passive screen: video track attached to the peer's offered m-line (no offer sent)");
+    }
     if (!CreateAnswerAndSetLocal(&local_error)) {
       ReleaseStreamObjects();
       return reject(PU_ERR_MEDIA, "pu_signal_in: " + local_error);
@@ -3310,12 +3397,43 @@ PU_API int pu_screen_start(pu_engine* e, pu_screen_id screen_id) {
   if (e == nullptr) return PU_ERR_INVALID_ARG;
   try {
     std::string error;
-    return e->core.Start(screen_id, &error);
+    // v2.11：老入口语义不变 = flags 0（本端 offerer）。
+    return e->core.Start(screen_id, 0u, &error);
   } catch (const std::exception& ex) {
     e->core.SetLastError(std::string("pu_screen_start exception: ") + ex.what());
     return PU_ERR_INTERNAL;
   } catch (...) {
     e->core.SetLastError("pu_screen_start: unknown exception");
+    return PU_ERR_INTERNAL;
+  }
+}
+
+/* v2.11：带角色标志的屏幕共享入口。flags bit0 = passive。 */
+PU_API int pu_screen_start_ex(pu_engine* e, pu_screen_id screen_id, uint32_t flags) {
+  if (e == nullptr) return PU_ERR_INVALID_ARG;
+  try {
+    std::string error;
+    return e->core.Start(screen_id, flags, &error);
+  } catch (const std::exception& ex) {
+    e->core.SetLastError(std::string("pu_screen_start_ex exception: ") + ex.what());
+    return PU_ERR_INTERNAL;
+  } catch (...) {
+    e->core.SetLastError("pu_screen_start_ex: unknown exception");
+    return PU_ERR_INTERNAL;
+  }
+}
+
+/* v2.11：观看者预建屏幕会话（answerer，不采屏、不建轨），幂等。 */
+PU_API int pu_screen_prepare(pu_engine* e) {
+  if (e == nullptr) return PU_ERR_INVALID_ARG;
+  try {
+    std::string error;
+    return e->core.PrepareScreen(&error);
+  } catch (const std::exception& ex) {
+    e->core.SetLastError(std::string("pu_screen_prepare exception: ") + ex.what());
+    return PU_ERR_INTERNAL;
+  } catch (...) {
+    e->core.SetLastError("pu_screen_prepare: unknown exception");
     return PU_ERR_INTERNAL;
   }
 }

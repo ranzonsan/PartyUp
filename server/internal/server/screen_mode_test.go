@@ -47,9 +47,10 @@ func TestScreenModeIndependentOfVoiceMode(t *testing.T) {
 	}
 }
 
-// TestScreenModeRelayRejectedCleanly 锁定兜底：screen_mode=relay 且 SFU 还没有视频通道时，
-// screen.start 必须干净地失败（NOT_IMPLEMENTED），并且不能影响语音成员状态。
-func TestScreenModeRelayRejectedCleanly(t *testing.T) {
+// TestScreenModeRelayShareAccepted 锁定 screen_mode=relay 的新契约（2026-11-03 起）：
+// 屏幕共享走服务端 SFU 视频中继，screen.start 必须被接受，且不能影响语音成员状态。
+// 具体视频转发行为由 video_relay_test.go 覆盖。
+func TestScreenModeRelayShareAccepted(t *testing.T) {
 	env := newTestEnvWithModes(t, "relay", "relay")
 	_, aliceToken := env.bootstrapAdmin("alice", "secret123")
 	code := env.newInvite()
@@ -67,28 +68,31 @@ func TestScreenModeRelayRejectedCleanly(t *testing.T) {
 	bobWS.request(protocol.TypeVoiceJoin, protocol.VoiceJoinRequest{ChannelID: ch.ID})
 	waitVoiceState(t, aliceWS, func(s protocol.VoiceStatePayload) bool { return len(s.Members) == 2 })
 
-	// 1) screen.start 必须被明确拒绝（NOT_IMPLEMENTED），而不是静默接受。
-	aliceWS.expectError(protocol.TypeScreenStart, protocol.ScreenStartRequest{
+	// 1) screen.start 现在必须被接受（relay = 走服务端 SFU 视频中继）。
+	aliceWS.request(protocol.TypeScreenStart, protocol.ScreenStartRequest{
 		ChannelID: ch.ID,
 		Mode:      "direct", // 客户端说 direct 也不能改变服务端策略
 		Source:    protocol.ScreenSource{ID: "42", Title: "DISPLAY1", Width: 1280, Height: 720, Kind: "screen"},
-	}, protocol.CodeNotImplemented)
+	})
 
-	// 2) 屏幕共享信令 target=sfu 也必须明确失败（视频通道未实现）。
-	aliceWS.expectError(protocol.TypeMediaSignal, protocol.MediaSignalRequest{
-		ChannelID: ch.ID,
-		Media:     "screen",
-		Kind:      "offer",
-		Target:    "sfu",
-		Payload:   `{"type":"offer","sdp":"v=0"}`,
-	}, protocol.CodeNotImplemented)
+	// 2) screen.state 回显的是服务端策略 relay，不是客户端说的 direct。
+	stateEnv := bobWS.waitFor(protocol.TypeScreenState)
+	var state protocol.ScreenStatePayload
+	if err := stateEnv.DecodePayload(&state); err != nil {
+		t.Fatalf("decode screen.state: %v", err)
+	}
+	if state.Mode != "relay" || len(state.Shares) != 1 || state.Shares[0].Mode != "relay" {
+		t.Fatalf("screen.state = mode=%q shares=%+v, want 1 share with mode=relay", state.Mode, state.Shares)
+	}
 
-	// 3) 语音成员状态没有被污染：仍然两人在语音。
-	// 主动触发一次 voice.state 广播（切换静音）再读，避免依赖队列里残留的旧快照。
+	// 3) 语音成员状态没有被污染：仍两人在语音，且 screen_mode=relay。
 	aliceWS.request(protocol.TypeVoiceSetMute, protocol.VoiceSetMuteRequest{ChannelID: ch.ID, Muted: true})
 	st := waitVoiceState(t, aliceWS, func(s protocol.VoiceStatePayload) bool { return len(s.Members) == 2 })
 	if st.ScreenMode != "relay" {
 		t.Fatalf("voice.state.screen_mode = %q, want relay", st.ScreenMode)
+	}
+	if st.VoiceMode != "relay" {
+		t.Fatalf("voice.state.voice_mode = %q, want relay", st.VoiceMode)
 	}
 }
 

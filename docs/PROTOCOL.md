@@ -203,7 +203,7 @@ HTTP 请求/响应体形状（2026-11-02 落地，此前文档未定义）：
     - `media=voice` + `voice_mode=relay` → 交给服务端 SFU（§4.1，服务端是 offerer）
     - `media=voice` + `voice_mode=direct` → 成员间转发（offer 广播 / answer·candidate 定向）
     - `media=screen` + `screen_mode=direct` → 成员间转发
-    - `media=screen` + `screen_mode=relay` → SFU 视频通道（**尚未实现**，返回 `NOT_IMPLEMENTED`）
+    - `media=screen` + `screen_mode=relay` → **SFU 视频中继**（§4.3，服务端是 offerer）
   - `target` 仍接受（历史字段）但**只做一致性校验，不再参与路由**：与策略矛盾就报
     `INVALID_ARGUMENT`（例如 `voice_mode=direct` 却带 `target:"sfu"`），避免「客户端以为走中继、
     实际被当直连转发」这种静默错配。
@@ -238,15 +238,40 @@ HTTP 请求/响应体形状（2026-11-02 落地，此前文档未定义）：
     （显示器为 HMONITOR 的十进制串），`width/height` 是源分辨率
   - **传输方式由服务端 `--screen-mode` 决定，与 `--voice-mode` 无关**；请求里的 `mode` 只作告知、
     不参与决策（客户端传什么都不影响结果）。`screen.state` 里回显服务端实际值。
-  - `screen_mode=relay` 且 SFU 视频通道未就绪时，`screen.start` **在广播 `screen.state` 之前**
-    就返回 `NOT_IMPLEMENTED`（错误码），消息直接给用户看：
-    「当前服务器为纯 SFU 中继模式，暂不支持屏幕共享（视频通道开发中）」。
-    这是硬要求：不能在客户端先开采集再被拒——那会往已有的 PC 上挂视频轨，把语音一起拖坏
-    （历史实测 `role mismatch` → PCM 冻结）。
+  - `screen_mode=relay` 时，`screen.start` 走服务端 SFU 视频中继（§4.3）：
+    **本端不建自己的屏幕 PeerConnection**，而是在服务端下发的视频 PC 上把采集轨挂到
+    recvonly 视频 m-line（`pu_screen_start_ex(..., flags&1)`，被动方角色）。
+    若原生侧不支持被动屏幕会话，必须在**采集开始前**失败并告知用户，
+    绝不允许「先开采集、再把视频轨挂到语音 PC 上」——历史实测 `role mismatch` → PCM 冻结。
 - `screen.stop { channel_id }` → `screen.stop.ok { channel_id }`，广播 `screen.state`
 - 广播 `screen.state { channel_id, mode, shares: [{ sharer_id, member_name, source, mode, viewers: [member_id] }] }`
   —— `mode` 是服务端屏幕共享策略（`relay|direct`），任何订阅者都能在加入共享/语音之前知道；
   没有共享时 `shares` 是 `[]`，不推 `null`
+
+### 4.3 屏幕共享 SFU 视频中继（`screen_mode=relay`）
+
+与语音中继（§4.1）同构，但**独立 PeerConnection**（`sfu.VideoRoom`）：客户端本来就把语音与屏幕
+拆成两个会话，一个服务端 PC 无法被两个客户端 PC 应答；分开也让「停共享」与「语音」在结构上互不牵连。
+
+- 每成员的视频 PC 预协商：**1 条 recvonly 视频 m-line**（上传自己的屏幕）
+  + **2 条 sendonly 视频槽**（看别人的屏幕，占位轨 id `partyup-video-slot-00` / `-01`）。
+  单频道同时共享上限 2 路（v1 规模目标；首轮验收只做 1 路）。
+- 共享者不换 PC：往自己那条 recvonly 视频 m-line 上传；服务端 `OnTrack` 收到后
+  `ReplaceTrack` 进其他成员的空槽（零重协商，与音频完全同构）。
+- 观看者中途加入：offer 发出去之后服务端再把**已有共享**回填进它的空槽，
+  因此「共享开始后才进来的人」也能看到画面。
+- `screen.stop` 时服务端立刻 `ReplaceTrack(nil)` 清空该共享者占的槽位：
+  否则观看者会一直收到最后一帧，看起来像画面卡死。
+- **只有 `screen_mode=relay` 才会建视频 PC**。`screen_mode=direct` 下绝不能凭空多一条
+  到服务端的视频连接——用户以为屏幕是 P2P，实际却连服务器，既是资源浪费也是隐私问题
+  （`TestScreenDirectCreatesNoVideoPeerConnection` 锁定）。
+- 客户端侧 ABI（加法式，待媒体核心提供）：
+  - `pu_screen_start_ex(engine, source_id, flags)`，`flags` bit0 = 被动（answerer）：
+    采屏 + 把视频轨挂到服务端 offer 的 recvonly m-line 上，**不生成 offer**；
+  - `pu_screen_prepare(engine)`：观看者预建屏幕会话为 answerer，等 `pu_signal_in_media("screen", …)` 灌 offer；
+  - 按视频槽取帧（多路共享）暂未定义，首轮只支持 1 路共享。
+- 编解码：视频槽占位轨按 **H264** 协商（客户端媒体核心硬件优先）；VP8 回落在 SFU 视频首轮不支持。
+- 码率/分辨率：服务端只转发不转码；v1 验收按 1080p 进行（`PRODUCT.md` 规模目标）。
 
 信令走 §4.2 的 `media.signal`，**`media` 固定为 `"screen"`**：共享方 `screen.start` 后媒体核心
 产出 offer，经 `media.signal media=screen kind=offer` 发出；观看方按媒体类型交给自己的

@@ -420,3 +420,127 @@ func (h *Hub) roomFor(channelID string) *sfu.Room {
 }
 
 var _ = errors.Is // errors 在 media.signal 的 target=sfu 分支里用（本文件保留引用检查）
+
+// ------------------------------------------------------------------
+// 屏幕共享视频中继（sfu.VideoRoom，仅 --screen-mode=relay）
+// ------------------------------------------------------------------
+
+// ensureVideoRoom 取得（必要时创建）某频道的视频房间。
+func (h *Hub) ensureVideoRoom(channelID string) (*sfu.VideoRoom, error) {
+	h.mu.RLock()
+	if room := h.videoRooms[channelID]; room != nil {
+		h.mu.RUnlock()
+		return room, nil
+	}
+	h.mu.RUnlock()
+
+	room, err := sfu.NewVideo(channelID, h.log, func(memberID, kind, payload string) {
+		h.deliverScreenSignal(channelID, memberID, kind, payload)
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if existing := h.videoRooms[channelID]; existing != nil {
+		return existing, nil
+	}
+	h.videoRooms[channelID] = room
+	return room, nil
+}
+
+// joinVideoRoom 在**订阅**频道时把成员接进视频房间（仅 screen_mode=relay）。
+// 观看者必须提前就绪，才能在共享开始的瞬间就收到槽位；direct 模式不建视频 PC。
+func (h *Hub) joinVideoRoom(channelID, memberID string) {
+	h.mu.RLock()
+	mode := h.screenMode
+	h.mu.RUnlock()
+	if mode != "relay" {
+		return
+	}
+	room, err := h.ensureVideoRoom(channelID)
+	if err != nil {
+		h.log.Error("ensure video room", "channel", channelID, "err", err)
+		return
+	}
+	// Join 里有 ICE gathering（几十毫秒），放在 goroutine 里避免阻塞 subscribe 应答。
+	go func() {
+		if err := room.Join(memberID); err != nil {
+			h.log.Error("join video room", "channel", channelID, "member", memberID, "err", err)
+		}
+	}()
+}
+
+// leaveVideoRoom 让成员离开视频房间；频道空了就关房间（仅 relay）。
+func (h *Hub) leaveVideoRoom(channelID, memberID string) {
+	h.mu.RLock()
+	room := h.videoRooms[channelID]
+	h.mu.RUnlock()
+	if room == nil {
+		return
+	}
+	room.Leave(memberID)
+	h.mu.Lock()
+	if existing := h.videoRooms[channelID]; existing != nil && len(existing.Members()) == 0 {
+		delete(h.videoRooms, channelID)
+		existing.Close()
+	}
+	h.mu.Unlock()
+}
+
+// leaveVideoRoomsEverywhere 在连接断开时把该成员从所有视频房间摘掉。
+func (h *Hub) leaveVideoRoomsEverywhere(memberID string, channels []string) {
+	for _, ch := range channels {
+		h.leaveVideoRoom(ch, memberID)
+	}
+}
+
+// handleScreenSignal 把客户端的 answer/candidate 交给视频房间。
+func (h *Hub) handleScreenSignal(memberID, channelID, kind, payload string) error {
+	h.mu.RLock()
+	room := h.videoRooms[channelID]
+	h.mu.RUnlock()
+	if room == nil {
+		return fmt.Errorf("%w: channel has no video relay room", sfu.ErrNotInRoom)
+	}
+	return room.HandleSignal(memberID, kind, []byte(payload))
+}
+
+// StopVideoShare 在 screen.stop 时摘掉视频房间里的共享槽位并清空，
+// 否则观看者会一直收到最后一帧（看起来像画面卡死）。
+func (h *Hub) StopVideoShare(channelID, memberID string) {
+	h.mu.RLock()
+	room := h.videoRooms[channelID]
+	h.mu.RUnlock()
+	if room != nil {
+		room.StopShare(memberID)
+	}
+}
+
+// deliverScreenSignal 把服务端视频 PC 的信令投递给某个成员（media.signal, media=screen, target=sfu）。
+func (h *Hub) deliverScreenSignal(channelID, memberID, kind, payload string) {
+	h.mu.RLock()
+	var target *conn
+	for c := range h.subs[channelID] {
+		if c.authed && c.member.ID == memberID {
+			target = c
+			break
+		}
+	}
+	h.mu.RUnlock()
+	if target == nil {
+		h.log.Warn("screen signal dropped, member not connected",
+			"channel", channelID, "member", memberID, "kind", kind)
+		return
+	}
+	target.enqueue(protocol.MustNew(protocol.TypeMediaSignal, protocol.MediaSignalPush{
+		ChannelID: channelID,
+		Target:    "sfu",
+		From:      "sfu",
+		FromName:  "sfu",
+		Media:     "screen",
+		Kind:      kind,
+		Payload:   payload,
+	}))
+}

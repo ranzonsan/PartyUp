@@ -29,6 +29,8 @@ public sealed class PartyUpConnection : IAsyncDisposable
     private readonly List<TextWaiter> _textWaiters = new();
     private readonly List<PresenceWaiter> _presenceWaiters = new();
     private readonly List<TextMessageDto> _receivedText = new();
+    private readonly List<MediaSignalDto> _receivedSignals = new();
+    private readonly List<MediaSignalWaiter> _signalWaiters = new();
     private readonly Dictionary<string, PresenceDto> _latestPresence = new(StringComparer.Ordinal);
     private readonly CancellationTokenSource _cts = new();
     private Task? _receiveLoop;
@@ -42,6 +44,12 @@ public sealed class PartyUpConnection : IAsyncDisposable
     public event Action<TextMessageDto>? TextReceived;
 
     public event Action<PresenceDto>? PresenceChanged;
+
+    /// <summary>媒体信令推送（media.signal，docs/PROTOCOL.md §4.2）。在接收循环线程触发。</summary>
+    public event Action<MediaSignalDto>? MediaSignalReceived;
+
+    /// <summary>共享状态推送（screen.state，docs/PROTOCOL.md §5）。在接收循环线程触发。</summary>
+    public event Action<ScreenStateDto>? ScreenStateChanged;
 
     public event Action<string>? Closed;
 
@@ -99,6 +107,67 @@ public sealed class PartyUpConnection : IAsyncDisposable
             limit,
         }, ct);
         return dto.Messages;
+    }
+
+    // ---- 屏幕共享 / 媒体信令（docs/PROTOCOL.md §4.2、§5）----
+
+    /// <summary>
+    /// 上报一路共享（screen.start）。服务端随后广播 screen.state。
+    /// </summary>
+    public Task<ScreenAckDto> StartScreenAsync(string channelId, ScreenSourceDto source, string mode = "direct", CancellationToken ct = default) =>
+        RequestAsync<ScreenAckDto>("screen.start", new
+        {
+            channel_id = channelId,
+            source,
+            mode,
+        }, ct);
+
+    /// <summary>停止共享（screen.stop）。</summary>
+    public Task<ScreenAckDto> StopScreenAsync(string channelId, CancellationToken ct = default) =>
+        RequestAsync<ScreenAckDto>("screen.stop", new { channel_id = channelId }, ct);
+
+    /// <summary>
+    /// 转发一条媒体信令。payload 是媒体核心的原始 JSON 信封，本方法不解析它。
+    /// to 为空表示广播（offer）；非空表示只投递给该成员（answer / candidate）。
+    /// </summary>
+    public Task<ScreenAckDto> SendMediaSignalAsync(
+        string channelId,
+        string media,
+        string kind,
+        string payload,
+        string? to = null,
+        CancellationToken ct = default) =>
+        RequestAsync<ScreenAckDto>("media.signal", new
+        {
+            channel_id = channelId,
+            to,
+            media,
+            kind,
+            payload,
+        }, ct);
+
+    /// <summary>
+    /// 等一条满足谓词的 media.signal；此前的匹配消息不会丢。
+    /// 超时抛 <see cref="TimeoutException"/>。
+    /// </summary>
+    public Task<MediaSignalDto> WaitForMediaSignalAsync(Func<MediaSignalDto, bool> match, TimeSpan timeout, CancellationToken ct = default)
+    {
+        Task<MediaSignalDto> task;
+        TaskCompletionSource<MediaSignalDto> tcs;
+        lock (_waiterGate)
+        {
+            foreach (var signal in _receivedSignals)
+            {
+                if (match(signal))
+                {
+                    return Task.FromResult(signal);
+                }
+            }
+            tcs = new TaskCompletionSource<MediaSignalDto>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _signalWaiters.Add(new MediaSignalWaiter(match, tcs));
+            task = tcs.Task;
+        }
+        return task.WaitAsync(timeout, ct);
     }
 
     /// <summary>
@@ -351,6 +420,24 @@ public sealed class PartyUpConnection : IAsyncDisposable
                 }
                 return;
             }
+            case "media.signal":
+            {
+                var signal = envelope.Payload?.Deserialize<MediaSignalDto>(JsonDefaults.Options);
+                if (signal is not null)
+                {
+                    OnMediaSignalReceived(signal);
+                }
+                return;
+            }
+            case "screen.state":
+            {
+                var state = envelope.Payload?.Deserialize<ScreenStateDto>(JsonDefaults.Options);
+                if (state is not null)
+                {
+                    ScreenStateChanged?.Invoke(state);
+                }
+                return;
+            }
         }
 
         // 其余都是请求的响应：按 id 唤醒等待者。
@@ -412,11 +499,46 @@ public sealed class PartyUpConnection : IAsyncDisposable
         PresenceChanged?.Invoke(presence);
     }
 
+    private void OnMediaSignalReceived(MediaSignalDto signal)
+    {
+        List<MediaSignalWaiter> satisfied = new();
+        lock (_waiterGate)
+        {
+            _receivedSignals.Add(signal);
+            if (_receivedSignals.Count > 500)
+            {
+                _receivedSignals.RemoveRange(0, _receivedSignals.Count - 500);
+            }
+            for (var i = _signalWaiters.Count - 1; i >= 0; i--)
+            {
+                var waiter = _signalWaiters[i];
+                if (!waiter.Match(signal))
+                {
+                    continue;
+                }
+                _signalWaiters.RemoveAt(i);
+                satisfied.Add(waiter);
+            }
+        }
+        foreach (var waiter in satisfied)
+        {
+            waiter.Tcs.TrySetResult(signal);
+        }
+        MediaSignalReceived?.Invoke(signal);
+    }
+
     private sealed class TextWaiter(Func<TextMessageDto, bool> match, TaskCompletionSource<TextMessageDto> tcs)
     {
         public Func<TextMessageDto, bool> Match { get; } = match;
 
         public TaskCompletionSource<TextMessageDto> Tcs { get; } = tcs;
+    }
+
+    private sealed class MediaSignalWaiter(Func<MediaSignalDto, bool> match, TaskCompletionSource<MediaSignalDto> tcs)
+    {
+        public Func<MediaSignalDto, bool> Match { get; } = match;
+
+        public TaskCompletionSource<MediaSignalDto> Tcs { get; } = tcs;
     }
 
     private sealed class PresenceWaiter(string channelId, int minMembers, TaskCompletionSource<PresenceDto> tcs)

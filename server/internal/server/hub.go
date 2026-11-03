@@ -46,6 +46,9 @@ type Hub struct {
 	mu    sync.RWMutex
 	conns map[*conn]struct{}
 	subs  map[string]map[*conn]struct{} // channel_id → 订阅连接
+	// shares 是每个频道里正在进行的屏幕共享：channel_id → sharer_member_id → 状态。
+	// 只在内存里（共享随连接生命周期走），对应 PROTOCOL.md §5 的 screen.state。
+	shares map[string]map[string]protocol.ShareState
 
 	upgrader websocket.Upgrader
 }
@@ -59,6 +62,7 @@ func NewHub(st *store.Store, log *slog.Logger, name, version string) *Hub {
 		version: version,
 		conns:   make(map[*conn]struct{}, 8),
 		subs:    make(map[string]map[*conn]struct{}, 8),
+		shares:  make(map[string]map[string]protocol.ShareState, 4),
 		upgrader: websocket.Upgrader{
 			HandshakeTimeout: 10 * time.Second,
 			// 桌面客户端不是浏览器，没有同源概念；放开 Origin 检查。
@@ -120,11 +124,26 @@ func (h *Hub) remove(c *conn) {
 		}
 	}
 	c.subs = map[string]struct{}{}
+	// 断开时清掉自己发起的共享，并记下受影响的频道（锁外广播 screen.state）。
+	sharesChanged := make([]string, 0, 2)
+	for ch, bySharer := range h.shares {
+		if _, ok := bySharer[c.member.ID]; !ok {
+			continue
+		}
+		delete(bySharer, c.member.ID)
+		if len(bySharer) == 0 {
+			delete(h.shares, ch)
+		}
+		sharesChanged = append(sharesChanged, ch)
+	}
 	h.mu.Unlock()
 
-	// 锁外广播 presence：避免在持锁时做 I/O。
+	// 锁外广播 presence / screen.state：避免在持锁时做 I/O。
 	for _, ch := range channels {
 		h.broadcastPresence(ch)
+	}
+	for _, ch := range sharesChanged {
+		h.broadcastScreenState(ch)
 	}
 }
 
@@ -312,7 +331,9 @@ func (c *conn) writePump() {
 // readPump 独占读端：解码信封并分发。返回即连接结束。
 func (c *conn) readPump() {
 	defer c.close()
-	c.ws.SetReadLimit(64 << 10)
+	// 单帧上限 = 媒体信令载荷上限 + 信封与转义余量。SDP 有几 KB，60 KB 太小会把
+	// 合法 offer 直接按 1009 断开；具体字段长度仍由各 handler 校验。
+	c.ws.SetReadLimit(int64(protocol.MaxSignalPayload) + (8 << 10))
 	// 未鉴权时只给 authWait；鉴权后放宽到 pongWait，任何消息都会续期。
 	_ = c.ws.SetReadDeadline(time.Now().Add(authWait))
 	c.ws.SetPongHandler(func(string) error {
@@ -370,6 +391,12 @@ func (c *conn) handle(env protocol.Envelope) {
 		c.handleTextSend(env)
 	case protocol.TypeTextHistory:
 		c.handleTextHistory(env)
+	case protocol.TypeScreenStart:
+		c.handleScreenStart(env)
+	case protocol.TypeScreenStop:
+		c.handleScreenStop(env)
+	case protocol.TypeMediaSignal:
+		c.handleMediaSignal(env)
 	default:
 		c.replyError(env.Type, protocol.CodeInvalidArgument, "unknown message type "+env.Type, env.ID)
 	}
@@ -576,6 +603,9 @@ func (c *conn) handleTextSend(env protocol.Envelope) {
 		c.replyError(env.Type, protocol.CodeInternal, "could not store message", env.ID)
 		return
 	}
+	// MemberName 不落库（members 表里有），实时这条路直接取当前连接身份；
+	// 历史由 store.History 联表带出，两条路都能给客户端完整作者信息。
+	msg.MemberName = c.member.Name
 
 	// 先回执（带 seq，发送者据此把乐观消息转正），再广播 text.new。
 	c.replyOK(env, protocol.TextSendOK{
@@ -641,4 +671,227 @@ func validChannelName(name string) bool {
 		}
 	}
 	return true
+}
+
+// ------------------------------------------------------------------
+// 屏幕共享与媒体信令（PROTOCOL.md §4.2 / §5）
+// ------------------------------------------------------------------
+
+// broadcastScreenState 把频道当前共享列表推给该频道的所有订阅者。
+func (h *Hub) broadcastScreenState(channelID string) {
+	h.mu.RLock()
+	bySharer := h.shares[channelID]
+	shares := make([]protocol.ShareState, 0, len(bySharer))
+	for _, share := range bySharer {
+		shares = append(shares, share)
+	}
+	targets := make([]*conn, 0, len(h.subs[channelID]))
+	for peer := range h.subs[channelID] {
+		targets = append(targets, peer)
+	}
+	h.mu.RUnlock()
+
+	data, err := protocol.MustNew(protocol.TypeScreenState, protocol.ScreenStatePayload{
+		ChannelID: channelID,
+		Shares:    shares,
+	}).Marshal()
+	if err != nil {
+		h.log.Error("marshal screen.state", "err", err)
+		return
+	}
+	for _, peer := range targets {
+		if peer.authed {
+			peer.enqueueBytes(data)
+		}
+	}
+}
+
+// validScreenSource 校验共享源描述。真实约束在客户端（来自 pu_screen_sources），
+// 服务端只做形状与长度校验，避免把脏数据广播给整个频道。
+func validScreenSource(src *protocol.ScreenSource) bool {
+	src.ID = strings.TrimSpace(src.ID)
+	src.Title = strings.TrimSpace(src.Title)
+	if src.ID == "" || src.Title == "" || len(src.ID) > 128 || len(src.Title) > 256 {
+		return false
+	}
+	if src.Width < 0 || src.Height < 0 || src.Width > 32768 || src.Height > 32768 {
+		return false
+	}
+	if src.Kind == "" {
+		src.Kind = "screen"
+	}
+	switch src.Kind {
+	case "screen", "window", "synthetic":
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *conn) handleScreenStart(env protocol.Envelope) {
+	var req protocol.ScreenStartRequest
+	if err := env.DecodePayload(&req); err != nil {
+		c.replyError(env.Type, protocol.CodeInvalidArgument, err.Error(), env.ID)
+		return
+	}
+	channelID := strings.TrimSpace(req.ChannelID)
+	if channelID == "" {
+		c.replyError(env.Type, protocol.CodeInvalidArgument, "channel_id is required", env.ID)
+		return
+	}
+	if !c.hub.isSubscribed(c, channelID) {
+		c.replyError(env.Type, protocol.CodeForbidden, "not a subscriber of this channel", env.ID)
+		return
+	}
+	source := req.Source
+	if !validScreenSource(&source) {
+		c.replyError(env.Type, protocol.CodeInvalidArgument, "invalid source", env.ID)
+		return
+	}
+	mode := strings.TrimSpace(req.Mode)
+	if mode == "" {
+		mode = "direct"
+	}
+	if mode != "direct" && mode != "relay" {
+		c.replyError(env.Type, protocol.CodeInvalidArgument, "mode must be direct or relay", env.ID)
+		return
+	}
+
+	share := protocol.ShareState{
+		SharerID:   c.member.ID,
+		MemberName: c.member.Name,
+		Source:     source,
+		Mode:       mode,
+		Viewers:    []string{},
+	}
+	c.hub.mu.Lock()
+	if c.hub.shares[channelID] == nil {
+		c.hub.shares[channelID] = make(map[string]protocol.ShareState, 2)
+	}
+	c.hub.shares[channelID][c.member.ID] = share
+	c.hub.mu.Unlock()
+
+	c.hub.log.Info("screen share started", "channel", channelID, "member", c.member.Name,
+		"source", source.Title, "width", source.Width, "height", source.Height, "mode", mode)
+	c.replyOK(env, protocol.ScreenStartOK{ChannelID: channelID})
+	c.hub.broadcastScreenState(channelID)
+}
+
+func (c *conn) handleScreenStop(env protocol.Envelope) {
+	var req protocol.ScreenStopRequest
+	if err := env.DecodePayload(&req); err != nil {
+		c.replyError(env.Type, protocol.CodeInvalidArgument, err.Error(), env.ID)
+		return
+	}
+	channelID := strings.TrimSpace(req.ChannelID)
+	if channelID == "" {
+		c.replyError(env.Type, protocol.CodeInvalidArgument, "channel_id is required", env.ID)
+		return
+	}
+	if !c.hub.isSubscribed(c, channelID) {
+		c.replyError(env.Type, protocol.CodeForbidden, "not a subscriber of this channel", env.ID)
+		return
+	}
+
+	c.hub.mu.Lock()
+	removed := false
+	if bySharer := c.hub.shares[channelID]; bySharer != nil {
+		if _, ok := bySharer[c.member.ID]; ok {
+			delete(bySharer, c.member.ID)
+			removed = true
+		}
+		if len(bySharer) == 0 {
+			delete(c.hub.shares, channelID)
+		}
+	}
+	c.hub.mu.Unlock()
+
+	if removed {
+		c.hub.log.Info("screen share stopped", "channel", channelID, "member", c.member.Name)
+	}
+	c.replyOK(env, protocol.ScreenStopOK{ChannelID: channelID})
+	c.hub.broadcastScreenState(channelID)
+}
+
+// handleMediaSignal 转发一条媒体信令（offer / answer / candidate）。
+//
+// 服务端不解析、不改写 payload：它是媒体核心产出的原始 JSON 信封字符串。
+//   - to 为空 → 广播给频道内其它订阅者（offer 用这条）；
+//   - to 非空 → 只投递给该成员（answer / candidate 用这条，避免打扰其他观看者）。
+func (c *conn) handleMediaSignal(env protocol.Envelope) {
+	var req protocol.MediaSignalRequest
+	if err := env.DecodePayload(&req); err != nil {
+		c.replyError(env.Type, protocol.CodeInvalidArgument, err.Error(), env.ID)
+		return
+	}
+	channelID := strings.TrimSpace(req.ChannelID)
+	if channelID == "" {
+		c.replyError(env.Type, protocol.CodeInvalidArgument, "channel_id is required", env.ID)
+		return
+	}
+	if !c.hub.isSubscribed(c, channelID) {
+		c.replyError(env.Type, protocol.CodeForbidden, "not a subscriber of this channel", env.ID)
+		return
+	}
+	media := strings.TrimSpace(req.Media)
+	if media == "" {
+		media = "screen"
+	}
+	if media != "screen" && media != "voice" {
+		c.replyError(env.Type, protocol.CodeInvalidArgument, "media must be screen or voice", env.ID)
+		return
+	}
+	kind := strings.TrimSpace(req.Kind)
+	switch kind {
+	case "offer", "answer", "candidate":
+	default:
+		c.replyError(env.Type, protocol.CodeInvalidArgument, "kind must be offer, answer or candidate", env.ID)
+		return
+	}
+	if req.Payload == "" {
+		c.replyError(env.Type, protocol.CodeInvalidArgument, "payload is required", env.ID)
+		return
+	}
+	if len(req.Payload) > protocol.MaxSignalPayload {
+		c.replyError(env.Type, protocol.CodeInvalidArgument, "payload too large", env.ID)
+		return
+	}
+
+	push := protocol.MediaSignalPush{
+		ChannelID: channelID,
+		From:      c.member.ID,
+		FromName:  c.member.Name,
+		Media:     media,
+		Kind:      kind,
+		Payload:   req.Payload,
+	}
+	data, err := protocol.MustNew(protocol.TypeMediaSignal, push).Marshal()
+	if err != nil {
+		c.hub.log.Error("marshal media.signal", "err", err)
+		c.replyError(env.Type, protocol.CodeInternal, "could not encode signal", env.ID)
+		return
+	}
+
+	to := strings.TrimSpace(req.To)
+	c.hub.mu.RLock()
+	targets := make([]*conn, 0, len(c.hub.subs[channelID]))
+	for peer := range c.hub.subs[channelID] {
+		if !peer.authed || peer == c {
+			continue
+		}
+		if to != "" && peer.member.ID != to {
+			continue
+		}
+		targets = append(targets, peer)
+	}
+	c.hub.mu.RUnlock()
+
+	if to != "" && len(targets) == 0 {
+		c.replyError(env.Type, protocol.CodeNotFound, "target member is not in this channel", env.ID)
+		return
+	}
+	for _, peer := range targets {
+		peer.enqueueBytes(data)
+	}
+	c.replyOK(env, protocol.MediaSignalOK{ChannelID: channelID})
 }

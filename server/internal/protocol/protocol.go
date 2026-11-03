@@ -19,9 +19,10 @@ const Version = 1
 
 // 载荷上限。骨架先用固定值，后续按 PROTOCOL.md §8 的扩展位调整。
 const (
-	MaxBodyBytes    = 4096 // text.send.body 的 UTF-8 字节上限
-	MaxChannelName  = 32   // 频道名 rune 数上限
-	MaxHistoryLimit = 200  // text.history.limit 上限
+	MaxBodyBytes     = 4096  // text.send.body 的 UTF-8 字节上限
+	MaxChannelName   = 32    // 频道名 rune 数上限
+	MaxHistoryLimit  = 200   // text.history.limit 上限
+	MaxSignalPayload = 65536 // media.signal.payload 的 UTF-8 字节上限（SDP 有几 KB）
 )
 
 // 错误码，见 docs/PROTOCOL.md §0「第一批」。
@@ -53,6 +54,12 @@ const (
 	TypeTextHistory    = "text.history"
 	TypePresence       = "presence"
 	TypeMemberRegister = "member.register"
+
+	// 屏幕共享与媒体信令（PROTOCOL.md §4.2 / §5）。
+	TypeScreenStart = "screen.start"
+	TypeScreenStop  = "screen.stop"
+	TypeScreenState = "screen.state"
+	TypeMediaSignal = "media.signal"
 )
 
 // TypeOK 返回请求类型对应的成功响应类型：`text.send` → `text.send.ok`。
@@ -163,12 +170,23 @@ type VoiceMember struct {
 	Deafened bool   `json:"deafened"`
 }
 
-// Share 是共享区的一路共享占位。骨架不实现屏幕共享，恒为空数组。
-type Share struct {
-	SharerID string   `json:"sharer_id"`
-	Source   string   `json:"source"`
-	Mode     string   `json:"mode"`
-	Viewers  []string `json:"viewers"`
+// ScreenSource 是一路可共享的源（显示器 / 窗口 / 合成源），与媒体核心的
+// pu_source_info 对齐。
+type ScreenSource struct {
+	ID     string `json:"id"`
+	Title  string `json:"title"`
+	Width  int    `json:"width"`
+	Height int    `json:"height"`
+	Kind   string `json:"kind"` // screen | window | synthetic
+}
+
+// ShareState 是一路正在进行的共享（screen.state 的元素）。
+type ShareState struct {
+	SharerID   string       `json:"sharer_id"`
+	MemberName string       `json:"member_name"`
+	Source     ScreenSource `json:"source"`
+	Mode       string       `json:"mode"` // direct | relay
+	Viewers    []string     `json:"viewers"`
 }
 
 // Channel 是频道。三区同时存在：文字区（消息流）、语音区、共享区。
@@ -176,17 +194,21 @@ type Channel struct {
 	ID     string        `json:"id"`
 	Name   string        `json:"name"`
 	Voice  []VoiceMember `json:"voice"`
-	Shares []Share       `json:"shares"`
+	Shares []ShareState  `json:"shares"`
 }
 
 // TextMessage 是一条文字消息。text.new 的载荷与 text.history 的元素同形。
+//
+// MemberName 是 PROTOCOL.md §3 之外的补充字段（原文档只有 member_id）：没有它，
+// 历史消息里的离线成员只能显示 id 前缀。服务端在 text.new 与 text.history 里都填。
 type TextMessage struct {
-	ChannelID string `json:"channel_id"`
-	ID        string `json:"id"`
-	Seq       int64  `json:"seq"`
-	MemberID  string `json:"member_id"`
-	Body      string `json:"body"`
-	TS        int64  `json:"ts"`
+	ChannelID  string `json:"channel_id"`
+	ID         string `json:"id"`
+	Seq        int64  `json:"seq"`
+	MemberID   string `json:"member_id"`
+	MemberName string `json:"member_name"`
+	Body       string `json:"body"`
+	TS         int64  `json:"ts"`
 }
 
 // PresenceMember 是 presence 里的成员条目。
@@ -272,4 +294,65 @@ type TextHistoryOK struct {
 type PresencePayload struct {
 	ChannelID string           `json:"channel_id"`
 	Members   []PresenceMember `json:"members"`
+}
+
+// ------------------------------------------------------------------
+// 屏幕共享 / 媒体信令（PROTOCOL.md §4.2、§5）
+// ------------------------------------------------------------------
+
+// ScreenStartRequest 是 screen.start 的载荷：某成员在频道里开始一路共享。
+type ScreenStartRequest struct {
+	ChannelID string       `json:"channel_id"`
+	Source    ScreenSource `json:"source"`
+	Mode      string       `json:"mode,omitempty"` // direct（默认）| relay；骨架只做 direct
+}
+
+// ScreenStopRequest 是 screen.stop 的载荷。
+type ScreenStopRequest struct {
+	ChannelID string `json:"channel_id"`
+}
+
+// ScreenStatePayload 是 screen.state 推送的载荷：频道内当前所有共享。
+type ScreenStatePayload struct {
+	ChannelID string       `json:"channel_id"`
+	Shares    []ShareState `json:"shares"`
+}
+
+// MediaSignalRequest 是客户端上行的一条媒体信令。
+//
+// Payload 是媒体核心吐出来的原始信令信封（{"type":"offer","sdp":...} /
+// {"type":"answer",...} / {"type":"candidate",...}）的**原样字符串**：服务端不解析、
+// 不改写 SDP，只按 To 定向投递或按频道广播。Kind 由客户端从 pu_signal_event.kind
+// 映射（offer|answer|candidate），服务端只做白名单校验。
+type MediaSignalRequest struct {
+	ChannelID string `json:"channel_id"`
+	To        string `json:"to,omitempty"`
+	Media     string `json:"media"` // screen | voice
+	Kind      string `json:"kind"`  // offer | answer | candidate
+	Payload   string `json:"payload"`
+}
+
+// MediaSignalPush 是服务端下发的媒体信令（media.signal），字段与上行一致，
+// 另加发送方身份，接收方据此决定把 answer/candidate 发给谁。
+type MediaSignalPush struct {
+	ChannelID string `json:"channel_id"`
+	From      string `json:"from"`
+	FromName  string `json:"from_name"`
+	Media     string `json:"media"`
+	Kind      string `json:"kind"`
+	Payload   string `json:"payload"`
+}
+
+// ScreenStartOK / ScreenStopOK / MediaSignalOK 是三类共享信令的成功响应载荷。
+// 只回 channel_id：真实状态由 screen.state 推送负责，响应只用于配对与错误上报。
+type ScreenStartOK struct {
+	ChannelID string `json:"channel_id"`
+}
+
+type ScreenStopOK struct {
+	ChannelID string `json:"channel_id"`
+}
+
+type MediaSignalOK struct {
+	ChannelID string `json:"channel_id"`
 }

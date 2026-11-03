@@ -23,6 +23,23 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# 本进程必须是 DPI-aware：否则 Screen.Bounds / GetWindowRect 返回虚拟化坐标（实测
+# 2560x1440 的屏幕被报告成 1707x960），截出来的只是窗口左上角一块，右栏（共享区）会被裁掉。
+Add-Type -Namespace PartyUpEvidence -Name Dpi -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern bool SetProcessDpiAwarenessContext(System.IntPtr value);
+'@
+try {
+    # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4；老系统回落到 SetProcessDPIAware。
+    [void][PartyUpEvidence.Dpi]::SetProcessDpiAwarenessContext([System.IntPtr]-4)
+} catch {
+    Add-Type -Namespace PartyUpEvidence -Name DpiFallback -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern bool SetProcessDPIAware();
+'@
+    [void][PartyUpEvidence.DpiFallback]::SetProcessDPIAware()
+}
+
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 

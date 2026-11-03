@@ -446,17 +446,18 @@ func toProtocolChannel(ch store.Channel) protocol.Channel {
 		ID:     ch.ID,
 		Name:   ch.Name,
 		Voice:  []protocol.VoiceMember{},
-		Shares: []protocol.Share{},
+		Shares: []protocol.ShareState{},
 	}
 }
 
 func toProtocolMessage(m store.Message) protocol.TextMessage {
 	return protocol.TextMessage{
-		ChannelID: m.ChannelID,
-		ID:        m.ID,
-		Seq:       m.Seq,
-		MemberID:  m.MemberID,
-		Body:      m.Body,
-		TS:        m.TS,
+		ChannelID:  m.ChannelID,
+		ID:         m.ID,
+		Seq:        m.Seq,
+		MemberID:   m.MemberID,
+		MemberName: m.MemberName,
+		Body:       m.Body,
+		TS:         m.TS,
 	}
 }

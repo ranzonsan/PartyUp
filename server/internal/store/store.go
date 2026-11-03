@@ -64,14 +64,16 @@ type Channel struct {
 	CreatedAt int64
 }
 
-// Message 是一条文字消息。
+// Message 是一条文字消息。MemberName 由 History 联表带出（实时广播时由 hub 填
+// 当前连接的身份），这样历史消息里的离线成员也能显示名字。
 type Message struct {
-	ID        string
-	ChannelID string
-	Seq       int64
-	MemberID  string
-	Body      string
-	TS        int64
+	ID         string
+	ChannelID  string
+	Seq        int64
+	MemberID   string
+	MemberName string
+	Body       string
+	TS         int64
 }
 
 // Store 是库句柄。
@@ -549,13 +551,15 @@ func (s *Store) History(ctx context.Context, channelID string, beforeSeq int64, 
 	)
 	if beforeSeq > 0 {
 		rows, err = s.db.QueryContext(ctx,
-			`SELECT id, channel_id, seq, member_id, body, ts FROM messages
-			  WHERE channel_id = ? AND seq < ? ORDER BY seq DESC LIMIT ?`,
+			`SELECT m.id, m.channel_id, m.seq, m.member_id, COALESCE(mb.name, ''), m.body, m.ts
+			   FROM messages m LEFT JOIN members mb ON mb.id = m.member_id
+			  WHERE m.channel_id = ? AND m.seq < ? ORDER BY m.seq DESC LIMIT ?`,
 			channelID, beforeSeq, limit)
 	} else {
 		rows, err = s.db.QueryContext(ctx,
-			`SELECT id, channel_id, seq, member_id, body, ts FROM messages
-			  WHERE channel_id = ? ORDER BY seq DESC LIMIT ?`,
+			`SELECT m.id, m.channel_id, m.seq, m.member_id, COALESCE(mb.name, ''), m.body, m.ts
+			   FROM messages m LEFT JOIN members mb ON mb.id = m.member_id
+			  WHERE m.channel_id = ? ORDER BY m.seq DESC LIMIT ?`,
 			channelID, limit)
 	}
 	if err != nil {
@@ -567,7 +571,7 @@ func (s *Store) History(ctx context.Context, channelID string, beforeSeq int64, 
 	desc := make([]Message, 0, limit)
 	for rows.Next() {
 		var m Message
-		if err := rows.Scan(&m.ID, &m.ChannelID, &m.Seq, &m.MemberID, &m.Body, &m.TS); err != nil {
+		if err := rows.Scan(&m.ID, &m.ChannelID, &m.Seq, &m.MemberID, &m.MemberName, &m.Body, &m.TS); err != nil {
 			return nil, fmt.Errorf("store: scan message: %w", err)
 		}
 		desc = append(desc, m)

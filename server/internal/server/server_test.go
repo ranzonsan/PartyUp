@@ -745,3 +745,184 @@ func TestBadTokenClosesConnection(t *testing.T) {
 		}
 	}
 }
+
+// TestTextMessagesCarryMemberName 锁定「text.new 与 text.history 都带 member_name」。
+// 这是把 B 方向（产品功能）协议缺口补上后的回归判据：历史消息里的离线成员必须
+// 能显示名字，而不是 id 前缀。
+func TestTextMessagesCarryMemberName(t *testing.T) {
+	env := newTestEnv(t)
+	alice, aliceToken := env.bootstrapAdmin("alice", "secret123")
+	code := env.newInvite()
+	bob, bobToken := env.registerViaInvite(code, "bob", "secret123")
+
+	aliceWS := dialWS(t, env.http.URL, aliceToken)
+	bobWS := dialWS(t, env.http.URL, bobToken)
+
+	ch := aliceWS.createChannel("name-check")
+	aliceWS.subscribe(ch.ID)
+	bobWS.subscribe(ch.ID)
+	aliceWS.waitForPresenceWith(ch.ID, 2)
+
+	sent := aliceWS.sendText(ch.ID, "hello from alice")
+
+	// 广播包含发送者自己：用 alice 的连接取 text.new，断言作者名。
+	push := aliceWS.waitFor(protocol.TypeTextNew)
+	var live protocol.TextMessage
+	if err := push.DecodePayload(&live); err != nil {
+		t.Fatalf("decode text.new: %v", err)
+	}
+	if live.MemberID != alice.ID {
+		t.Fatalf("text.new member_id = %q, want %q", live.MemberID, alice.ID)
+	}
+	if live.MemberName != "alice" {
+		t.Fatalf("text.new member_name = %q, want %q", live.MemberName, "alice")
+	}
+	if live.Seq != sent.Seq {
+		t.Fatalf("text.new seq = %d, want %d", live.Seq, sent.Seq)
+	}
+
+	// 历史（联 members 表）同样要带名字。
+	histEnv := aliceWS.request(protocol.TypeTextHistory, protocol.TextHistoryRequest{ChannelID: ch.ID, Limit: 50})
+	var hist protocol.TextHistoryOK
+	if err := histEnv.DecodePayload(&hist); err != nil {
+		t.Fatalf("decode text.history.ok: %v", err)
+	}
+	if len(hist.Messages) != 1 {
+		t.Fatalf("history has %d messages, want 1", len(hist.Messages))
+	}
+	if hist.Messages[0].MemberName != "alice" {
+		t.Fatalf("history member_name = %q, want %q", hist.Messages[0].MemberName, "alice")
+	}
+
+	// bob 发一条，历史里两个人的名字都要对。
+	bobWS.sendText(ch.ID, "hello from bob")
+	_ = aliceWS.waitFor(protocol.TypeTextNew)
+
+	histEnv = aliceWS.request(protocol.TypeTextHistory, protocol.TextHistoryRequest{ChannelID: ch.ID, Limit: 50})
+	if err := histEnv.DecodePayload(&hist); err != nil {
+		t.Fatalf("decode text.history.ok: %v", err)
+	}
+	if len(hist.Messages) != 2 {
+		t.Fatalf("history has %d messages, want 2", len(hist.Messages))
+	}
+	if hist.Messages[0].MemberName != "alice" || hist.Messages[1].MemberName != "bob" {
+		t.Fatalf("history authors = [%q %q], want [alice bob]",
+			hist.Messages[0].MemberName, hist.Messages[1].MemberName)
+	}
+	if hist.Messages[1].MemberID != bob.ID {
+		t.Fatalf("second history member_id = %q, want %q", hist.Messages[1].MemberID, bob.ID)
+	}
+}
+
+// TestMediaSignalRelayAndScreenState 锁定屏幕共享的控制面：
+// screen.start/stop → screen.state 广播；media.signal 的广播（offer）与定向投递
+// （answer/candidate 发给指定成员），以及非法 kind / 未订阅频道的拒绝。
+func TestMediaSignalRelayAndScreenState(t *testing.T) {
+	env := newTestEnv(t)
+	alice, aliceToken := env.bootstrapAdmin("alice", "secret123")
+	code := env.newInvite()
+	bob, bobToken := env.registerViaInvite(code, "bob", "secret123")
+
+	aliceWS := dialWS(t, env.http.URL, aliceToken)
+	bobWS := dialWS(t, env.http.URL, bobToken)
+
+	ch := aliceWS.createChannel("share")
+	aliceWS.subscribe(ch.ID)
+	bobWS.subscribe(ch.ID)
+	aliceWS.waitForPresenceWith(ch.ID, 2)
+
+	// 1) screen.start：bob 必须收到 screen.state，含 sharer 身份与源分辨率。
+	aliceWS.request(protocol.TypeScreenStart, protocol.ScreenStartRequest{
+		ChannelID: ch.ID,
+		Source: protocol.ScreenSource{
+			ID:     "42",
+			Title:  "DISPLAY1 2560x1440",
+			Width:  2560,
+			Height: 1440,
+			Kind:   "screen",
+		},
+	})
+	stateEnv := bobWS.waitFor(protocol.TypeScreenState)
+	var state protocol.ScreenStatePayload
+	if err := stateEnv.DecodePayload(&state); err != nil {
+		t.Fatalf("decode screen.state: %v", err)
+	}
+	if state.ChannelID != ch.ID {
+		t.Fatalf("screen.state channel_id = %q, want %q", state.ChannelID, ch.ID)
+	}
+	if len(state.Shares) != 1 {
+		t.Fatalf("screen.state shares = %d, want 1", len(state.Shares))
+	}
+	share := state.Shares[0]
+	if share.SharerID != alice.ID || share.MemberName != "alice" {
+		t.Fatalf("share sharer = (%q,%q), want (%q,alice)", share.SharerID, share.MemberName, alice.ID)
+	}
+	if share.Source.Width != 2560 || share.Source.Height != 1440 || share.Source.Kind != "screen" {
+		t.Fatalf("share source = %dx%d kind=%q, want 2560x1440 screen",
+			share.Source.Width, share.Source.Height, share.Source.Kind)
+	}
+	if share.Mode != "direct" {
+		t.Fatalf("share mode = %q, want direct (default)", share.Mode)
+	}
+
+	// 2) offer 广播：alice → bob，payload 原样透传。
+	const offerPayload = `{"type":"offer","sdp":"v=0 fake offer"}`
+	aliceWS.request(protocol.TypeMediaSignal, protocol.MediaSignalRequest{
+		ChannelID: ch.ID,
+		Media:     "screen",
+		Kind:      "offer",
+		Payload:   offerPayload,
+	})
+	sigEnv := bobWS.waitFor(protocol.TypeMediaSignal)
+	var sig protocol.MediaSignalPush
+	if err := sigEnv.DecodePayload(&sig); err != nil {
+		t.Fatalf("decode media.signal: %v", err)
+	}
+	if sig.From != alice.ID || sig.FromName != "alice" {
+		t.Fatalf("media.signal from = (%q,%q), want (%q,alice)", sig.From, sig.FromName, alice.ID)
+	}
+	if sig.Kind != "offer" || sig.Media != "screen" {
+		t.Fatalf("media.signal kind/media = %q/%q, want offer/screen", sig.Kind, sig.Media)
+	}
+	if sig.Payload != offerPayload {
+		t.Fatalf("media.signal payload was rewritten by the server: %q", sig.Payload)
+	}
+
+	// 3) 定向 answer：bob → alice，只有 alice 能收到。
+	const answerPayload = `{"type":"answer","sdp":"v=0 fake answer"}`
+	bobWS.request(protocol.TypeMediaSignal, protocol.MediaSignalRequest{
+		ChannelID: ch.ID,
+		To:        alice.ID,
+		Media:     "screen",
+		Kind:      "answer",
+		Payload:   answerPayload,
+	})
+	sigEnv = aliceWS.waitFor(protocol.TypeMediaSignal)
+	if err := sigEnv.DecodePayload(&sig); err != nil {
+		t.Fatalf("decode media.signal answer: %v", err)
+	}
+	if sig.From != bob.ID || sig.Kind != "answer" || sig.Payload != answerPayload {
+		t.Fatalf("answer relay = from:%q kind:%q payload:%q", sig.From, sig.Kind, sig.Payload)
+	}
+
+	// 4) 非法参数与未订阅频道被拒（错误码稳定）。
+	aliceWS.expectError(protocol.TypeMediaSignal, protocol.MediaSignalRequest{
+		ChannelID: ch.ID, Media: "screen", Kind: "bogus", Payload: "{}",
+	}, protocol.CodeInvalidArgument)
+	aliceWS.expectError(protocol.TypeMediaSignal, protocol.MediaSignalRequest{
+		ChannelID: "01NOTSUBSCRIBED000000000000", Media: "screen", Kind: "offer", Payload: "{}",
+	}, protocol.CodeForbidden)
+	aliceWS.expectError(protocol.TypeMediaSignal, protocol.MediaSignalRequest{
+		ChannelID: ch.ID, Media: "screen", Kind: "offer", Payload: strings.Repeat("x", protocol.MaxSignalPayload+1),
+	}, protocol.CodeInvalidArgument)
+
+	// 5) screen.stop：bob 收到空列表。
+	aliceWS.request(protocol.TypeScreenStop, protocol.ScreenStopRequest{ChannelID: ch.ID})
+	stateEnv = bobWS.waitFor(protocol.TypeScreenState)
+	if err := stateEnv.DecodePayload(&state); err != nil {
+		t.Fatalf("decode screen.state after stop: %v", err)
+	}
+	if len(state.Shares) != 0 {
+		t.Fatalf("screen.state shares after stop = %d, want 0", len(state.Shares))
+	}
+}

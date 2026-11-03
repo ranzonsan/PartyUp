@@ -25,6 +25,8 @@ internal static class InteropRole
         return options.Mode switch
         {
             ClientMode.Duo => await RunDuoAsync(options),
+            ClientMode.ShareHost => await RunShareHostAsync(options),
+            ClientMode.ShareView => await RunShareViewAsync(options),
             ClientMode.RoleB => await RunSingleRoleAsync(options, isA: false),
             ClientMode.Send => await RunSendAsync(options),
             _ => await RunSingleRoleAsync(options, isA: true),
@@ -120,6 +122,232 @@ internal static class InteropRole
         AppLog.Fail($"duo: FAIL (own={ownOk}, child={childOk})");
         Console.WriteLine("INTEROP_RESULT=FAIL");
         return 1;
+    }
+
+    /// <summary>
+    /// --share host：当共享方。拉起观看方子进程，等它订阅进来后开始共享合成源，
+    /// 把媒体核心吐出的信令经服务端转发，跑若干秒后汇总两边的结果。
+    /// </summary>
+    private static async Task<int> RunShareHostAsync(ClientOptions options)
+    {
+        Process? child = null;
+        MediaEngine? engine = null;
+        try
+        {
+            var token = options.TokenA ?? options.Token;
+            if (string.IsNullOrWhiteSpace(token) || string.IsNullOrWhiteSpace(options.TokenB))
+            {
+                AppLog.Fail("share-host: 需要 --token-a（或 --token）与 --token-b");
+                return 2;
+            }
+
+            var baseUri = new Uri(options.Server);
+            await using var connection = await PartyUpConnection.ConnectAsync(baseUri, token);
+            var channel = await EnsureChannelAsync(connection, options.Channel);
+            await connection.SubscribeAsync(channel.Id);
+
+            engine = MediaEngine.Load();
+            if (engine.MissingExports.Count > 0)
+            {
+                AppLog.Fail($"share-host: DLL 缺 {engine.MissingExports.Count} 个导出");
+                return 1;
+            }
+            engine.Create("partyup-share-host");
+
+            await using var session = new ShareSession(engine, connection, channel.Id);
+
+            // --share-no-child：观看方是外部进程（例如已经打开、自动登录的 GUI），
+            // 此时不拉子进程，只等它订阅进来。
+            if (!options.ShareNoChild)
+            {
+                child = StartShareChildAsync(options, viewer: true);
+            }
+            // 等观看方订阅进来：offer 是广播，晚订阅就收不到。
+            await connection.WaitForPresenceAsync(channel.Id, 2, PresenceTimeout);
+
+            var source = new MediaSource(options.ShareSourceId, "内置合成源（synthetic）", 640, 360, 2);
+            await session.StartSharingAsync(source);
+
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(options.ShareSeconds);
+            var nextReport = DateTime.UtcNow;
+            while (DateTime.UtcNow < deadline)
+            {
+                while (engine.Poll(0) is { } ev)
+                {
+                    session.HandleMediaEvent(ev);
+                }
+                if (DateTime.UtcNow >= nextReport)
+                {
+                    var stats = engine.GetStats();
+                    AppLog.Info($"share-host: encoded={stats.FramesEncoded} sent={stats.FramesSent} " +
+                                $"signals_out={session.SignalsOut} signals_in={session.SignalsIn} " +
+                                $"peer={stats.PeerState} ice={stats.IceState}");
+                    nextReport = DateTime.UtcNow.AddSeconds(2);
+                }
+                await Task.Delay(50);
+            }
+
+            await session.StopSharingAsync();
+            var finalStats = engine.GetStats();
+            AppLog.Pass($"share-host: encoded={finalStats.FramesEncoded} signals_out={session.SignalsOut} " +
+                        $"signals_in={session.SignalsIn} encoder={finalStats.Reserved}");
+
+            // 没有子进程时（--share-no-child，观看方是 GUI），只要自己编码出帧就算通过。
+            var childOk = child is null || (child.WaitForExit(20_000) && child.ExitCode == 0);
+            if (child is { HasExited: false })
+            {
+                child.Kill(entireProcessTree: true);
+            }
+
+            var ok = finalStats.FramesEncoded > 0 && childOk;
+            Console.WriteLine($"SHARE_HOST_ENCODED={finalStats.FramesEncoded}");
+            Console.WriteLine($"SHARE_HOST_SIGNALS_OUT={session.SignalsOut} SHARE_HOST_SIGNALS_IN={session.SignalsIn}");
+            Console.WriteLine($"SHARE_HOST_CHILD_OK={childOk}");
+            Console.WriteLine($"SHARE_HOST_RESULT={(ok ? "PASS" : "FAIL")}");
+            Console.WriteLine($"SHARE_RESULT={(ok ? "PASS" : "FAIL")}");
+            return ok ? 0 : 1;
+        }
+        catch (Exception ex)
+        {
+            AppLog.Fail("share-host: " + ex);
+            Console.WriteLine("SHARE_RESULT=FAIL");
+            return 1;
+        }
+        finally
+        {
+            if (child is { HasExited: false })
+            {
+                child.Kill(entireProcessTree: true);
+            }
+            engine?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// --share view：当观看方。等 offer → 交给媒体核心应答（answer 自动经 SIGNAL_OUT
+    /// 回到共享方）→ 统计远端帧，够数就提前成功退出。
+    /// </summary>
+    private static async Task<int> RunShareViewAsync(ClientOptions options)
+    {
+        MediaEngine? engine = null;
+        try
+        {
+            var token = options.TokenB ?? options.Token;
+            if (string.IsNullOrWhiteSpace(token))
+            {
+                AppLog.Fail("share-view: 需要 --token-b 或 --token");
+                return 2;
+            }
+
+            var baseUri = new Uri(options.Server);
+            await using var connection = await PartyUpConnection.ConnectAsync(baseUri, token);
+            var channel = await EnsureChannelAsync(connection, options.Channel);
+
+            // 顺序很重要：先建引擎与 ShareSession（它挂上 media.signal 处理器），
+            // 最后才 subscribe。否则 offer 可能在本进程订阅之后、处理器挂上之前到达，
+            // 被服务端推过来却没人接（实测丢第一次 offer 就是这么来的）。
+            engine = MediaEngine.Load();
+            if (engine.MissingExports.Count > 0)
+            {
+                AppLog.Fail($"share-view: DLL 缺 {engine.MissingExports.Count} 个导出");
+                return 1;
+            }
+            engine.Create("partyup-share-view");
+
+            await using var session = new ShareSession(engine, connection, channel.Id);
+            await connection.SubscribeAsync(channel.Id);
+            AppLog.Pass("share-view: waiting for an offer");
+
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(options.ShareSeconds + 45);
+            var nextReport = DateTime.UtcNow;
+            while (DateTime.UtcNow < deadline)
+            {
+                while (engine.Poll(0) is { } ev)
+                {
+                    session.HandleMediaEvent(ev);
+                }
+                if (session.RemoteFrames >= 30)
+                {
+                    break;
+                }
+                if (DateTime.UtcNow >= nextReport)
+                {
+                    var stats = engine.GetStats();
+                    AppLog.Info($"share-view: frames={session.RemoteFrames} " +
+                                $"size={session.RemoteWidth}x{session.RemoteHeight} " +
+                                $"stats_received={stats.FramesReceived} signals_in={session.SignalsIn} " +
+                                $"signals_out={session.SignalsOut} ice={stats.IceState}");
+                    nextReport = DateTime.UtcNow.AddSeconds(2);
+                }
+                await Task.Delay(50);
+            }
+
+            var ok = session.RemoteFrames >= 10;
+            Console.WriteLine($"SHARE_VIEW_FRAMES={session.RemoteFrames}");
+            Console.WriteLine($"SHARE_VIEW_SIZE={session.RemoteWidth}x{session.RemoteHeight}");
+            Console.WriteLine($"SHARE_VIEW_SIGNALS_IN={session.SignalsIn} SHARE_VIEW_SIGNALS_OUT={session.SignalsOut}");
+            Console.WriteLine($"SHARE_VIEW_RESULT={(ok ? "PASS" : "FAIL")}");
+            return ok ? 0 : 1;
+        }
+        catch (Exception ex)
+        {
+            AppLog.Fail("share-view: " + ex);
+            Console.WriteLine("SHARE_VIEW_RESULT=FAIL");
+            return 1;
+        }
+        finally
+        {
+            engine?.Dispose();
+        }
+    }
+
+    /// <summary>拉起观看方子进程（--share view），转发它的输出并标记是否看到 PASS 行。</summary>
+    private static Process StartShareChildAsync(ClientOptions options, bool viewer)
+    {
+        var exe = Environment.ProcessPath
+                  ?? throw new InvalidOperationException("无法取得自身可执行文件路径（Environment.ProcessPath 为空）");
+        var startInfo = new ProcessStartInfo(exe)
+        {
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            WorkingDirectory = AppContext.BaseDirectory,
+        };
+        foreach (var argument in new[]
+                 {
+                     "--share", viewer ? "view" : "host",
+                     "--server", options.Server,
+                     "--channel", options.Channel,
+                     "--token", options.TokenB ?? options.Token ?? string.Empty,
+                     "--share-seconds", options.ShareSeconds.ToString(),
+                 })
+        {
+            startInfo.ArgumentList.Add(argument);
+        }
+
+        var process = new Process { StartInfo = startInfo };
+        process.OutputDataReceived += (_, e) =>
+        {
+            if (e.Data is not null)
+            {
+                AppLog.Info("[share-view] " + e.Data);
+            }
+        };
+        process.ErrorDataReceived += (_, e) =>
+        {
+            if (e.Data is not null)
+            {
+                AppLog.Warn("[share-view] " + e.Data);
+            }
+        };
+        if (!process.Start())
+        {
+            throw new InvalidOperationException("无法启动观看方子进程");
+        }
+        process.BeginOutputReadLine();
+        process.BeginErrorReadLine();
+        AppLog.Pass($"share-host: viewer child started (pid={process.Id})");
+        return process;
     }
 
     /// <summary>启动一个 --role b 子进程，把它的输出带前缀转发到本进程 stdout。</summary>

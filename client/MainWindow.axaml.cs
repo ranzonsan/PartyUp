@@ -20,6 +20,9 @@ public partial class MainWindow : Window
     public MainWindow(MainViewModel viewModel)
     {
         InitializeComponent();
+        // 诊断：确认 XAML 里的共享面板真的进了视觉树（截图取证时用来排除"窗口是旧版"）。
+        AppLog.Info($"gui: xaml loaded (share panel={(SourceCombo is null ? "missing" : "ok")}, " +
+                    $"window={Width}x{Height})");
         _viewModel = viewModel;
         DataContext = viewModel;
 
@@ -27,6 +30,8 @@ public partial class MainWindow : Window
         RegisterButton.Click += OnRegisterClicked;
         CreateChannelButton.Click += OnCreateChannelClicked;
         SendButton.Click += OnSendClicked;
+        StartShareButton.Click += OnStartShareClicked;
+        StopShareButton.Click += OnStopShareClicked;
         MessageInput.KeyDown += OnMessageInputKeyDown;
         ChannelList.SelectionChanged += OnChannelSelectionChanged;
         _viewModel.Messages.CollectionChanged += (_, _) => MessageScroll.ScrollToEnd();
@@ -43,6 +48,10 @@ public partial class MainWindow : Window
     private async void OnOpened(object? sender, EventArgs e)
     {
         AppLog.Info("gui: window opened");
+        // 布局自检：右栏（共享区）与顶栏徽标都在视觉树里且拿到了非零尺寸。
+        AppLog.Info($"gui: layout client={ClientSize.Width}x{ClientSize.Height} " +
+                    $"sharePanel={SharePanel.Bounds} shareVisible={SharePanel.IsVisible} " +
+                    $"badge={MediaBadge.Bounds} mediaText=\"{_viewModel.MediaStatusText}\"");
         if (string.IsNullOrWhiteSpace(Program.Options.Token))
         {
             return;
@@ -62,6 +71,10 @@ public partial class MainWindow : Window
         await _viewModel.CreateChannelAsync();
 
     private async void OnSendClicked(object? sender, RoutedEventArgs e) => await _viewModel.SendMessageAsync();
+
+    private async void OnStartShareClicked(object? sender, RoutedEventArgs e) => await _viewModel.StartSharingAsync();
+
+    private async void OnStopShareClicked(object? sender, RoutedEventArgs e) => await _viewModel.StopSharingAsync();
 
     private async void OnMessageInputKeyDown(object? sender, KeyEventArgs e)
     {

@@ -27,13 +27,35 @@ public sealed record SubscribeAckDto(string ChannelId);
 
 public sealed record TextSendAckDto(string Id, long Seq, long Ts, string? ClientMsgId);
 
-public sealed record TextMessageDto(string ChannelId, string Id, long Seq, string MemberId, string Body, long Ts);
+public sealed record TextMessageDto(string ChannelId, string Id, long Seq, string MemberId, string MemberName, string Body, long Ts);
 
 public sealed record TextHistoryDto(IReadOnlyList<TextMessageDto> Messages);
 
 public sealed record PresenceMemberDto(string MemberId, string Name, string State);
 
 public sealed record PresenceDto(string ChannelId, IReadOnlyList<PresenceMemberDto> Members);
+
+// ---- 屏幕共享 / 媒体信令（docs/PROTOCOL.md §4.2、§5）----
+
+/// <summary>共享源（对应媒体核心 pu_source_info）。</summary>
+public sealed record ScreenSourceDto(string Id, string Title, int Width, int Height, string Kind);
+
+/// <summary>screen.state 里的一路共享。</summary>
+public sealed record ShareDto(string SharerId, string MemberName, ScreenSourceDto Source, string Mode, IReadOnlyList<string> Viewers);
+
+public sealed record ScreenStateDto(string ChannelId, IReadOnlyList<ShareDto> Shares);
+
+public sealed record ScreenAckDto(string ChannelId);
+
+/// <summary>media.signal：payload 是媒体核心的原始信令 JSON，客户端不解析、只透传。</summary>
+public sealed record MediaSignalDto(
+    string ChannelId,
+    string? To,
+    string? From,
+    string? FromName,
+    string Media,
+    string Kind,
+    string Payload);
 
 /// <summary>通用信封。v=1 由协议固定；Payload 原样保留，按消息类型再反序列化。</summary>
 public sealed record EnvelopeDto(int V, string Id, string Type, long Ts, JsonElement? Payload);

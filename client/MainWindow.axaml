@@ -2,9 +2,10 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:vm="using:PartyUp.Client.ViewModels"
         xmlns:models="using:PartyUp.Client.Models"
+        xmlns:services="using:PartyUp.Client.Services"
         x:Class="PartyUp.Client.MainWindow"
         x:DataType="vm:MainViewModel"
-        Width="1140" Height="760"
+        Width="1240" Height="780"
         MinWidth="900" MinHeight="600"
         Background="#FF0E1014"
         Title="PartyUp · 文字频道">
@@ -23,7 +24,7 @@
         <TextBlock Grid.Column="1" Text="{Binding StatusText}"
                    HorizontalAlignment="Center" VerticalAlignment="Center"
                    FontSize="12" Foreground="#FF8E98AB" />
-        <Border Grid.Column="2" Background="#FF15251B" CornerRadius="9" Padding="10,4"
+        <Border x:Name="MediaBadge" Grid.Column="2" Background="#FF15251B" CornerRadius="9" Padding="10,4"
                 VerticalAlignment="Center">
           <TextBlock Text="{Binding MediaStatusText}" FontSize="12" Foreground="#FF8AD9A0" />
         </Border>
@@ -61,8 +62,8 @@
       </Border>
     </Grid>
 
-    <!-- 已登录：频道列表 / 聊天 / 在线成员 -->
-    <Grid Grid.Row="1" IsVisible="{Binding IsLoggedIn}" ColumnDefinitions="250,*,210">
+    <!-- 已登录：频道列表 / 聊天 / 在线成员 + 共享 -->
+    <Grid Grid.Row="1" IsVisible="{Binding IsLoggedIn}" ColumnDefinitions="250,*,290">
       <Border Grid.Column="0" Background="#FF12151C" Padding="10"
               BorderBrush="#FF232936" BorderThickness="0,0,1,0">
         <DockPanel>
@@ -115,22 +116,71 @@
         </Grid>
       </Grid>
 
-      <Border Grid.Column="2" Background="#FF12151C" Padding="12"
+      <Border x:Name="SharePanel" Grid.Column="2" Background="#FF12151C" Padding="12"
               BorderBrush="#FF232936" BorderThickness="1,0,0,0">
-        <DockPanel>
-          <TextBlock DockPanel.Dock="Top" Text="在线成员" FontSize="12"
-                     FontWeight="SemiBold" Foreground="#FF9AA4B8" />
-          <ItemsControl ItemsSource="{Binding Members}" Margin="0,8,0,0">
-            <ItemsControl.ItemTemplate>
-              <DataTemplate x:DataType="models:PresenceMemberDto">
-                <StackPanel Orientation="Horizontal" Spacing="6" Margin="0,3">
-                  <Ellipse Width="7" Height="7" Fill="#FF6FCF87" VerticalAlignment="Center" />
-                  <TextBlock Text="{Binding Name}" FontSize="12" Foreground="#FFD5DAE4" />
-                </StackPanel>
-              </DataTemplate>
-            </ItemsControl.ItemTemplate>
-          </ItemsControl>
-        </DockPanel>
+        <ScrollViewer>
+          <StackPanel Spacing="8">
+            <TextBlock Text="在线成员" FontSize="12"
+                       FontWeight="SemiBold" Foreground="#FF9AA4B8" />
+            <ItemsControl ItemsSource="{Binding Members}">
+              <ItemsControl.ItemTemplate>
+                <DataTemplate x:DataType="models:PresenceMemberDto">
+                  <StackPanel Orientation="Horizontal" Spacing="6" Margin="0,2">
+                    <Ellipse Width="7" Height="7" Fill="#FF6FCF87" VerticalAlignment="Center" />
+                    <TextBlock Text="{Binding Name}" FontSize="12" Foreground="#FFD5DAE4" />
+                  </StackPanel>
+                </DataTemplate>
+              </ItemsControl.ItemTemplate>
+            </ItemsControl>
+
+            <Border Height="1" Background="#FF232936" Margin="0,6" />
+
+            <!-- 屏幕共享：选源 → 开始/停止；观看方显示共享者与远端帧计数 -->
+            <TextBlock Text="共享屏幕" FontSize="12"
+                       FontWeight="SemiBold" Foreground="#FF9AA4B8" />
+            <ComboBox x:Name="SourceCombo" ItemsSource="{Binding Sources}"
+                      SelectedItem="{Binding SelectedSource}"
+                      HorizontalAlignment="Stretch" FontSize="11">
+              <ComboBox.ItemTemplate>
+                <DataTemplate x:DataType="services:MediaSource">
+                  <TextBlock Text="{Binding Title}" FontSize="11" TextTrimming="CharacterEllipsis" />
+                </DataTemplate>
+              </ComboBox.ItemTemplate>
+            </ComboBox>
+            <Grid ColumnDefinitions="*,*">
+              <Button x:Name="StartShareButton" Content="开始共享"
+                      HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+                      Background="#FF2C5BE6" Foreground="White" Padding="0,7" FontSize="12" />
+              <Button x:Name="StopShareButton" Grid.Column="1" Content="停止"
+                      Margin="6,0,0,0" HorizontalAlignment="Stretch"
+                      HorizontalContentAlignment="Center" Padding="0,7" FontSize="12" />
+            </Grid>
+            <TextBlock Text="{Binding ShareStatusText}" FontSize="11"
+                       Foreground="#FF9AA4B8" TextWrapping="Wrap" />
+
+            <Border Height="1" Background="#FF232936" Margin="0,4" />
+
+            <TextBlock Text="{Binding WatchStatusText}" FontSize="11"
+                       Foreground="#FFB7C4DE" TextWrapping="Wrap" />
+            <TextBlock Text="{Binding RemoteFramesText}" FontSize="13"
+                       FontWeight="SemiBold" Foreground="#FF8AD9A0" />
+
+            <ItemsControl ItemsSource="{Binding Shares}">
+              <ItemsControl.ItemTemplate>
+                <DataTemplate x:DataType="models:ShareDto">
+                  <Border Background="#FF1A2130" CornerRadius="8" Padding="8,6" Margin="0,3">
+                    <StackPanel Spacing="2">
+                      <TextBlock Text="{Binding MemberName}" FontSize="12"
+                                 FontWeight="SemiBold" Foreground="#FFD5DAE4" />
+                      <TextBlock Text="{Binding Source.Title}" FontSize="10"
+                                 Foreground="#FF7C8698" TextTrimming="CharacterEllipsis" />
+                    </StackPanel>
+                  </Border>
+                </DataTemplate>
+              </ItemsControl.ItemTemplate>
+            </ItemsControl>
+          </StackPanel>
+        </ScrollViewer>
       </Border>
     </Grid>
 

@@ -34,6 +34,8 @@ internal static class Program
                 case ClientMode.RoleB:
                 case ClientMode.Duo:
                 case ClientMode.Send:
+                case ClientMode.ShareHost:
+                case ClientMode.ShareView:
                     return InteropRole.RunAsync(Options).GetAwaiter().GetResult();
                 default:
                     BuildAvaloniaApp().StartWithClassicDesktopLifetime(args);

@@ -10,8 +10,11 @@ public sealed class MediaEngineException : Exception
 }
 
 /// <summary>
-/// 从 pu_event 里摊平出来的一条事件。只用骨架需要的信息：
-/// 状态迁移（state/previous_state/reason）、错误文本；帧/信令/远端帧只带类型与时间戳。
+/// 从 pu_event 里摊平出来的一条事件。
+///
+/// 状态迁移用 State/PreviousState/Reason；错误用 ErrorMessage；信令用
+/// SignalKind/SignalPayload（payload 在 Map 里就复制，指针不越过本次 poll）；
+/// 远端帧用 Remote* 四个字段。
 /// </summary>
 public sealed record MediaEvent(
     MediaEventKind Kind,
@@ -25,6 +28,22 @@ public sealed record MediaEvent(
     public PuStreamState StateValue => (PuStreamState)State;
 
     public PuStreamState PreviousStateValue => (PuStreamState)PreviousState;
+
+    /// <summary>PU_EVENT_SIGNAL_OUT：offer / answer / candidate。</summary>
+    public PuSignalKind SignalKind { get; init; }
+
+    /// <summary>PU_EVENT_SIGNAL_OUT：媒体核心产出的原始 JSON 信封（已复制成托管字符串）。</summary>
+    public string? SignalPayload { get; init; }
+
+    /// <summary>PU_EVENT_REMOTE_FRAME：该引擎收到的第 N 帧（0 起）。</summary>
+    public ulong RemoteSequence { get; init; }
+
+    /// <summary>PU_EVENT_REMOTE_FRAME：累计收到帧数（= RemoteSequence + 1）。</summary>
+    public uint RemoteFramesReceived { get; init; }
+
+    public uint RemoteWidth { get; init; }
+
+    public uint RemoteHeight { get; init; }
 }
 
 /// <summary>pu_screen_sources 的一项（骨架 UI 只用 id/title 展示，不启动共享）。</summary>
@@ -387,6 +406,23 @@ public sealed class MediaEngine : IDisposable
                     0,
                     0,
                     ReadFixedMessage(ev.Data.Error));
+            case MediaEventKind.SignalOut:
+                return new MediaEvent(kind, ev.Type, ev.TimestampUs, 0, 0, 0, null)
+                {
+                    SignalKind = (PuSignalKind)ev.Data.Signal.Kind,
+                    // 库持有 payload 指针（有效期到 destroy 或再取走 64 条信令），
+                    // 这里立刻复制：事件对象会跨线程/跨定时器存活。
+                    SignalPayload = Marshal.PtrToStringUTF8(
+                        ev.Data.Signal.Payload, (int)ev.Data.Signal.PayloadLen) ?? string.Empty,
+                };
+            case MediaEventKind.RemoteFrame:
+                return new MediaEvent(kind, ev.Type, ev.TimestampUs, 0, 0, 0, null)
+                {
+                    RemoteSequence = ev.Data.Remote.Sequence,
+                    RemoteFramesReceived = ev.Data.Remote.FramesReceived,
+                    RemoteWidth = ev.Data.Remote.Width,
+                    RemoteHeight = ev.Data.Remote.Height,
+                };
             default:
                 return new MediaEvent(kind, ev.Type, ev.TimestampUs, 0, 0, 0, null);
         }

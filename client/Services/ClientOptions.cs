@@ -20,6 +20,12 @@ public enum ClientMode
 
     /// <summary>发一条消息就退出（给 GUI 取证造一条「别人发来的实时消息」）。</summary>
     Send,
+
+    /// <summary>屏幕共享的「共享方」：开一路共享，把信令转给服务端，跑若干秒后退出。</summary>
+    ShareHost,
+
+    /// <summary>屏幕共享的「观看方」：收到 offer 后应答，统计远端帧并打印结果。</summary>
+    ShareView,
 }
 
 /// <summary>
@@ -50,6 +56,15 @@ public sealed record ClientOptions
 
     /// <summary>--role send 要发送的正文。</summary>
     public string? Text { get; init; }
+
+    /// <summary>屏幕共享测试用的源 id（默认内置合成源，不碰真实桌面）。</summary>
+    public string ShareSourceId { get; init; } = "synthetic";
+
+    /// <summary>屏幕共享测试跑的秒数。</summary>
+    public int ShareSeconds { get; init; } = 12;
+
+    /// <summary>--share host 时不再拉起观看方子进程（用于配合已经打开的 GUI 观看）。</summary>
+    public bool ShareNoChild { get; init; }
 
     public static ClientOptions Parse(string[] args)
     {
@@ -100,6 +115,26 @@ public sealed record ClientOptions
                     break;
                 case "--text":
                     options = options with { Text = TakeValue(args, ref i, arg) };
+                    break;
+                case "--share":
+                    var shareRole = TakeValue(args, ref i, arg).ToLowerInvariant();
+                    options = options with
+                    {
+                        Mode = shareRole switch
+                        {
+                            "view" or "viewer" => ClientMode.ShareView,
+                            _ => ClientMode.ShareHost,
+                        },
+                    };
+                    break;
+                case "--share-source":
+                    options = options with { ShareSourceId = TakeValue(args, ref i, arg) };
+                    break;
+                case "--share-seconds":
+                    options = options with { ShareSeconds = int.Parse(TakeValue(args, ref i, arg)) };
+                    break;
+                case "--share-no-child":
+                    options = options with { ShareNoChild = true };
                     break;
                 default:
                     // Avalonia 自己会忽略未知参数；这里也静默跳过，避免破坏 GUI 启动。

@@ -31,6 +31,14 @@ public enum MediaEventKind
     RemoteFrame = 5,
 }
 
+/// <summary>pu_signal_kind：PU_EVENT_SIGNAL_OUT 的信令种类，与信封里的 type 一一对应。</summary>
+public enum PuSignalKind
+{
+    Offer = 1,
+    Answer = 2,
+    Candidate = 3,
+}
+
 /// <summary>pu_stream_state。</summary>
 public enum PuStreamState
 {

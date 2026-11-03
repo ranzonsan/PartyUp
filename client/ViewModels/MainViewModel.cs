@@ -25,6 +25,7 @@ public sealed partial class MainViewModel : ObservableObject
     private readonly HashSet<string> _messageIds = new(StringComparer.Ordinal);
     private PartyUpConnection? _connection;
     private MediaEngine? _media;
+    private ShareSession? _share;
     private string? _subscribedChannelId;
     private bool _busy;
     private bool _openInFlight;
@@ -42,6 +43,12 @@ public sealed partial class MainViewModel : ObservableObject
     public ObservableCollection<MessageItem> Messages { get; } = new();
 
     public ObservableCollection<PresenceMemberDto> Members { get; } = new();
+
+    /// <summary>可共享的源（本机显示器 + 内置合成源），来自 pu_screen_sources。</summary>
+    public ObservableCollection<MediaSource> Sources { get; } = new();
+
+    /// <summary>当前频道里正在进行的共享（screen.state 推送）。</summary>
+    public ObservableCollection<ShareDto> Shares { get; } = new();
 
     public string SelfName { get; private set; } = string.Empty;
 
@@ -78,6 +85,22 @@ public sealed partial class MainViewModel : ObservableObject
     [ObservableProperty]
     private string _footerText = string.Empty;
 
+    /// <summary>共享区选中的源。</summary>
+    [ObservableProperty]
+    private MediaSource? _selectedSource;
+
+    [ObservableProperty]
+    private bool _isSharing;
+
+    [ObservableProperty]
+    private string _shareStatusText = "共享：未开始";
+
+    [ObservableProperty]
+    private string _watchStatusText = "观看：—";
+
+    [ObservableProperty]
+    private string _remoteFramesText = "远端帧：0";
+
     // ------------------------------------------------------------------
     // 媒体引擎
     // ------------------------------------------------------------------
@@ -97,6 +120,7 @@ public sealed partial class MainViewModel : ObservableObject
             _media.Create("partyup-ui");
             MediaStatusText = "媒体引擎：已就绪（ABI v2，18/18 导出）";
             AppLog.Pass($"media: pu_engine_create ok, dll={Path.GetFileName(_media.LibraryPath)}, exports=18/18");
+            LoadSources();
         }
         catch (Exception ex)
         {
@@ -116,6 +140,8 @@ public sealed partial class MainViewModel : ObservableObject
         {
             while (_media.Poll(0) is { } ev)
             {
+                // 共享会话先处理：信令转发 / 远端帧计数都在它里面。
+                _share?.HandleMediaEvent(ev);
                 switch (ev.Kind)
                 {
                     case MediaEventKind.State:
@@ -290,6 +316,15 @@ public sealed partial class MainViewModel : ObservableObject
         _openInFlight = true;
         try
         {
+            // 切频道：旧共享会话先收尾（它的后台线程与事件订阅都绑在旧频道上）。
+            if (_share is not null)
+            {
+                await _share.DisposeAsync();
+                _share = null;
+                Shares.Clear();
+                IsSharing = false;
+                ShareStatusText = "共享：未开始";
+            }
             if (_subscribedChannelId is not null && _subscribedChannelId != channel.Id)
             {
                 await _connection.UnsubscribeAsync(_subscribedChannelId);
@@ -297,6 +332,13 @@ public sealed partial class MainViewModel : ObservableObject
             await _connection.SubscribeAsync(channel.Id);
             _subscribedChannelId = channel.Id;
             SelectedChannel = channel;
+
+            // 这个频道的共享会话：负责信令转发与远端帧统计。
+            if (_media is { IsCreated: true })
+            {
+                _share = new ShareSession(_media, _connection, channel.Id);
+                _share.Changed += OnShareChanged;
+            }
 
             Messages.Clear();
             Members.Clear();
@@ -389,6 +431,106 @@ public sealed partial class MainViewModel : ObservableObject
         });
     }
 
+    // ------------------------------------------------------------------
+    // 屏幕共享（docs/PROTOCOL.md §4.2 / §5）
+    // ------------------------------------------------------------------
+
+    /// <summary>枚举可共享的源（本机显示器 + 内置合成源）。</summary>
+    private void LoadSources()
+    {
+        if (_media is not { IsCreated: true })
+        {
+            return;
+        }
+        try
+        {
+            Sources.Clear();
+            foreach (var source in _media.EnumerateSources())
+            {
+                Sources.Add(source);
+            }
+            SelectedSource ??= Sources.FirstOrDefault();
+            AppLog.Pass($"share: sources = {Sources.Count} ({string.Join(", ", Sources.Select(s => s.Title))})");
+        }
+        catch (Exception ex)
+        {
+            AppLog.Warn("share: enumerate sources failed: " + ex.Message);
+        }
+    }
+
+    public async Task StartSharingAsync()
+    {
+        if (_share is null)
+        {
+            ShareStatusText = "共享：请先进入频道";
+            return;
+        }
+        if (SelectedSource is null)
+        {
+            ShareStatusText = "共享：请选择要共享的屏幕";
+            return;
+        }
+        try
+        {
+            ShareStatusText = $"共享：正在启动「{SelectedSource.Title}」…";
+            await _share.StartSharingAsync(SelectedSource);
+            IsSharing = true;
+            ShareStatusText = $"共享中：{SelectedSource.Title}（{SelectedSource.Width}x{SelectedSource.Height}）";
+        }
+        catch (Exception ex)
+        {
+            IsSharing = false;
+            ShareStatusText = "共享失败：" + ex.Message;
+            AppLog.Fail("gui: start sharing failed: " + ex.Message);
+        }
+    }
+
+    public async Task StopSharingAsync()
+    {
+        if (_share is null || !IsSharing)
+        {
+            return;
+        }
+        try
+        {
+            await _share.StopSharingAsync();
+            IsSharing = false;
+            ShareStatusText = "共享：已停止";
+        }
+        catch (Exception ex)
+        {
+            ShareStatusText = "停止共享失败：" + ex.Message;
+            AppLog.Fail("gui: stop sharing failed: " + ex.Message);
+        }
+    }
+
+    private void OnShareChanged()
+    {
+        Dispatcher.UIThread.Post(() =>
+        {
+            if (_share is not { } share)
+            {
+                return;
+            }
+            Shares.Clear();
+            foreach (var item in share.Shares)
+            {
+                Shares.Add(item);
+            }
+            WatchStatusText = share.IsWatching ? $"观看：{share.WatchingName} 正在共享" : "观看：—";
+            RemoteFramesText = $"远端帧：{share.RemoteFrames}" +
+                               (share.RemoteWidth > 0 ? $"（{share.RemoteWidth}x{share.RemoteHeight}）" : string.Empty);
+            if (share.LastError is { } error)
+            {
+                ShareStatusText = "共享错误：" + error;
+            }
+            if (share.IsSharing && !IsSharing)
+            {
+                IsSharing = true;
+            }
+        });
+    }
+
     private void AppendMessage(TextMessageDto message)
     {
         // 同一条消息可能来自历史加载 + 实时 text.new 两条路径，按消息 id 去重。
@@ -396,10 +538,13 @@ public sealed partial class MainViewModel : ObservableObject
         {
             return;
         }
-        // presence 会带来成员名；没见过的人退化成 id 前缀，避免 UI 里出现空白作者。
-        var author = _memberNames.TryGetValue(message.MemberId, out var name)
-            ? name
-            : message.MemberId.Length >= 6 ? message.MemberId[..6] : message.MemberId;
+        // 作者名优先用服务端随消息下发的 member_name（历史里离线成员也能显示名字）；
+        // 再退化到 presence 见过的名字，最后才用 id 前缀兜底。
+        var author = !string.IsNullOrWhiteSpace(message.MemberName)
+            ? message.MemberName
+            : _memberNames.TryGetValue(message.MemberId, out var name)
+                ? name
+                : message.MemberId.Length >= 6 ? message.MemberId[..6] : message.MemberId;
         var time = DateTimeOffset.FromUnixTimeMilliseconds(message.Ts).ToLocalTime().ToString("HH:mm");
         Messages.Add(new MessageItem(author, message.Body, time, message.MemberId == _connection?.Member.Id));
         AppLog.Pass($"gui: message seq={message.Seq} author={author} body=\"{message.Body}\"");

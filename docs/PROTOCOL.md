@@ -22,7 +22,9 @@ WebSocket 承载全部控制消息，一条连接一个成员。
   "payload": { "code": "FORBIDDEN", "message": "not a member of this channel" } }
 ```
 
-错误码（第一批）：`UNAUTHENTICATED` `FORBIDDEN` `NOT_FOUND` `CONFLICT` `RATE_LIMITED` `INTERNAL`。
+错误码（第一批）：`UNAUTHENTICATED` `FORBIDDEN` `NOT_FOUND` `CONFLICT` `RATE_LIMITED` `INTERNAL` `INVALID_ARGUMENT`。
+
+`INVALID_ARGUMENT` 是 2026-11-02 补入的：载荷形状非法、字段缺失/越界、消息类型未知都归它，HTTP 400 与 WS 参数错误共用同一个稳定名字。
 
 ## 1. 握手与认证
 
@@ -41,21 +43,38 @@ HTTP 侧：
 
 Token 是不透明随机串（32 字节，base64url），存在 SQLite 里、可撤销——不用 JWT，因为需要"踢下线"能力。
 
+HTTP 请求/响应体形状（2026-11-02 落地，此前文档未定义）：
+
+| 路径 | 请求体 | 成功响应体 |
+| --- | --- | --- |
+| `POST /api/bootstrap` | `{ "token", "username", "password" }` | `{ "member": { id, name, admin }, "token" }` |
+| `POST /api/login` | `{ "username", "password" }` | 同上 |
+| `POST /api/invite/{code}` | `{ "username", "password" }`（邀请码在路径里） | 同上 |
+| `GET /api/me` | — | `{ "member": { id, name, admin } }` |
+
+失败统一为 `{ "code": "<错误码>", "message": "<人类可读>" }`，状态码：400 参数非法（`INVALID_ARGUMENT`）、401 未认证（`UNAUTHENTICATED`）、403 禁止（`FORBIDDEN`）、404 不存在（`NOT_FOUND`）、409 冲突（`CONFLICT`）、500 内部（`INTERNAL`）。
+
 ## 2. 频道
 
 - `channel.list` → `channel.list.ok { channels: [{ id, name, voice: [...], shares: [...] }] }`
-- `channel.subscribe { channel_id }` → 之后该频道的 `text.new` / `presence` / `media.*` 推给本连接
+- `channel.create { name }` → `channel.create.ok { channel: { id, name, voice: [], shares: [] } }`
+  —— 2026-11-02 补入（原文档只有 list/subscribe/unsubscribe，没有创建入口）。任何已认证成员都可创建；
+  `name` 为 1–32 个可见字符，**全局唯一**，撞名回 `CONFLICT`。创建后仍需 `channel.subscribe` 才会收到推送。
+  `voice` / `shares` 在 v1 恒为 `[]`（空数组，**不是 `null`**）；共享状态以 `screen.state` 推送为准。
+- `channel.subscribe { channel_id }` → 之后该频道的 `text.new` / `presence` / `screen.state` / `media.signal` 推给本连接
 - `channel.unsubscribe { channel_id }`
 
 订阅是显式的：不订阅就不推送，避免大服务器把无关频道的消息刷给所有人。
 
 ## 3. 文字
 
-- `text.send { channel_id, client_msg_id, body }` → `text.send.ok { id, seq, ts }`
-- 广播 `text.new { channel_id, id, seq, member_id, body, ts }`
-- `text.history { channel_id, before_seq, limit }` → `text.history.ok { messages: [...] }`
+- `text.send { channel_id, client_msg_id, body }` → `text.send.ok { id, seq, ts, client_msg_id }`
+- 广播 `text.new { channel_id, id, seq, member_id, member_name, body, ts }`
+- `text.history { channel_id, before_seq, limit }` → `text.history.ok { messages: [...] }`（元素与 `text.new` 同形）
 
-`seq` 是**每频道单调递增的整数**，由服务端分配；客户端按 `seq` 排序，不依赖时间戳。`client_msg_id` 用于本地乐观显示与去重。
+`seq` 是**每频道单调递增的整数**，由服务端分配；客户端按 `seq` 排序，不依赖时间戳。`client_msg_id` 用于本地乐观显示与去重（服务端在 `.ok` 里原样带回）。
+
+`member_name` 是 2026-11-02 补入的：原来只有 `member_id`，历史消息里的离线成员无法显示名字（客户端只能退化到 id 前缀）。服务端在 `text.new` 与 `text.history` 里都填；`member_id` 保留，用于身份关联。
 
 ## 4. 语音
 
@@ -77,22 +96,43 @@ Token 是不透明随机串（32 字节，base64url），存在 SQLite 里、可
 
 ### 4.2 直连
 
-服务端只做定向投递，不改 SDP 内容：
+服务端只做中转与定向投递，不解析也不改写 SDP：
 
-- `p2p.start { channel_id, media: "voice", peers: [member_id, ...] }` —— 服务端告诉每个成员该连谁
-- `p2p.signal { to, channel_id, media, kind, payload }`，`kind ∈ { offer, answer, ice }`
-- 收到方原样回 `p2p.signal` 给对方
+- `media.signal { channel_id, to?, media, kind, payload }`
+  - `media ∈ { screen, voice }`；`kind ∈ { offer, answer, candidate }`
+  - `payload` 是**媒体核心产出的原始信令信封字符串**（`{"type":"offer","sdp":"…"}` /
+    `{"type":"answer","sdp":"…"}` / `{"type":"candidate","mid":"0","mline":0,"candidate":"…"}`）。
+    服务端当不透明字符串转发，长度上限 64 KiB。
+  - `to` 省略 = 广播给频道内其它订阅者（offer 用这条）；`to` 指定成员 = 定向投递
+    （answer / candidate 用这条，观看者只回给共享方，不打扰其他观看者）。
+- 服务端下发 `media.signal { channel_id, from, from_name, media, kind, payload }`，
+  接收方据此决定 answer/candidate 发给谁。
+
+2026-11-02 起 `media.signal` 就是屏幕共享直连的实际通道。原设计稿里的
+`p2p.start` / `p2p.signal { to, channel_id, media, kind, payload }`（`kind ∈ { offer, answer, ice }`）
+调整为：`kind` 与媒体核心 `pu_signal_event.kind` 对齐（`ice` → `candidate`），
+`p2p.start` 暂不实现（观看方收到 offer 即自动应答）。
 
 服务端角色：成员准入、消息定向、超时清理。它不解析也不改写 SDP——一旦开始 munge，直连就变成了"半个 SFU"。
 
 ## 5. 屏幕共享
 
-- `screen.start { channel_id, source: { kind: "screen" | "window", id, title }, mode }`
-- `screen.stop { channel_id }`
-- `screen.watch { channel_id, sharer_id }` / `screen.unwatch { channel_id, sharer_id }`
-- 广播 `screen.state { channel_id, shares: [{ sharer_id, source, mode, viewers: [member_id] }] }`
+- `screen.start { channel_id, source: { id, title, width, height, kind }, mode? }`
+  → `screen.start.ok { channel_id }`，随后服务端广播 `screen.state`
+  - `source.kind ∈ { screen, window, synthetic }`；`id` 是媒体核心给的源 id
+    （显示器为 HMONITOR 的十进制串），`width/height` 是源分辨率
+  - `mode ∈ { direct, relay }`，缺省 `direct`；当前只实现 direct（P2P），relay 留给 SFU
+- `screen.stop { channel_id }` → `screen.stop.ok { channel_id }`，广播 `screen.state`
+- 广播 `screen.state { channel_id, shares: [{ sharer_id, member_name, source, mode, viewers: [member_id] }] }`
+  —— 没有共享时 `shares` 是 `[]`，不推 `null`
 
-每个观看者单独 `watch`，因为直连要为每个观看者单独建连接、单独编码——协议层面就把这个事实暴露出来，UI 才能如实显示"正在为 N 人分别编码"。
+信令走 §4.2 的 `media.signal`：共享方 `screen.start` 后媒体核心产出 offer，经
+`media.signal kind=offer` 广播；观看方把 `payload` 原样喂给自己的媒体核心，应答的
+answer 经 `media.signal kind=answer to=<sharer_id>` 回给共享方；candidate 同理。
+
+`screen.watch` / `screen.unwatch`（每个观看者显式 opt-in，用于"为 N 人分别编码"的如实展示）
+在 v1 暂不实现：媒体核心的 `pu_screen_watch` 目前返回 `PU_NOT_IMPLEMENTED`，观看方收到
+offer 即自动协商。等 SFU 中继与逐观看者编码落地后再补这两条。
 
 ## 6. 路径事件
 
@@ -108,6 +148,8 @@ Token 是不透明随机串（32 字节，base64url），存在 SQLite 里、可
 ## 7. 在线状态
 
 `presence { channel_id, members: [{ member_id, name, state }] }`，`state ∈ { online, voice, sharing }`。
+
+v1 只发 `online`：语音未实现，`voice` / `sharing` 两个状态等语音落地后再启用；「谁在共享」由 `screen.state` 单独推送，不要从 presence 推断。
 
 按订阅推送，变化即发，同一频道 200ms 内合并。
 

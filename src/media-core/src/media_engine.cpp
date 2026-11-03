@@ -2926,7 +2926,18 @@ int MediaEngine::VoiceLeave() {
   });
   voice_joined_ = false;
   voice_channel_id_.clear();
-  Log(3, "voice: left");
+  // v2.9：断线重连 / 换会话时，服务端会**新建一个 PeerConnection**（新 DTLS/ICE 凭据）。
+  // 旧 PC 如果不拆，下一个 offer 会被 SignalIn 判成「同一会话的重协商」，两套 DTLS
+  // 会话拼在一起 → ICE 能 connected 但 SRTP 双向不通（客户端 tracks=0、服务端 publishers=0）。
+  // 所以没在跑屏幕共享时把 PC 一并拆掉，让下次 VoiceJoin 从干净会话开始。
+  // 正在共享时不动 PC（视频轨还在用），由客户端按
+  // pu_screen_stop → pu_voice_leave → 重连 → join → 重新 start 的顺序处理。
+  if (!running_) {
+    ReleaseStreamObjects();
+    Log(3, "voice: left (pc released — next join creates a fresh session)");
+  } else {
+    Log(3, "voice: left (screen sharing still active, pc kept)");
+  }
   return PU_OK;
 }
 

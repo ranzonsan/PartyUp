@@ -416,6 +416,8 @@ int main(int argc, char** argv) {
   int connect_timeout_ms = 5000;
   int jitter_ms = 0;
   std::string order = "viewer-first";
+  // 默认沿用合成源；传 --source 可跑真实显示器，覆盖「停止→再开始」的真实路径。
+  std::string source = "synthetic";
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -435,6 +437,8 @@ int main(int argc, char** argv) {
       std::snprintf(g_log_dir, sizeof(g_log_dir), "%s", next("--logs"));
     } else if (arg == "--min-frames") {
       min_frames = std::atoi(next("--min-frames"));
+    } else if (arg == "--source") {
+      source = next("--source");
     } else if (arg == "--connect-timeout-ms") {
       connect_timeout_ms = std::atoi(next("--connect-timeout-ms"));
     } else if (arg == "--jitter-ms") {
@@ -507,7 +511,7 @@ int main(int argc, char** argv) {
     }
     Phase("engines created");
 
-    const int start_rc = pu_screen_start(a, "synthetic");
+    const int start_rc = pu_screen_start(a, source.c_str());
     if (start_rc != PU_OK) {
       LogLine("FAIL: pu_screen_start(A) rc=%d (%s)", start_rc, pu_last_error(a));
       pu_engine_destroy(a);

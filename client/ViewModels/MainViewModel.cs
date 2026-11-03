@@ -37,7 +37,16 @@ public sealed partial class MainViewModel : ObservableObject
     {
         // --server 同时用于登录框初值与 GUI 自动登录：同一个参数，两处不各写一份默认值。
         ServerUrl = Program.Options.Server;
-        TryInitMedia();
+        if (Program.Options.NoMedia)
+        {
+            // 仅用于内存归因测量：不 LoadLibrary、不 pu_engine_create，其他功能照常。
+            MediaStatusText = "媒体引擎：已禁用（--no-media，仅测量用）";
+            AppLog.Info("media: --no-media，跳过 DLL 加载与引擎创建");
+        }
+        else
+        {
+            TryInitMedia();
+        }
         FooterText = "就绪。填服务器地址后登录，或用邀请码注册；左侧「新建频道」建第一个频道。";
     }
 

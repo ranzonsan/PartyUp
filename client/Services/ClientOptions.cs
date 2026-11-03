@@ -54,6 +54,12 @@ public sealed record ClientOptions
     /// <summary>--duo 模式下 B 子进程的 token。</summary>
     public string? TokenB { get; init; }
 
+    /// <summary>
+    /// 只用于内存归因测量：跳过媒体核心的加载与引擎创建（不再 <c>pu_engine_create</c>），
+    /// 其他功能（连接/文字/presence）照常。默认 false = 正常加载。
+    /// </summary>
+    public bool NoMedia { get; init; }
+
     /// <summary>测试用频道名（不存在时由 A 创建）。</summary>
     public string Channel { get; init; } = "interop";
 
@@ -112,6 +118,9 @@ public sealed record ClientOptions
                     break;
                 case "--token-b":
                     options = options with { TokenB = TakeValue(args, ref i, arg) };
+                    break;
+                case "--no-media":
+                    options = options with { NoMedia = true };
                     break;
                 case "--channel":
                     options = options with { Channel = TakeValue(args, ref i, arg) };

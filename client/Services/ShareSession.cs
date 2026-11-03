@@ -150,7 +150,7 @@ public sealed class ShareSession : IAsyncDisposable
 
     /// <summary>屏幕共享策略展示文本。</summary>
     public string ScreenModeText => _screenMode == "relay"
-        ? "中继（服务端 SFU 视频通道，暂未实现）"
+        ? "中继（服务端 SFU 转发）"
         : "直连（P2P）";
 
     /// <summary>语音模式展示文本（服务端策略值；客户端不参与选择）。</summary>

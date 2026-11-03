@@ -87,8 +87,20 @@
         </DockPanel>
       </Border>
 
-      <Grid Grid.Column="1" RowDefinitions="*,Auto" Margin="14">
-        <Border Grid.Row="0" Background="#FF14171F" CornerRadius="12" Padding="12">
+      <Grid Grid.Column="1" RowDefinitions="Auto,*,Auto" Margin="14">
+        <!-- 远端画面区：收看对方共享时显示。由 PU_EVENT_REMOTE_FRAME 驱动逐帧写入
+             复用的 WriteableBitmap（见 RemoteScreenPresenter），不是定时器打帧。 -->
+        <Border x:Name="RemoteScreenHost" Grid.Row="0" Background="#FF0B0D12" CornerRadius="12"
+                IsVisible="{Binding IsRemoteScreenVisible}" ClipToBounds="True" Margin="0,0,0,10">
+          <Grid>
+            <Image x:Name="RemoteScreen" Height="430" Stretch="Uniform" />
+            <Border HorizontalAlignment="Right" VerticalAlignment="Bottom" Margin="8"
+                    Background="#99202636" CornerRadius="6" Padding="7,3">
+              <TextBlock Text="{Binding RemoteFpsText}" FontSize="11" Foreground="#FFCFE0FF" />
+            </Border>
+          </Grid>
+        </Border>
+        <Border Grid.Row="1" Background="#FF14171F" CornerRadius="12" Padding="12">
           <ScrollViewer x:Name="MessageScroll">
             <ItemsControl ItemsSource="{Binding Messages}">
               <ItemsControl.ItemTemplate>
@@ -108,7 +120,7 @@
             </ItemsControl>
           </ScrollViewer>
         </Border>
-        <Grid Grid.Row="1" ColumnDefinitions="*,Auto" Margin="0,10,0,0">
+        <Grid Grid.Row="2" ColumnDefinitions="*,Auto" Margin="0,10,0,0">
           <TextBox x:Name="MessageInput" Text="{Binding MessageInput}"
                    PlaceholderText="输入消息，回车发送" FontSize="13" />
           <Button x:Name="SendButton" Grid.Column="1" Content="发送" Margin="8,0,0,0"

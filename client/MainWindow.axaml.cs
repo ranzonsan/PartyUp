@@ -10,7 +10,7 @@ namespace PartyUp.Client;
 public partial class MainWindow : Window
 {
     private readonly MainViewModel _viewModel = null!;
-    private readonly DispatcherTimer _mediaTimer = null!;
+    private readonly RemoteScreenPresenter _remoteScreen = null!;
 
     /// <summary>XAML 加载器要求的无参构造（设计器/热重载用）。</summary>
     public MainWindow() : this(new MainViewModel())
@@ -36,10 +36,11 @@ public partial class MainWindow : Window
         ChannelList.SelectionChanged += OnChannelSelectionChanged;
         _viewModel.Messages.CollectionChanged += (_, _) => MessageScroll.ScrollToEnd();
 
-        // 媒体事件是轮询式的（pu_poll_event）；用 100ms 的 UI 定时器 drain，开销可忽略。
-        _mediaTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
-        _mediaTimer.Tick += (_, _) => _viewModel.PollMedia();
-        _mediaTimer.Start();
+        // 远端画面：由解码回调驱动渲染（后台事件泵 + 复用 WriteableBitmap），
+        // 不再用 UI 定时器轮询——Timer 打帧会直接把帧率压到轮询频率（Spike 1 结论）。
+        _remoteScreen = new RemoteScreenPresenter(RemoteScreen);
+        _viewModel.AttachRemoteScreen(_remoteScreen);
+        _viewModel.StartMediaPump();
 
         Opened += OnOpened;
         Closed += OnClosed;
@@ -66,7 +67,7 @@ public partial class MainWindow : Window
                     $"title=\"{_viewModel.SelectedSource?.Title}\" size={StartShareButton.Bounds}");
     }
 
-    private void OnClosed(object? sender, EventArgs e) => _mediaTimer.Stop();
+    private void OnClosed(object? sender, EventArgs e) => _viewModel.StopMediaPump();
 
     private async void OnLoginClicked(object? sender, RoutedEventArgs e) => await _viewModel.LoginAsync();
 

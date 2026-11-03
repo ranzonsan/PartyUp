@@ -288,12 +288,31 @@ if ($Run) {
   Write-Host "== media_signaling_smoke exit=0"
 
   Write-Host "== [3/3] screen capture smoke (real WGC desktop, 10 s)"
+  # pu_frame_acquire 首帧（远端 BGRA）→ WIC PNG，直接写进仓库 out/。
+  # 若 UNC 写入被拒，exe 会回落到 $StageDir\frame-acquire.png，这里再拷回来。
+  $repoCaptureOut = Join-Path $Root 'spikes\media-dll-smoke\out'
+  New-Item -ItemType Directory -Force -Path $repoCaptureOut | Out-Null
+  $repoFramePng = Join-Path $repoCaptureOut 'frame-acquire.png'
+  Remove-Item -Force -ErrorAction SilentlyContinue $repoFramePng
   Push-Location $StageDir
   try {
-    & (Join-Path $StageDir 'screen_capture_smoke.exe') --seconds 10
+    & (Join-Path $StageDir 'screen_capture_smoke.exe') --seconds 10 --frame-png $repoFramePng
     $captureExitCode = $LASTEXITCODE
   } finally {
     Pop-Location
+  }
+  if (-not (Test-Path $repoFramePng)) {
+    $stageFramePng = Join-Path $StageDir 'frame-acquire.png'
+    if (Test-Path $stageFramePng) {
+      Copy-Item -Force $stageFramePng $repoFramePng
+      Write-Host "== frame png copied from stage fallback: $repoFramePng"
+    }
+  }
+  if (Test-Path $repoFramePng) {
+    $framePngInfo = Get-Item $repoFramePng
+    Write-Host ("== frame png: {0} ({1:N0} bytes)" -f $repoFramePng, $framePngInfo.Length)
+  } else {
+    Write-Host "== WARN: frame-acquire.png was not produced"
   }
   if ($captureExitCode -ne 0) { throw "screen_capture_smoke failed: exit=$captureExitCode" }
   Write-Host "== screen_capture_smoke exit=0"

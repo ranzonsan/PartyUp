@@ -17,8 +17,11 @@
 //   6. 全程没有 PU_EVENT_ERROR。
 //
 // 用法：screen_capture_smoke.exe [--seconds N] [--source <id>] [--png <path>]
+//                                  [--frame-png <path>]
 //   --source 省略时自动选主屏（列表里第一块 kind=0）。
-//   --png 省略时把首帧写到当前目录的 capture-first-frame.png。
+//   --png 省略时把首帧写到当前目录的 capture-first-frame.png（库内部写）。
+//   --frame-png 是 pu_frame_acquire 拿到的第一帧 BGRA 经 WIC 编出来的 PNG，
+//   省略时写当前目录的 frame-acquire.png；写失败会回落到当前目录再报路径。
 //
 // 注意：本 exe 只会从 partyup_media.dll 同目录加载，必须放在 Windows 本地盘运行。
 #include <algorithm>
@@ -30,10 +33,17 @@
 #include <vector>
 
 #include <windows.h>
-#include <psapi.h>  // GetProcessMemoryInfo：pu_frame_acquire 300 帧的泄漏检查
+#include <objbase.h>     // CoInitializeEx / CoCreateInstance：WIC 需要 COM
+#include <wincodec.h>    // 首帧 BGRA → PNG 直写（本机没有 ffmpeg/ImageMagick）
+#include <wrl/client.h>  // ComPtr
+#include <psapi.h>       // GetProcessMemoryInfo：pu_frame_acquire 300 帧的泄漏检查
 #pragma comment(lib, "psapi.lib")
+#pragma comment(lib, "windowscodecs.lib")
+#pragma comment(lib, "ole32.lib")
 
 #include "partyup_media.h"
+
+using Microsoft::WRL::ComPtr;
 
 namespace {
 
@@ -77,10 +87,112 @@ unsigned ProcessorCount() {
   return info.dwNumberOfProcessors != 0 ? info.dwNumberOfProcessors : 1;
 }
 
+// 定义在后面（Options 之后），这里先声明：首帧 PNG 的日志要打绝对路径。
+std::string AbsolutePath(const std::string& path);
+
+// ---------------------------------------------------------------------------
+// 首帧 BGRA → PNG（WIC）
+//
+// 为什么要在这里自己做：本机没有 ffmpeg / ImageMagick，WSL 里也没有 PIL，而
+// WSL 不能写 /mnt/c、Windows 侧的 System.Drawing.Save() 又不接受 UNC 输出
+// （写出 0 字节）。所以只能在 smoke 内部用 WIC 编码。链路照抄
+// src/media-core/src/wgc_screen.cpp 的 MaybeDumpPng→WritePng：工厂 →
+// CreateStream → CreateEncoder(PNG) → CreateNewFrame → WritePixels(BGRA)。
+//
+// **步长用 frame.stride，不是 width*4**：库已如实填行步长，图省事写 width*4
+// 一旦将来真出现 padding 就会把每行错开，输出花屏。
+// ---------------------------------------------------------------------------
+
+std::wstring Widen(const std::string& utf8) {
+  if (utf8.empty()) return std::wstring();
+  const int needed = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, nullptr, 0);
+  if (needed <= 0) return std::wstring();
+  std::wstring wide(static_cast<size_t>(needed), L'\0');
+  const int written = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, wide.data(), needed);
+  if (written <= 1) return std::wstring();
+  wide.resize(static_cast<size_t>(written - 1));
+  return wide;
+}
+
+std::string HrText(HRESULT hr) {
+  char buffer[48] = {};
+  std::snprintf(buffer, sizeof(buffer), "HRESULT 0x%08lX", static_cast<unsigned long>(hr));
+  return buffer;
+}
+
+bool WritePngBgra(const std::string& path, const uint8_t* bgra, UINT width, UINT height,
+                  UINT stride, std::string* error) {
+  const std::wstring wide_path = Widen(path);
+  if (wide_path.empty()) {
+    if (error != nullptr) *error = "PNG path is not valid UTF-8";
+    return false;
+  }
+
+  ComPtr<IWICImagingFactory> factory;
+  HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(&factory));
+  ComPtr<IWICStream> stream;
+  if (SUCCEEDED(hr)) hr = factory->CreateStream(&stream);
+  if (SUCCEEDED(hr)) hr = stream->InitializeFromFilename(wide_path.c_str(), GENERIC_WRITE);
+  ComPtr<IWICBitmapEncoder> encoder;
+  if (SUCCEEDED(hr)) hr = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder);
+  if (SUCCEEDED(hr)) hr = encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache);
+  ComPtr<IWICBitmapFrameEncode> frame;
+  if (SUCCEEDED(hr)) hr = encoder->CreateNewFrame(&frame, nullptr);
+  if (SUCCEEDED(hr)) hr = frame->Initialize(nullptr);
+  if (SUCCEEDED(hr)) hr = frame->SetSize(width, height);
+  WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
+  if (SUCCEEDED(hr)) hr = frame->SetPixelFormat(&format);
+  if (SUCCEEDED(hr)) {
+    hr = frame->WritePixels(height, stride, stride * height, const_cast<BYTE*>(bgra));
+  }
+  if (SUCCEEDED(hr)) hr = frame->Commit();
+  if (SUCCEEDED(hr)) hr = encoder->Commit();
+  if (FAILED(hr)) {
+    if (error != nullptr) *error = "WIC PNG write failed: " + HrText(hr);
+    return false;
+  }
+  return true;
+}
+
+// 首帧 PNG 的目标路径由 --frame-png 决定（脚本会传仓库里的 out/ 绝对路径），
+// 空字符串表示不写。只写一次：谁先拿到第一帧就谁写，之后一律跳过。
+std::string g_frame_png_path;
+bool g_frame_png_done = false;
+
+void MaybeDumpFramePng(const pu_frame& frame) {
+  if (g_frame_png_done || g_frame_png_path.empty()) return;
+  if (frame.pixels == nullptr || frame.width == 0 || frame.height == 0) return;
+  g_frame_png_done = true;
+
+  const uint8_t* base = static_cast<const uint8_t*>(frame.pixels);
+  std::string error;
+  if (WritePngBgra(g_frame_png_path, base, frame.width, frame.height, frame.stride, &error)) {
+    std::printf("frame png        : %s (%ux%u stride=%u)\n",
+                AbsolutePath(g_frame_png_path).c_str(), frame.width, frame.height, frame.stride);
+    return;
+  }
+  std::printf("WARN: frame PNG write to %s failed: %s\n",
+              AbsolutePath(g_frame_png_path).c_str(), error.c_str());
+  // 回落：写当前目录（Windows 本地盘），脚本再从那里拷回仓库，免得一次 UNC
+  // 写失败就把整张图丢了。
+  const std::string fallback = AbsolutePath("frame-acquire.png");
+  std::string fallback_error;
+  if (WritePngBgra(fallback, base, frame.width, frame.height, frame.stride, &fallback_error)) {
+    std::printf("frame png (fallback): %s (%ux%u stride=%u)\n", fallback.c_str(), frame.width,
+                frame.height, frame.stride);
+  } else {
+    std::printf("FAIL: fallback frame PNG write to %s failed: %s\n", fallback.c_str(),
+                fallback_error.c_str());
+  }
+}
+
 struct Options {
   int seconds = 10;
   std::string source_id;  // 空 = 自动选主屏
   std::string png_path = "capture-first-frame.png";
+  // pu_frame_acquire 首帧的 PNG 输出路径；默认写当前目录，脚本会显式传绝对路径。
+  std::string frame_png_path = "frame-acquire.png";
 };
 
 Options ParseArgs(int argc, char** argv) {
@@ -94,6 +206,8 @@ Options ParseArgs(int argc, char** argv) {
       options.source_id = argv[++i];
     } else if (arg == "--png" && i + 1 < argc) {
       options.png_path = argv[++i];
+    } else if (arg == "--frame-png" && i + 1 < argc) {
+      options.frame_png_path = argv[++i];
     }
   }
   return options;
@@ -161,6 +275,24 @@ struct EngineGuard {
   }
 };
 
+// WIC 需要本线程有 COM。声明在最前面，保证比两个 EngineGuard 后析构。
+struct ComGuard {
+  bool usable = false;         // 本线程现在能调 COM（自己初始化成功或别人已初始化）
+  bool owns_reference = false;  // 只有自己成功初始化才配对 CoUninitialize
+
+  ComGuard() {
+    const HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    usable = SUCCEEDED(hr);
+    owns_reference = SUCCEEDED(hr);
+    // RPC_E_CHANGED_MODE：本线程已被初始化成别的模型（如 STA），COM 可用但不是
+    // 我们加的那份引用，绝不能去 CoUninitialize。
+    if (!usable && hr == RPC_E_CHANGED_MODE) usable = true;
+  }
+  ~ComGuard() {
+    if (owns_reference) CoUninitialize();
+  }
+};
+
 // 把 from 的 SIGNAL_OUT 原样灌给 to；顺手数一下 from 收到的远端帧。
 // 返回 -1 表示出错（已打印原因）。
 int ForwardSignals(pu_engine* from, pu_engine* to, int* remote_frames, const char* label) {
@@ -215,6 +347,7 @@ int ForwardSignals(pu_engine* from, pu_engine* to, int* remote_frames, const cha
               static_cast<long long>(grabbed.timestamp_us),
               static_cast<unsigned long long>(grabbed.stream_id), bgra_path.c_str());
         }
+        MaybeDumpFramePng(grabbed);
         pu_frame_release(from, &grabbed);
         if (acquired == 300) {
           PROCESS_MEMORY_COUNTERS counters;
@@ -259,6 +392,14 @@ int main(int argc, char** argv) {
   const std::string log_path = ConfigureLogFile();
   std::printf("  engine log       : %s\n", log_path.c_str());
   std::printf("  first frame png  : %s\n", png_path.c_str());
+
+  // 必须在 pu_engine_create 之前初始化：WIC 以及引擎内部的 COM 组件都依赖它。
+  ComGuard com;
+  std::printf("  COM (main thread): %s\n", com.usable ? "ok" : "unavailable");
+  if (!com.usable) std::printf("WARN: COM init failed on main thread; frame PNG will not be written\n");
+
+  g_frame_png_path = AbsolutePath(options.frame_png_path);
+  std::printf("  frame bgra png   : %s\n", g_frame_png_path.c_str());
 
   pu_config config;
   std::memset(&config, 0, sizeof(config));
@@ -496,6 +637,7 @@ int main(int argc, char** argv) {
                 static_cast<long long>(grabbed.timestamp_us),
                 static_cast<unsigned long long>(grabbed.stream_id), bgra_path.c_str());
           }
+          MaybeDumpFramePng(grabbed);
           pu_frame_release(viewer, &grabbed);
           if (acquired == 300) {
             PROCESS_MEMORY_COUNTERS counters;
@@ -618,6 +760,21 @@ int main(int argc, char** argv) {
     }
     std::printf("png            : %s (%ld bytes)\n", png_path.c_str(), png_bytes);
     if (png_bytes <= 0) std::printf("WARN: first-frame PNG was not written\n");
+  }
+  {
+    // pu_frame_acquire 首帧经 WIC 编出来的 PNG：尺寸就是 pu_frame 的 width/height，
+    // 文件大小是判「真的编码了图像」还是「只建了个空文件」的最快证据。
+    long frame_png_bytes = -1;
+    if (!g_frame_png_path.empty()) {
+      if (std::FILE* png = std::fopen(g_frame_png_path.c_str(), "rb")) {
+        std::fseek(png, 0, SEEK_END);
+        frame_png_bytes = std::ftell(png);
+        std::fclose(png);
+      }
+    }
+    std::printf("frame png      : %s (%ld bytes, written=%s)\n", g_frame_png_path.c_str(),
+                frame_png_bytes, g_frame_png_done ? "yes" : "no");
+    if (frame_png_bytes <= 0) std::printf("WARN: pu_frame BGRA PNG was not written\n");
   }
 
   // ---- 7. 判据 ----

@@ -99,6 +99,12 @@ public sealed class MediaEngine : IDisposable
         MissingExports = missingExports;
     }
 
+    /// <summary>
+    /// <c>pu_frame_acquire</c> 的远端流 id：观看方要渲染的那一路解码帧。
+    /// 与 native 侧约定（encoder-dev 实现），改名要两边一起改。
+    /// </summary>
+    public const string RemoteStreamId = "remote";
+
     public string LibraryPath { get; }
 
     public IReadOnlyList<string> MissingExports { get; }

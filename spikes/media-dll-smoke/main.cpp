@@ -6,7 +6,9 @@
 //   * 10 秒内收到 >= 30 个 PU_EVENT_FRAME；
 //   * v2.1：PC 侧只编码一次——outbound-rtp.framesEncoded ≈ 连上之后推送的帧数，
 //     并且严格小于「推送帧数的 1.5 倍」（2 倍就意味着同一帧被编码了两次）；
-//   * 9 个未实现函数都返回 PU_NOT_IMPLEMENTED（证明导出表齐全）；
+//   * 7 个未实现函数都返回 PU_NOT_IMPLEMENTED（证明导出表齐全）；
+//   * v2.5：pu_frame_acquire 已实现——空闲引擎上返回 PU_ERR_TIMEOUT，未知
+//     stream_id 返回 PU_ERR_INVALID_ARG，不配对 release 不崩；
 //   * v2.3：pu_screen_sources 已实现——至少 1 块真实显示器 + synthetic 在列表里；
 //   * 全程没有 PU_EVENT_ERROR；
 //   * pu_screen_stop / pu_engine_destroy 正常返回。
@@ -63,8 +65,8 @@ void PrintLastError(pu_engine* engine, const char* what) {
   std::printf("  pu_last_error: %s\n", pu_last_error(engine));
 }
 
-// 9 个未实现函数必须都存在且返回 PU_NOT_IMPLEMENTED（pu_screen_sources 在 v2.3
-// 已经实现了，改由 CheckScreenSources 断言，见下）。
+// 7 个未实现函数必须都存在且返回 PU_NOT_IMPLEMENTED（pu_screen_sources 在 v2.3
+// 已经实现，pu_frame_acquire/release 在 v2.5 已经实现，改由各自的检查函数断言）。
 int CheckUnimplementedSurface(pu_engine* engine) {
   pu_voice_params voice;
   std::memset(&voice, 0, sizeof(voice));
@@ -84,7 +86,6 @@ int CheckUnimplementedSurface(pu_engine* engine) {
       {"pu_voice_set_deafen", pu_voice_set_deafen(engine, 1)},
       {"pu_screen_watch", pu_screen_watch(engine, "peer-1")},
       {"pu_screen_unwatch", pu_screen_unwatch(engine, "peer-1")},
-      {"pu_frame_acquire", pu_frame_acquire(engine, "stream-1", &frame)},
   };
 
   int failures = 0;
@@ -95,9 +96,44 @@ int CheckUnimplementedSurface(pu_engine* engine) {
       ++failures;
     }
   }
-  pu_frame_release(engine, &frame);  // void，也要能调用
-  std::printf("unimplemented surface: %zu int calls + 1 void call checked, %d unexpected\n",
+  std::printf("unimplemented surface: %zu int call(s) checked, %d unexpected\n",
               sizeof(calls) / sizeof(calls[0]), failures);
+  return failures;
+}
+
+// v2.5：pu_frame_acquire / pu_frame_release 已经是真实现（远端帧 I420→BGRA），
+// 所以这里断言它的契约而不是 PU_NOT_IMPLEMENTED：
+//   * 空闲引擎上 acquire("remote") 必须返回 PU_ERR_TIMEOUT —— 没有新帧是「未就绪」，
+//     调用方应忽略并重试，不是错误；
+//   * 未知 stream_id 必须返回 PU_ERR_INVALID_ARG（参数校验没被跳过）；
+//   * 不配对的 release 是 void，必须能安全调用（库里只计数+记日志，不崩不泄漏）。
+int CheckFrameSurface(pu_engine* engine) {
+  int failures = 0;
+  pu_frame frame;
+  std::memset(&frame, 0, sizeof(frame));
+  frame.struct_size = static_cast<uint32_t>(sizeof(frame));
+
+  const int idle_rc = pu_frame_acquire(engine, "remote", &frame);
+  if (idle_rc != PU_ERR_TIMEOUT) {
+    std::printf(
+        "FAIL: pu_frame_acquire(remote) on an idle engine returned %d, expected PU_ERR_TIMEOUT (%d)\n",
+        idle_rc, PU_ERR_TIMEOUT);
+    ++failures;
+    // 万一真拿到了帧，立刻配对释放，别把槽位挂在 busy 上影响后面的检查。
+    if (idle_rc == PU_OK) pu_frame_release(engine, &frame);
+  }
+
+  const int bad_rc = pu_frame_acquire(engine, "no-such-stream", &frame);
+  if (bad_rc != PU_ERR_INVALID_ARG) {
+    std::printf(
+        "FAIL: pu_frame_acquire(no-such-stream) returned %d, expected PU_ERR_INVALID_ARG (%d)\n",
+        bad_rc, PU_ERR_INVALID_ARG);
+    ++failures;
+  }
+
+  pu_frame_release(engine, &frame);  // 不配对：void，必须能调用
+  std::printf("frame surface: acquire(idle)=%d acquire(bad-stream)=%d, unpaired release ok\n",
+              idle_rc, bad_rc);
   return failures;
 }
 
@@ -494,6 +530,7 @@ int main() {
 
   const int source_failures = CheckScreenSources(engine);
   const int surface_failures = CheckUnimplementedSurface(engine);
+  const int frame_failures = CheckFrameSurface(engine);
 
   // pu_last_error 的指针在 destroy 之后失效，先拷出来。
   // 未经 stop 直接 destroy 也必须干净收尾（UI 直接退出的路径）。
@@ -595,6 +632,11 @@ int main() {
   }
   if (surface_failures != 0) {
     std::printf("FAIL: ABI surface check found %d unexpected result(s)\n", surface_failures);
+    return 1;
+  }
+  if (frame_failures != 0) {
+    std::printf("FAIL: pu_frame_acquire/release contract check found %d problem(s)\n",
+                frame_failures);
     return 1;
   }
   if (!peer_connected) {

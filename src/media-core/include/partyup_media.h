@@ -330,7 +330,9 @@ typedef struct pu_source_list {
  *   * acquire / release 必须**配对**；漏掉 release 时该槽位不会回收，
  *     引擎会记日志 + 计数（不会泄漏内存）。
  *   * 没有比上次更新过的帧时 `pu_frame_acquire` 返回 **PU_ERR_TIMEOUT**，
- *     表示「还没好，继续等」，不是失败。
+ *     表示「还没好，继续等」，不是失败 —— **调用方必须忽略它并稍后重试**，
+ *     不得把它当成错误去重建引擎或停止拉帧（源 55fps、UI 60Hz 时本来就会周期性出现）。
+ *   * acquire 只会返回比上一次更新过的帧；同一帧不会被重复交付两次。
  *   * stride 是**如实**的行字节数，客户端必须按 stride 逐行拷贝，
  *     不能假设 stride == width * 4。
  *   * stream_id 是不透明流标识（当前远端视频流为 1）。

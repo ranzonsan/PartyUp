@@ -16,8 +16,8 @@ public sealed record MessageItem(string Author, string Body, string TimeText, bo
 /// 主窗口的视图模型：登录/注册、连接、频道、聊天、presence、媒体引擎状态。
 ///
 /// 线程约定：网络事件从接收循环线程进来，所有改集合的操作都经
-/// <see cref="Dispatcher.UIThread"/> 回到 UI 线程；媒体引擎的 poll 由窗口里的
-/// DispatcherTimer 驱动（每 100ms 一次），不在这里起线程。
+/// <see cref="Dispatcher.UIThread"/> 回到 UI 线程；媒体引擎的事件由 <see cref="MediaPump"/>
+/// 在专用后台线程阻塞 poll 取出（**不再用 UI 定时器轮询**，那是 Spike 1 证伪的打帧方式）。
 /// </summary>
 public sealed partial class MainViewModel : ObservableObject
 {
@@ -26,9 +26,12 @@ public sealed partial class MainViewModel : ObservableObject
     private PartyUpConnection? _connection;
     private MediaEngine? _media;
     private ShareSession? _share;
+    private MediaPump? _pump;
+    private RemoteScreenPresenter? _remoteScreen;
     private string? _subscribedChannelId;
     private bool _busy;
     private bool _openInFlight;
+    private bool _frameAcquireWarned;
 
     public MainViewModel()
     {
@@ -101,6 +104,14 @@ public sealed partial class MainViewModel : ObservableObject
     [ObservableProperty]
     private string _remoteFramesText = "远端帧：0";
 
+    /// <summary>远端画面区是否可见（收到并渲染过帧后才显示，避免空白黑框）。</summary>
+    [ObservableProperty]
+    private bool _isRemoteScreenVisible;
+
+    /// <summary>画面渲染帧率文本（由 <see cref="RemoteScreenPresenter.FpsChanged"/> 每秒更新一次）。</summary>
+    [ObservableProperty]
+    private string _remoteFpsText = "画面：等待远端帧";
+
     // ------------------------------------------------------------------
     // 媒体引擎
     // ------------------------------------------------------------------
@@ -129,36 +140,118 @@ public sealed partial class MainViewModel : ObservableObject
         }
     }
 
-    /// <summary>由窗口的 DispatcherTimer 调用：把事件队列里已经到的事件全部取出来。</summary>
-    public void PollMedia()
+    /// <summary>
+    /// 启动媒体事件泵。**渲染必须由解码回调驱动**（Spike 1 结论）：所以事件不再由 UI
+    /// 定时器轮询，而是后台线程阻塞等 <c>pu_poll_event</c>，事件到就处理。UI 定时器打帧
+    /// 那条路径已彻底删除，不保留回退分支。
+    /// </summary>
+    public void StartMediaPump()
     {
         if (_media is not { IsCreated: true })
         {
+            AppLog.Warn("media pump: 引擎未就绪，未启动");
             return;
         }
+        if (_pump is not null)
+        {
+            return;
+        }
+        _pump = new MediaPump(_media, OnMediaEvent);
+        _pump.Start();
+    }
+
+    /// <summary>停止媒体事件泵（窗口关闭时调用）。</summary>
+    public void StopMediaPump()
+    {
+        _pump?.Dispose();
+        _pump = null;
+    }
+
+    /// <summary>把远端画面渲染器接到 ViewModel（窗口在 XAML 加载后调用，仅 UI 线程）。</summary>
+    public void AttachRemoteScreen(RemoteScreenPresenter presenter)
+    {
+        _remoteScreen = presenter;
+        presenter.FpsChanged += fps =>
+        {
+            RemoteFpsText = $"画面：{fps:F1} fps（{presenter.Width}x{presenter.Height}）";
+        };
+        AppLog.Info("remote screen: presenter attached");
+    }
+
+    /// <summary>媒体泵线程回调。帧路径在 UI 线程取帧+拷贝；非帧事件 Post 回 UI 线程。</summary>
+    private void OnMediaEvent(MediaEvent ev)
+    {
+        if (ev.Kind == MediaEventKind.RemoteFrame)
+        {
+            // 用 Invoke（阻塞）而不是 Post：UI 跟不上时让泵线程等，native 队列自然丢旧帧，
+            // 不会在托管堆里堆一串待渲染帧。
+            Dispatcher.UIThread.Invoke(() =>
+            {
+                _share?.HandleMediaEvent(ev);
+                PresentRemoteFrame();
+            });
+            return;
+        }
+
+        Dispatcher.UIThread.Post(() =>
+        {
+            _share?.HandleMediaEvent(ev);
+            switch (ev.Kind)
+            {
+                case MediaEventKind.State:
+                    MediaStatusText = $"媒体引擎：{ev.PreviousStateValue} → {ev.StateValue}";
+                    AppLog.Info($"media: state {ev.PreviousStateValue} -> {ev.StateValue} (reason={ev.Reason})");
+                    break;
+                case MediaEventKind.Error:
+                    MediaStatusText = "媒体引擎错误：" + ev.ErrorMessage;
+                    AppLog.Fail("media: " + ev.ErrorMessage);
+                    break;
+            }
+        });
+    }
+
+    /// <summary>
+    /// 取最近一帧远端画面并渲染。native 的 <c>pu_frame_acquire</c> 还没实现时必须优雅跳过
+    /// （返回 NOT_IMPLEMENTED，不能死循环也不能崩），界面保持空白并继续等下一帧。
+    /// </summary>
+    private void PresentRemoteFrame()
+    {
+        if (_media is not { IsCreated: true } || _remoteScreen is not { } presenter)
+        {
+            return;
+        }
+
+        var status = _media.FrameAcquire(MediaEngine.RemoteStreamId, out var frame);
+        if (status == (int)PuStatus.Timeout)
+        {
+            // 没有比上次 acquire 更新的帧：属于正常的「还没好」，不是错误。
+            return;
+        }
+        if (status != (int)PuStatus.Ok || frame.Pixels == IntPtr.Zero)
+        {
+            if (!_frameAcquireWarned)
+            {
+                _frameAcquireWarned = true;
+                AppLog.Warn($"remote screen: 帧未就绪（pu_frame_acquire={status}，{_media.LastErrorText()}）；" +
+                            "native 侧尚未实现时属预期，界面继续等待。");
+            }
+            return;
+        }
+
         try
         {
-            while (_media.Poll(0) is { } ev)
+            if (presenter.Present(frame.Pixels, (int)frame.Width, (int)frame.Height, (int)frame.Stride)
+                && !IsRemoteScreenVisible)
             {
-                // 共享会话先处理：信令转发 / 远端帧计数都在它里面。
-                _share?.HandleMediaEvent(ev);
-                switch (ev.Kind)
-                {
-                    case MediaEventKind.State:
-                        MediaStatusText = $"媒体引擎：{ev.PreviousStateValue} → {ev.StateValue}";
-                        AppLog.Info($"media: state {ev.PreviousStateValue} -> {ev.StateValue} (reason={ev.Reason})");
-                        break;
-                    case MediaEventKind.Error:
-                        MediaStatusText = "媒体引擎错误：" + ev.ErrorMessage;
-                        AppLog.Fail("media: " + ev.ErrorMessage);
-                        break;
-                }
+                IsRemoteScreenVisible = true;
+                _frameAcquireWarned = false;
+                AppLog.Pass($"remote screen: 首帧上屏 {frame.Width}x{frame.Height} stride={frame.Stride} " +
+                            $"pixels=0x{frame.Pixels.ToInt64():X}");
             }
         }
-        catch (Exception ex)
+        finally
         {
-            MediaStatusText = "媒体引擎异常：" + ex.Message;
-            AppLog.Fail("media: " + ex.Message);
+            _media.FrameRelease(ref frame);
         }
     }
 
@@ -522,6 +615,16 @@ public sealed partial class MainViewModel : ObservableObject
             WatchStatusText = share.IsWatching ? $"观看：{share.WatchingName} 正在共享" : "观看：—";
             RemoteFramesText = $"远端帧：{share.RemoteFrames}" +
                                (share.RemoteWidth > 0 ? $"（{share.RemoteWidth}x{share.RemoteHeight}）" : string.Empty);
+            if (!share.IsWatching)
+            {
+                // 对方停止共享：清掉画面并让画面区收起（位图保留待复用，不重建）。
+                if (IsRemoteScreenVisible)
+                {
+                    _remoteScreen?.Clear();
+                    IsRemoteScreenVisible = false;
+                    RemoteFpsText = "画面：等待远端帧";
+                }
+            }
             if (share.LastError is { } error)
             {
                 ShareStatusText = "共享错误：" + error;

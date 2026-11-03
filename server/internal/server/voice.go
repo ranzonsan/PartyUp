@@ -22,17 +22,15 @@ import (
 	"partyup/internal/sfu"
 )
 
-// normalizeVoiceMode 校验并归一化传输模式。缺省 direct：老客户端不发 voice.join，
-// 新客户端显式传 relay 才走中继。
-func normalizeVoiceMode(mode string) (string, bool) {
-	switch strings.TrimSpace(mode) {
-	case "", "direct":
-		return "direct", true
-	case "relay":
-		return "relay", true
-	default:
-		return "", false
+// NormalizeVoiceMode 归一化服务端语音传输策略：只接受 relay / direct，
+// 空值或无法识别的值一律回落到默认 relay（ADR-0002：语音默认中继）。
+//
+// 这是**服务端配置**，不是客户端请求参数；客户端无权选择传输方式。
+func NormalizeVoiceMode(mode string) string {
+	if strings.EqualFold(strings.TrimSpace(mode), "direct") {
+		return "direct"
 	}
+	return "relay"
 }
 
 // ensureRoom 取得（必要时创建）某个频道的 SFU 房间。房间方法不持 h.mu 调用。
@@ -103,10 +101,7 @@ func (h *Hub) handleVoiceSignal(memberID, channelID, kind, payload string) error
 // broadcastVoiceState 把频道当前语音快照推给所有订阅者。
 func (h *Hub) broadcastVoiceState(channelID string) {
 	h.mu.RLock()
-	mode := h.voiceMode[channelID]
-	if mode == "" {
-		mode = "direct"
-	}
+	mode := h.voiceMode
 	members := make([]protocol.VoiceMemberState, 0, len(h.voice[channelID]))
 	for _, m := range h.voice[channelID] {
 		members = append(members, m)
@@ -148,7 +143,7 @@ func (h *Hub) detachVoiceMemberLocked(channelID, memberID string) (leave, close 
 		return nil, nil
 	}
 	delete(members, memberID)
-	mode := h.voiceMode[channelID]
+	mode := h.voiceMode
 	if len(members) > 0 {
 		if mode == "relay" {
 			return h.rooms[channelID], nil
@@ -156,7 +151,6 @@ func (h *Hub) detachVoiceMemberLocked(channelID, memberID string) (leave, close 
 		return nil, nil
 	}
 	delete(h.voice, channelID)
-	delete(h.voiceMode, channelID)
 	room := h.rooms[channelID]
 	delete(h.rooms, channelID)
 	if room != nil {
@@ -232,20 +226,12 @@ func (c *conn) handleVoiceJoin(env protocol.Envelope) {
 		c.replyError(env.Type, protocol.CodeForbidden, "not a subscriber of this channel", env.ID)
 		return
 	}
-	mode, ok := normalizeVoiceMode(req.Mode)
-	if !ok {
-		c.replyError(env.Type, protocol.CodeInvalidArgument, "mode must be relay or direct", env.ID)
-		return
-	}
+
+	// 传输方式只由服务端策略决定；客户端请求里就算带了 mode 也不会被读取。
+	h := c.hub
 	memberID := c.member.ID
 
-	h := c.hub
 	h.mu.Lock()
-	current := h.voiceMode[channelID]
-	if current == "" {
-		h.voiceMode[channelID] = mode
-		current = mode
-	}
 	members := h.voice[channelID]
 	if members == nil {
 		members = make(map[string]protocol.VoiceMemberState, 4)
@@ -257,27 +243,24 @@ func (c *conn) handleVoiceJoin(env protocol.Envelope) {
 	}
 	h.mu.Unlock()
 
-	if current != mode {
-		c.replyError(env.Type, protocol.CodeConflict,
-			fmt.Sprintf("channel voice mode is %s; use voice.set_mode to switch", current), env.ID)
-		return
-	}
-
-	if current == "relay" {
+	if h.voiceMode == "relay" {
 		room, err := h.ensureRoom(channelID)
 		if err != nil {
+			// 加入失败要回滚刚写进 voice 表的成员，避免幽灵成员。
+			c.hub.leaveVoiceChannel(memberID, channelID)
 			c.replyError(env.Type, protocol.CodeInternal, "create relay room: "+err.Error(), env.ID)
 			return
 		}
 		if err := room.Join(memberID); err != nil {
+			c.hub.leaveVoiceChannel(memberID, channelID)
 			c.replyError(env.Type, protocol.CodeInternal, "join relay room: "+err.Error(), env.ID)
 			return
 		}
 	}
 
-	c.replyOK(env, protocol.VoiceJoinOK{ChannelID: channelID, Mode: current, Transport: current})
+	c.replyOK(env, protocol.VoiceJoinOK{ChannelID: channelID, Transport: h.voiceMode})
 	if !already {
-		h.log.Info("voice: joined", "channel", channelID, "member", memberID, "mode", current)
+		h.log.Info("voice: joined", "channel", channelID, "member", memberID, "transport", h.voiceMode)
 		h.broadcastVoiceState(channelID)
 	}
 }
@@ -295,65 +278,6 @@ func (c *conn) handleVoiceLeave(env protocol.Envelope) {
 	}
 	c.hub.leaveVoiceChannel(c.member.ID, channelID)
 	c.replyOK(env, protocol.VoiceJoinOK{ChannelID: channelID})
-}
-
-func (c *conn) handleVoiceSetMode(env protocol.Envelope) {
-	var req protocol.VoiceSetModeRequest
-	if err := env.DecodePayload(&req); err != nil {
-		c.replyError(env.Type, protocol.CodeInvalidArgument, err.Error(), env.ID)
-		return
-	}
-	channelID := strings.TrimSpace(req.ChannelID)
-	if channelID == "" {
-		c.replyError(env.Type, protocol.CodeInvalidArgument, "channel_id is required", env.ID)
-		return
-	}
-	if !c.hub.isSubscribed(c, channelID) {
-		c.replyError(env.Type, protocol.CodeForbidden, "not a subscriber of this channel", env.ID)
-		return
-	}
-	mode, ok := normalizeVoiceMode(req.Mode)
-	if !ok || strings.TrimSpace(req.Mode) == "" {
-		c.replyError(env.Type, protocol.CodeInvalidArgument, "mode must be relay or direct", env.ID)
-		return
-	}
-
-	h := c.hub
-	h.mu.Lock()
-	if h.voiceMode[channelID] == mode {
-		h.mu.Unlock()
-		c.replyOK(env, protocol.VoiceJoinOK{ChannelID: channelID, Mode: mode, Transport: mode})
-		return
-	}
-	h.voiceMode[channelID] = mode
-	members := make([]string, 0, len(h.voice[channelID]))
-	for id := range h.voice[channelID] {
-		members = append(members, id)
-	}
-	oldRoom := h.rooms[channelID]
-	delete(h.rooms, channelID)
-	h.mu.Unlock()
-
-	// 旧房间里的人被整体断开；relay 侧由下面按新成员表重建。
-	if oldRoom != nil {
-		oldRoom.Close()
-	}
-	if mode == "relay" {
-		room, err := h.ensureRoom(channelID)
-		if err != nil {
-			c.replyError(env.Type, protocol.CodeInternal, "create relay room: "+err.Error(), env.ID)
-			return
-		}
-		for _, memberID := range members {
-			if err := room.Join(memberID); err != nil {
-				h.log.Warn("voice: rejoin relay failed", "channel", channelID, "member", memberID, "err", err)
-			}
-		}
-	}
-
-	h.log.Info("voice: mode switched", "channel", channelID, "mode", mode, "members", len(members))
-	c.replyOK(env, protocol.VoiceJoinOK{ChannelID: channelID, Mode: mode, Transport: mode})
-	h.broadcastVoiceState(channelID)
 }
 
 func (c *conn) handleVoiceSetMute(env protocol.Envelope) {

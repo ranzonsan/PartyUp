@@ -66,9 +66,13 @@ public sealed record ClientOptions
     /// <summary>`--voice-join`：登录并进入频道后自动加入语音（自动化验收用）。</summary>
     public bool VoiceAutoJoin { get; init; }
 
-    /// <summary>`--voice-passive`：自动加入时用被动模式（flags bit0=1，等对端 offer）。</summary>
+    /// <summary>
+    /// 仅用于自动化/调试：强制以「被动（answerer）」身份加入 direct 语音，等对方 offer。
+    /// 这不是传输方式选择（传输方式由服务端策略决定），只是直连模式下的角色编排。
+    /// </summary>
     public bool VoicePassive { get; init; }
 
+    /// <summary>`--voice-passive`：自动加入时用被动模式（flags bit0=1，等对端 offer）。</summary>
     /// <summary>--role send 要发送的正文。</summary>
     public string? Text { get; init; }
 

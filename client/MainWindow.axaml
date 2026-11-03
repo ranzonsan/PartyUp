@@ -141,7 +141,7 @@
                     <Ellipse Width="7" Height="7" Fill="#FF6FCF87" VerticalAlignment="Center" />
                     <TextBlock Text="{Binding Name}" FontSize="12" Foreground="#FFD5DAE4" />
                     <TextBlock Text="🔊" FontSize="11" VerticalAlignment="Center"
-                               IsVisible="{Binding IsInVoice}" />
+                               IsVisible="{Binding IsSpeakingIconVisible}" />
                     <TextBlock Text="🔇" FontSize="11" VerticalAlignment="Center"
                                IsVisible="{Binding IsMuted}" />
                   </StackPanel>
@@ -151,7 +151,7 @@
 
             <Border Height="1" Background="#FF232936" Margin="0,6" />
 
-            <!-- 语音：加入/离开 + 麦克风静音 / 关闭扬声器（v1 只有 direct，relay 需后端 SFU） -->
+            <!-- 语音：加入/离开 + 麦克风静音 / 关闭扬声器（传输方式由服务端策略决定，UI 只显示） -->
             <TextBlock Text="语音" FontSize="12"
                        FontWeight="SemiBold" Foreground="#FF9AA4B8" />
             <Button x:Name="VoiceToggleButton" Content="{Binding VoiceJoinButtonText}"
@@ -168,10 +168,8 @@
             </Grid>
             <TextBlock Text="{Binding VoiceStatusText}" FontSize="11"
                        Foreground="#FF9AA4B8" TextWrapping="Wrap" />
-            <TextBlock Text="{Binding VoiceModeText}" FontSize="11" Foreground="#FF7C8698" />
-            <TextBlock Text="{Binding RelayUnavailableNote}" FontSize="10"
-                       Foreground="#FF6E7A8E" TextWrapping="Wrap"
-                       IsVisible="{Binding !IsRelayAvailable}" />
+            <TextBlock Text="{Binding VoiceModeText}" FontSize="11" Foreground="#FF7C8698"
+                       TextWrapping="Wrap" />
 
             <Border Height="1" Background="#FF232936" Margin="0,4" />
 

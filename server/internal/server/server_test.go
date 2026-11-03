@@ -39,6 +39,12 @@ type testEnv struct {
 
 func newTestEnv(t *testing.T) *testEnv {
 	t.Helper()
+	return newTestEnvWith(t, "relay")
+}
+
+// newTestEnvWith 允许测试覆盖服务端选项（目前用于语音传输策略：relay / direct）。
+func newTestEnvWith(t *testing.T, voiceMode string) *testEnv {
+	t.Helper()
 
 	st, err := store.Open(t.TempDir())
 	if err != nil {
@@ -51,7 +57,12 @@ func newTestEnv(t *testing.T) *testEnv {
 		logOut = os.Stderr
 	}
 	logger := slog.New(slog.NewTextHandler(logOut, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	srv := server.New(st, server.Options{Name: "test-server", Version: "0.0.0-test", Logger: logger})
+	srv := server.New(st, server.Options{
+		Name:      "test-server",
+		Version:   "0.0.0-test",
+		Logger:    logger,
+		VoiceMode: voiceMode,
+	})
 
 	info, err := srv.EnsureFirstRun(context.Background())
 	if err != nil {

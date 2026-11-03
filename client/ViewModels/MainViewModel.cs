@@ -115,13 +115,14 @@ public sealed partial class MainViewModel : ObservableObject
 
     public string VoiceJoinButtonText => IsInVoice ? "离开语音" : "加入语音";
 
-    /// <summary>relay 中继需要后端 SFU 中继，尚未实现——UI 置灰并给说明，不静默假装可用。</summary>
-    public bool IsRelayAvailable => false;
+    /// <summary>当前频道语音是否走服务端中继（relay / SFU）。</summary>
+    [ObservableProperty]
+    private bool _isRelayMode;
 
-    public string RelayUnavailableNote { get; } =
-        "中继模式（relay）暂不可用：需要后端 SFU 中继，v1 只支持 direct 直连。";
+    public int VoiceMemberCount { get; private set; }
 
     partial void OnIsInVoiceChanged(bool value) => OnPropertyChanged(nameof(VoiceJoinButtonText));
+
 
     [ObservableProperty]
     private string _footerText = string.Empty;
@@ -394,7 +395,24 @@ public sealed partial class MainViewModel : ObservableObject
         AppLog.Pass($"gui: channel list loaded ({Channels.Count} channels)");
         if (Channels.Count > 0)
         {
-            await OpenChannelAsync(Channels[0]);
+            // --channel 指定频道名时自动进那个频道（验收/脚本用），否则沿用「进第一个频道」。
+            var wanted = Program.Options.Channel;
+            var target = Channels[0];
+            if (!string.IsNullOrWhiteSpace(wanted))
+            {
+                var match = Channels.FirstOrDefault(c =>
+                    string.Equals(c.Name, wanted, StringComparison.OrdinalIgnoreCase));
+                if (match is not null)
+                {
+                    target = match;
+                    AppLog.Pass($"gui: auto-select channel by --channel: {target.Name}");
+                }
+                else
+                {
+                    AppLog.Warn($"gui: --channel {wanted} not found, fallback to {target.Name}");
+                }
+            }
+            await OpenChannelAsync(target);
         }
     }
 
@@ -475,16 +493,15 @@ public sealed partial class MainViewModel : ObservableObject
             // 这个频道的共享会话：负责信令转发与远端帧统计。
             if (_media is { IsCreated: true })
             {
-                _share = new ShareSession(_media, _connection, channel.Id);
+                _share = new ShareSession(_media, _connection, channel.Id, Program.Options.VoicePassive);
                 _share.Changed += OnShareChanged;
 
-                // 自动化验收用：进频道后自动加入语音（--voice-join / --voice-passive）。
+                // 自动化验收用：进频道后自动加入语音（--voice-join --voice-mode relay|direct）。
                 if (Program.Options.VoiceAutoJoin)
                 {
-                    var passive = Program.Options.VoicePassive;
-                    await _share.JoinVoiceAsync(passive);
+                    await _share.JoinVoiceAsync();
                     SyncVoiceFromShare();
-                    AppLog.Pass($"gui: voice auto-join passive={passive} ok={_share.IsInVoice}");
+                    AppLog.Pass($"gui: voice auto-join transport={_share.VoiceMode} ok={_share.IsInVoice}");
                 }
             }
 
@@ -565,17 +582,7 @@ public sealed partial class MainViewModel : ObservableObject
                 _memberNames[member.MemberId] = member.Name;
             }
             _membersSnapshot = presence.Members;
-            Members.Clear();
-            foreach (var member in presence.Members)
-            {
-                var inVoice = _share?.VoiceMembers.ContainsKey(member.MemberId) == true;
-                var selfMuted = _share is { IsVoiceMuted: true } && member.MemberId == _connection?.Member.Id;
-                Members.Add(new MemberRow(member.MemberId, member.Name)
-                {
-                    IsInVoice = inVoice,
-                    IsMuted = selfMuted,
-                });
-            }
+            RebuildMemberRows();
             AppLog.Info($"gui: presence {presence.Members.Count} member(s): {string.Join(", ", presence.Members.Select(m => m.Name))}");
             FooterText = $"频道内 {presence.Members.Count} 人在线";
         });
@@ -685,11 +692,10 @@ public sealed partial class MainViewModel : ObservableObject
         }
         else
         {
-            var passive = share.HasOtherVoiceMembers;
-            await share.JoinVoiceAsync(passive);
+            await share.JoinVoiceAsync();
             if (share.IsInVoice)
             {
-                AppLog.Pass($"gui: voice joined passive={passive}");
+                AppLog.Pass($"gui: voice joined mode={share.VoiceMode}");
             }
             else
             {
@@ -737,10 +743,12 @@ public sealed partial class MainViewModel : ObservableObject
         IsInVoice = share.IsInVoice;
         IsVoiceMuted = share.IsVoiceMuted;
         IsVoiceDeafened = share.IsVoiceDeafened;
-        VoiceModeText = "模式：" + share.VoiceModeText;
+        IsRelayMode = share.IsRelayMode;
+        VoiceMemberCount = share.VoiceMemberCount;
+        VoiceModeText = "本频道：" + share.VoiceModeText + "（服务端策略）";
         VoiceStatusText = !share.IsInVoice
             ? "语音：未加入"
-            : $"语音：已加入（{share.VoiceMembers.Count} 人）" +
+            : $"语音：已加入（{share.VoiceMemberCount} 人）" +
               (share.IsVoiceMuted ? "，麦克风静音" : string.Empty) +
               (share.IsVoiceDeafened ? "，扬声器关闭" : string.Empty);
         RebuildMemberRows();
@@ -749,15 +757,17 @@ public sealed partial class MainViewModel : ObservableObject
     /// <summary>按最近一次 presence 快照 + 语音状态重建成员行（语音/静音图标绑在这些属性上）。</summary>
     private void RebuildMemberRows()
     {
-        var selfId = _connection?.Member.Id;
         var voice = _share?.VoiceMembers;
         Members.Clear();
         foreach (var member in _membersSnapshot)
         {
+            // 谁在语音、谁静音都以服务端 voice.state 为准（不再靠本地猜测/捎带）。
+            VoiceMemberDto? state = null;
+            voice?.TryGetValue(member.MemberId, out state);
             Members.Add(new MemberRow(member.MemberId, member.Name)
             {
-                IsInVoice = voice?.ContainsKey(member.MemberId) == true,
-                IsMuted = _share is { IsVoiceMuted: true } && member.MemberId == selfId,
+                IsInVoice = state is not null,
+                IsMuted = state?.Muted == true,
             });
         }
     }

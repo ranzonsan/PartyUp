@@ -50,12 +50,22 @@ public sealed record ScreenAckDto(string ChannelId);
 /// <summary>media.signal：payload 是媒体核心的原始信令 JSON，客户端不解析、只透传。</summary>
 public sealed record MediaSignalDto(
     string ChannelId,
+    string? Target,
     string? To,
     string? From,
     string? FromName,
     string Media,
     string Kind,
     string Payload);
+
+/// <summary>voice.state 里的一个语音成员（PROTOCOL.md §4）。</summary>
+public sealed record VoiceMemberDto(string MemberId, bool Muted, bool Deafened);
+
+/// <summary>voice.state 推送：频道当前语音快照（mode + 成员，含静音/闭音）。</summary>
+public sealed record VoiceStateDto(string ChannelId, string Mode, IReadOnlyList<VoiceMemberDto> Members);
+
+/// <summary>voice.join / voice.leave / voice.set_mode / set_mute / set_deafen 的响应。</summary>
+public sealed record VoiceAckDto(string ChannelId, string? Mode, string? Transport);
 
 /// <summary>通用信封。v=1 由协议固定；Payload 原样保留，按消息类型再反序列化。</summary>
 public sealed record EnvelopeDto(int V, string Id, string Type, long Ts, JsonElement? Payload);

@@ -39,10 +39,11 @@ type relayPeer struct {
 	mic      *webrtc.TrackLocalStaticSample
 	send     bool // 是否在说话
 
-	mu     sync.Mutex
-	recv   map[string]int
-	total  int
-	states []protocol.VoiceStatePayload
+	mu        sync.Mutex
+	recv      map[string]int
+	total     int
+	sfuOffers int // 服务端下发过几次 relay offer（direct 策略下应为 0）
+	states    []protocol.VoiceStatePayload
 
 	incoming chan protocol.Envelope
 	closed   chan struct{}
@@ -159,6 +160,11 @@ func (p *relayPeer) readLoop() {
 			if err := env.DecodePayload(&push); err != nil {
 				continue
 			}
+			if push.Target == "sfu" && push.Kind == "offer" {
+				p.mu.Lock()
+				p.sfuOffers++
+				p.mu.Unlock()
+			}
 			if push.Kind == "offer" && p.pc != nil {
 				// 必须异步：applyOffer 里要发 answer 并等 .ok，而读这条 .ok 的就是本循环。
 				go p.applyOffer(push)
@@ -197,6 +203,15 @@ func (p *relayPeer) applyOffer(push protocol.MediaSignalPush) {
 	}
 	offer := webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: msg.SDP}
 	if err := p.pc.SetRemoteDescription(offer); err != nil {
+		// 收尾阶段 PC 已关、或 offer 在会话重建后才到：都属预期噪声，不算失败。
+		select {
+		case <-p.closed:
+			return
+		default:
+		}
+		if p.pc.ConnectionState() == webrtc.PeerConnectionStateClosed {
+			return
+		}
 		p.t.Errorf("%s: set remote offer: %v", p.name, err)
 		return
 	}
@@ -316,10 +331,7 @@ func (p *relayPeer) roundTrip(msgType string, payload any) protocol.Envelope {
 
 func (p *relayPeer) joinRelay() protocol.Envelope {
 	p.t.Helper()
-	return p.roundTrip(protocol.TypeVoiceJoin, protocol.VoiceJoinRequest{
-		ChannelID: p.channelID,
-		Mode:      "relay",
-	})
+	return p.roundTrip(protocol.TypeVoiceJoin, protocol.VoiceJoinRequest{ChannelID: p.channelID})
 }
 
 func (p *relayPeer) leaveVoice() protocol.Envelope {
@@ -333,6 +345,12 @@ func (p *relayPeer) setMuted(muted bool) protocol.Envelope {
 		ChannelID: p.channelID,
 		Muted:     muted,
 	})
+}
+
+func (p *relayPeer) sfuOfferCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.sfuOffers
 }
 
 func (p *relayPeer) receivedFrom(publisherID string) int {
@@ -512,6 +530,76 @@ func TestVoiceRelayThreeMembers(t *testing.T) {
 	}
 	t.Logf("PASS three-member reverse fan-out: alice=+%d carol=+%d packets (only bob sends)",
 		e.alice.receivedTotal()-beforeAlice, e.carol.receivedTotal()-beforeCarol)
+}
+
+// TestVoiceModeIsServerPolicy：传输方式完全由服务端策略决定，客户端传的 mode 被忽略。
+//
+//	服务端 relay（默认）+ 客户端说 direct  → transport=relay，且真的下发 relay offer；
+//	服务端 direct + 客户端说 relay          → transport=direct，且服务器一个 offer 都不发（走 P2P 信令）。
+func TestVoiceModeIsServerPolicy(t *testing.T) {
+	cases := []struct {
+		name       string
+		serverMode string
+		clientSays string
+		want       string
+	}{
+		{"relay-default", "relay", "direct", "relay"},
+		{"direct", "direct", "relay", "direct"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newTestEnvWith(t, tc.serverMode)
+			// 先 bootstrap 管理员（bootstrap 要求成员数为 0），再用邀请码建普通成员。
+			_, adminToken := env.bootstrapAdmin("admin-"+tc.name, "password-123")
+			member, token := env.registerViaInvite(env.newInvite(), "policy-"+tc.name, "password-123")
+			peer := newRelayPeer(t, env, "p-"+tc.name, token)
+			admin := newRelayPeer(t, env, "admin-"+tc.name, adminToken)
+			ch := admin.createChannel("policy-" + tc.name)
+			peer.channelID = ch.ID
+			admin.channelID = ch.ID
+			admin.subscribe(ch.ID)
+			peer.subscribe(ch.ID)
+
+			// 故意带一个与服务端策略相反的 mode 字段：服务端必须忽略它。
+			resp := peer.roundTrip(protocol.TypeVoiceJoin, map[string]string{
+				"channel_id": peer.channelID,
+				"mode":       tc.clientSays,
+			})
+			if resp.Type != protocol.TypeOK(protocol.TypeVoiceJoin) {
+				t.Fatalf("join: %s %s", resp.Type, resp.Payload)
+			}
+			var ok protocol.VoiceJoinOK
+			if err := resp.DecodePayload(&ok); err != nil {
+				t.Fatalf("decode voice.join.ok: %v", err)
+			}
+			if ok.Transport != tc.want {
+				t.Fatalf("transport = %q, want %q (server policy must win)", ok.Transport, tc.want)
+			}
+			if !waitUntil(t, "voice.state carries server mode", 3*time.Second, func() bool {
+				st, ok := peer.lastState()
+				return ok && st.Mode == tc.want && len(st.Members) == 1 && st.Members[0].MemberID == member.ID
+			}) {
+				st, _ := peer.lastState()
+				t.Fatalf("voice.state = mode=%q members=%d, want %q/1", st.Mode, len(st.Members), tc.want)
+			}
+
+			if tc.want == "relay" {
+				if !waitUntil(t, "relay offer delivered", 5*time.Second, func() bool {
+					return peer.sfuOfferCount() > 0
+				}) {
+					t.Fatal("relay policy but server never sent an sfu offer")
+				}
+			} else {
+				// direct 策略下服务端只做信令转发，不该主动发 offer。
+				time.Sleep(500 * time.Millisecond)
+				if n := peer.sfuOfferCount(); n != 0 {
+					t.Fatalf("direct policy but server sent %d sfu offer(s)", n)
+				}
+			}
+			t.Logf("PASS server voice mode=%s (client asked %s) → transport=%s, sfuOffers=%d",
+				tc.serverMode, tc.clientSays, ok.Transport, peer.sfuOfferCount())
+		})
+	}
 }
 
 // TestVoiceStateBroadcast：voice.state 正确反映加入/静音/离开，且带频道模式。

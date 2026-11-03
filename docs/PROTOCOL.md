@@ -78,23 +78,36 @@ HTTP 请求/响应体形状（2026-11-02 落地，此前文档未定义）：
 
 ## 4. 语音
 
-- `voice.join { channel_id, mode }`，`mode ∈ { relay, direct }`（缺省 `direct`）。
-  响应 `voice.join.ok { channel_id, mode, transport }`。
-  **频道模式由第一个加入者决定**；后续加入者传不同的 `mode` 会拿到 `CONFLICT`，要整频道切换用 `voice.set_mode`。
+**传输方式由服务端策略决定，客户端无权也无需选择。** 服务端启动参数
+`--voice-mode=relay|direct`（环境变量 `PARTYUP_VOICE_MODE`，默认 `relay`，见 ADR-0002）
+决定语音走服务端中继还是 P2P 直连。客户端只从 `voice.join.ok.transport` 与
+`voice.state.mode` 读取结果，再按结果走对应媒体路径。
+
+- `voice.join { channel_id }` —— 上行载荷**只有** `channel_id`。
+  客户端即使多传一个 `mode` 字段也会被服务端忽略（协议不再定义该字段）。
+  响应 `voice.join.ok { channel_id, transport }`，`transport ∈ { relay, direct }`
+  是服务端实际策略值。
 - `voice.leave { channel_id }`
-- `voice.set_mode { channel_id, mode }` —— 只允许整频道切换。切换时服务端关掉旧的中继房间，
-  并在 relay 侧按当前成员表重建（每个成员会收到新的 `media.signal` offer）。
 - `voice.set_mute { channel_id, muted }` / `voice.set_deafen { channel_id, deafened }`
   —— 上报本端静音/闭音状态。本地 ADM 状态仍由客户端自己控制；上报是为了让别人看见（`voice.state`）。
 - 广播 `voice.state { channel_id, mode, members: [{ member_id, muted, deafened }] }`
-  —— `members` 按 `member_id` 排序，稳定可比对。
+  —— `mode` 就是服务端策略值；`members` 按 `member_id` 排序，稳定可比对。
+  客户端订阅频道后服务端立即推一次快照，所以「本频道是直连还是中继」在加入语音之前就能显示。
   这取代了 2026-11-03 客户端临时代码：当时服务端还没有语音状态，客户端只能借
   `media.signal`（`media=voice, kind=candidate`）捎带 `{"type":"partyup.voice.presence",...}`。
   客户端接上本节的 `voice.state` 后应删除那条 stopgap。
 
-### 4.1 中继（服务端 SFU，`mode=relay`）
+**已从 v1 草案删除的两项**（2026-11-03 产品裁定）：
 
-**服务端是 offerer**：`voice.join` 成功后，服务端为该成员单独建一个 `PeerConnection`，并下发：
+- `voice.set_mode` —— 普通成员无权修改传输方式。将来若要做，应是独立的管理面入口（带权限），
+  不是成员协议的一部分。
+- `CONFLICT`「频道模式不一致」——既然模式来自服务端配置，就不存在每频道可变模式，
+  也不存在「先加入者定模式」这件事。
+
+### 4.1 中继（服务端 SFU，服务端策略 `--voice-mode=relay`）
+
+**服务端是 offerer**：`voice.join` 成功后（仅当服务端策略为 relay），服务端为该成员单独建一个
+`PeerConnection`，并下发：
 
 ```json
 { "type": "media.signal", "payload": {
@@ -135,7 +148,13 @@ HTTP 请求/响应体形状（2026-11-02 落地，此前文档未定义）：
 - 中继模式下**客户端不要给服务端发 offer**；收到 `kind=offer` 应理解成「服务端在协商」，只回 answer。
 
 服务端实现见 `server/internal/sfu/room.go`（房间）与 `server/internal/server/voice.go`（协议接线），
-端到端测试见 `server/internal/server/voice_relay_test.go`（2 人 / 3 人中继 + voice.state）。
+端到端测试见 `server/internal/server/voice_relay_test.go`（2 人 / 3 人中继 + voice.state +
+「服务端策略覆盖客户端意见」）。
+
+### 4.1.1 direct 策略下
+
+服务端**不发 offer**，只做 `media.signal` 转发（§4.2）：由成员之间自行 offer/answer
+（1:1 直连）。服务端仍维护 `voice.state`（谁在语音、谁静音），并拒绝 `voice.set_mode`。
 
 ### 4.2 直连
 

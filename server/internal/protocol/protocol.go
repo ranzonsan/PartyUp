@@ -64,7 +64,6 @@ const (
 	// 语音（PROTOCOL.md §4）。relay 模式由服务端 SFU 中继，direct 模式走 media.signal 直连。
 	TypeVoiceJoin      = "voice.join"
 	TypeVoiceLeave     = "voice.leave"
-	TypeVoiceSetMode   = "voice.set_mode"
 	TypeVoiceSetMute   = "voice.set_mute"
 	TypeVoiceSetDeafen = "voice.set_deafen"
 	TypeVoiceState     = "voice.state"
@@ -376,22 +375,18 @@ type MediaSignalOK struct {
 // 语音（PROTOCOL.md §4）与 SFU 中继（§4.1）
 // ------------------------------------------------------------------
 
-// VoiceJoinRequest 是 voice.join 的上行载荷。mode ∈ {relay, direct}：
-// relay 由服务端 SFU 中继（每成员一个 PeerConnection），direct 走 1:1 直连信令。
+// VoiceJoinRequest 是 voice.join 的上行载荷。
+//
+// 传输方式（relay / direct）由**服务端策略**决定（启动参数 --voice-mode），
+// 客户端不提供也无法影响它；客户端只从 voice.join.ok.transport 与 voice.state.mode 读取结果。
+// 旧客户端即使多传一个 "mode" 字段，服务端也会忽略（JSON 解码不认未知字段）。
 type VoiceJoinRequest struct {
 	ChannelID string `json:"channel_id"`
-	Mode      string `json:"mode"`
 }
 
 // VoiceLeaveRequest 是 voice.leave 的上行载荷。
 type VoiceLeaveRequest struct {
 	ChannelID string `json:"channel_id"`
-}
-
-// VoiceSetModeRequest 是 voice.set_mode 的上行载荷：整频道切换中继/直连。
-type VoiceSetModeRequest struct {
-	ChannelID string `json:"channel_id"`
-	Mode      string `json:"mode"`
 }
 
 // VoiceSetMuteRequest / VoiceSetDeafenRequest 上报本端静音状态，供 voice.state 广播。
@@ -424,6 +419,7 @@ type VoiceStatePayload struct {
 // 客户端据此决定是「等 media.signal offer（relay）」还是「自己发 offer（direct）」。
 type VoiceJoinOK struct {
 	ChannelID string `json:"channel_id"`
-	Mode      string `json:"mode"`
-	Transport string `json:"transport"` // relay | direct
+	// Transport 是服务端策略决定的传输方式：relay（服务端 SFU 中继）或 direct（P2P 直连）。
+	// 客户端必须按它走对应路径，不能自己选。
+	Transport string `json:"transport"`
 }

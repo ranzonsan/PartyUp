@@ -65,16 +65,23 @@ func run(args []string) error {
 	}
 }
 
+func envOr(key, fallback string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return fallback
+}
+
 func printUsage() {
 	fmt.Fprint(os.Stderr, `partyup — PartyUp 服务端
 
 用法:
-  partyup serve  [--data DIR] [--http ADDR] [--name NAME] [--log-level L]
+  partyup serve  [--data DIR] [--http ADDR] [--name NAME] [--log-level L] [--voice-mode relay|direct]
   partyup invite [--data DIR] [--by MEMBER_ID]
   partyup version
 
 serve 的 stdout 输出（每行 KEY=VALUE，最后一行 READY）:
-  DATA_DIR / DB_PATH / BOOTSTRAP_TOKEN / INVITE_CODE / LISTEN_ADDR
+  DATA_DIR / DB_PATH / BOOTSTRAP_TOKEN / INVITE_CODE / VOICE_MODE / LISTEN_ADDR
 BOOTSTRAP_TOKEN 与 INVITE_CODE 只在本次启动新生成时出现。
 `)
 }
@@ -85,6 +92,9 @@ func cmdServe(args []string) error {
 	httpAddr := fs.String("http", "127.0.0.1:8080", "HTTP 监听地址")
 	name := fs.String("name", "PartyUp", "服务端展示名")
 	logLevel := fs.String("log-level", "info", "日志级别：debug|info|warn|error")
+	// 语音传输策略：客户端无权选择，由运维在这里定（默认中继，见 ADR-0002）。
+	voiceMode := fs.String("voice-mode", envOr("PARTYUP_VOICE_MODE", "relay"),
+		"语音传输策略：relay（服务端 SFU 中继，默认）| direct（P2P 直连）")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -98,9 +108,10 @@ func cmdServe(args []string) error {
 	defer st.Close()
 
 	srv := server.New(st, server.Options{
-		Name:    *name,
-		Version: version,
-		Logger:  logger,
+		Name:      *name,
+		Version:   version,
+		Logger:    logger,
+		VoiceMode: *voiceMode,
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -131,6 +142,7 @@ func cmdServe(args []string) error {
 	if info.InviteCode != "" {
 		fmt.Printf("INVITE_CODE=%s\n", info.InviteCode)
 	}
+	fmt.Printf("VOICE_MODE=%s\n", server.NormalizeVoiceMode(*voiceMode))
 	fmt.Printf("LISTEN_ADDR=%s\n", ln.Addr().String())
 	fmt.Println("READY")
 

@@ -51,6 +51,9 @@ public sealed class PartyUpConnection : IAsyncDisposable
     /// <summary>共享状态推送（screen.state，docs/PROTOCOL.md §5）。在接收循环线程触发。</summary>
     public event Action<ScreenStateDto>? ScreenStateChanged;
 
+    /// <summary>语音状态推送（voice.state，docs/PROTOCOL.md §4）。在接收循环线程触发。</summary>
+    public event Action<VoiceStateDto>? VoiceStateChanged;
+
     public event Action<string>? Closed;
 
     /// <summary>连接 + auth 握手。失败时连接已释放，不会泄漏半开状态。</summary>
@@ -136,15 +139,36 @@ public sealed class PartyUpConnection : IAsyncDisposable
         string kind,
         string payload,
         string? to = null,
+        string? target = null,
         CancellationToken ct = default) =>
         RequestAsync<ScreenAckDto>("media.signal", new
         {
             channel_id = channelId,
+            target,
             to,
             media,
             kind,
             payload,
         }, ct);
+
+    // ---- 语音（docs/PROTOCOL.md §4）----
+
+    /// <summary>
+    /// 加入语音。传输方式由**服务端策略**决定，客户端不传也不该传 mode；
+    /// 响应里的 transport 是服务端实际决定值（relay / direct），客户端据此选媒体路径。
+    /// </summary>
+    public Task<VoiceAckDto> VoiceJoinAsync(string channelId, CancellationToken ct = default) =>
+        RequestAsync<VoiceAckDto>("voice.join", new { channel_id = channelId }, ct);
+
+    public Task<VoiceAckDto> VoiceLeaveAsync(string channelId, CancellationToken ct = default) =>
+        RequestAsync<VoiceAckDto>("voice.leave", new { channel_id = channelId }, ct);
+
+    /// <summary>上报本端静音状态（本地 ADM 已静音，但别人要看得见）。</summary>
+    public Task<VoiceAckDto> VoiceSetMuteAsync(string channelId, bool muted, CancellationToken ct = default) =>
+        RequestAsync<VoiceAckDto>("voice.set_mute", new { channel_id = channelId, muted }, ct);
+
+    public Task<VoiceAckDto> VoiceSetDeafenAsync(string channelId, bool deafened, CancellationToken ct = default) =>
+        RequestAsync<VoiceAckDto>("voice.set_deafen", new { channel_id = channelId, deafened }, ct);
 
     /// <summary>
     /// 等一条满足谓词的 media.signal；此前的匹配消息不会丢。
@@ -435,6 +459,15 @@ public sealed class PartyUpConnection : IAsyncDisposable
                 if (state is not null)
                 {
                     ScreenStateChanged?.Invoke(state);
+                }
+                return;
+            }
+            case "voice.state":
+            {
+                var state = envelope.Payload?.Deserialize<VoiceStateDto>(JsonDefaults.Options);
+                if (state is not null)
+                {
+                    VoiceStateChanged?.Invoke(state);
                 }
                 return;
             }

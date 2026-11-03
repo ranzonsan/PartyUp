@@ -22,7 +22,14 @@ public sealed partial class MemberRow : ObservableObject
     [ObservableProperty]
     private bool _isInVoice;
 
-    /// <summary>是否处于静音状态（只有自己可靠：媒体核心本地 mute 不外发）。</summary>
+    /// <summary>是否处于静音状态（来自服务端 voice.state.muted）。</summary>
     [ObservableProperty]
     private bool _isMuted;
+
+    /// <summary>「在语音」图标只在未静音时显示——静音时只留 🔇，避免两个图标并排。</summary>
+    public bool IsSpeakingIconVisible => IsInVoice && !IsMuted;
+
+    partial void OnIsInVoiceChanged(bool value) => OnPropertyChanged(nameof(IsSpeakingIconVisible));
+
+    partial void OnIsMutedChanged(bool value) => OnPropertyChanged(nameof(IsSpeakingIconVisible));
 }

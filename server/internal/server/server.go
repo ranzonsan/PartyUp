@@ -29,6 +29,9 @@ type Options struct {
 	Version      string        // 二进制版本，auth.ok.server.version
 	BootstrapTTL time.Duration // bootstrap token 有效期，默认 24h
 	Logger       *slog.Logger  // 默认 slog.Default()
+	// VoiceMode 是服务端语音传输策略："relay"（服务端 SFU 中继，默认，见 ADR-0002）
+	// 或 "direct"（P2P 直连）。客户端无权选择，只消费结果。
+	VoiceMode string
 }
 
 // Server 持有依赖与路由。一个进程一个 Server。
@@ -56,6 +59,7 @@ func New(st *store.Store, opts Options) *Server {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
+	opts.VoiceMode = NormalizeVoiceMode(opts.VoiceMode)
 	s := &Server{
 		store:        st,
 		log:          opts.Logger,
@@ -63,7 +67,7 @@ func New(st *store.Store, opts Options) *Server {
 		version:      opts.Version,
 		bootstrapTTL: opts.BootstrapTTL,
 	}
-	s.hub = NewHub(st, s.log, s.name, s.version)
+	s.hub = NewHub(st, s.log, s.name, s.version, opts.VoiceMode)
 	s.mux = http.NewServeMux()
 	s.routes()
 	return s

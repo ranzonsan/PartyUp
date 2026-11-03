@@ -55,13 +55,15 @@ type Hub struct {
 
 	// 语音（PROTOCOL.md §4）。这三张表都受 h.mu 保护，与 subs 共用一把锁，
 	// 避免出现「持 A 锁等 B 锁」的嵌套死锁；房间自身另有锁，调用房间方法时不持 h.mu。
-	voice     map[string]map[string]protocol.VoiceMemberState // channel_id → member_id → 状态
-	voiceMode map[string]string                               // channel_id → relay | direct
-	rooms     map[string]*sfu.Room                            // channel_id → 中继房间（仅 relay）
+	voice map[string]map[string]protocol.VoiceMemberState // channel_id → member_id → 状态
+	// voiceMode 是**服务端级**策略（启动参数 --voice-mode），不是每频道可变量：
+	// 客户端无权选择传输方式，语音/共享走中继还是直连由运维配置决定。
+	voiceMode string
+	rooms     map[string]*sfu.Room // channel_id → 中继房间（仅 relay 策略下存在）
 }
 
 // NewHub 构造会话中心。
-func NewHub(st *store.Store, log *slog.Logger, name, version string) *Hub {
+func NewHub(st *store.Store, log *slog.Logger, name, version, voiceMode string) *Hub {
 	return &Hub{
 		store:     st,
 		log:       log,
@@ -71,7 +73,7 @@ func NewHub(st *store.Store, log *slog.Logger, name, version string) *Hub {
 		subs:      make(map[string]map[*conn]struct{}, 8),
 		shares:    make(map[string]map[string]protocol.ShareState, 4),
 		voice:     make(map[string]map[string]protocol.VoiceMemberState, 4),
-		voiceMode: make(map[string]string, 4),
+		voiceMode: NormalizeVoiceMode(voiceMode),
 		rooms:     make(map[string]*sfu.Room, 4),
 		upgrader: websocket.Upgrader{
 			HandshakeTimeout: 10 * time.Second,
@@ -415,8 +417,6 @@ func (c *conn) handle(env protocol.Envelope) {
 		c.handleVoiceJoin(env)
 	case protocol.TypeVoiceLeave:
 		c.handleVoiceLeave(env)
-	case protocol.TypeVoiceSetMode:
-		c.handleVoiceSetMode(env)
 	case protocol.TypeVoiceSetMute:
 		c.handleVoiceSetMute(env)
 	case protocol.TypeVoiceSetDeafen:
@@ -574,6 +574,9 @@ func (c *conn) handleChannelSubscribe(env protocol.Envelope) {
 	}
 	c.hub.subscribe(c, channelID)
 	c.replyOK(env, protocol.ChannelSubscribeOK{ChannelID: channelID})
+	// 订阅后立刻推一次语音快照：客户端由此得知「本频道传输模式」与已在语音的成员，
+	// 不必等有人加入语音才知道（PROTOCOL.md §4：模式由服务端策略决定）。
+	c.hub.broadcastVoiceState(channelID)
 }
 
 func (c *conn) handleChannelUnsubscribe(env protocol.Envelope) {

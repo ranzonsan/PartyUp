@@ -59,6 +59,11 @@ public partial class MainWindow : Window
         // --token：自动登录（用于一键脚本和无头取证，不需要手点）。
         AppLog.Info("gui: auto-login with --token");
         await _viewModel.AutoLoginAsync(Program.Options.Token);
+
+        // 登录后右栏才显示：等一次布局，记录下拉框当前选中的源（自动化取证里用 UIA 点「开始共享」）。
+        await Task.Delay(1200);
+        AppLog.Info($"gui: share panel ready, selected-source={_viewModel.SelectedSource?.Id ?? "(none)"} " +
+                    $"title=\"{_viewModel.SelectedSource?.Title}\" size={StartShareButton.Bounds}");
     }
 
     private void OnClosed(object? sender, EventArgs e) => _mediaTimer.Stop();

@@ -26,6 +26,9 @@ public enum ClientMode
 
     /// <summary>屏幕共享的「观看方」：收到 offer 后应答，统计远端帧并打印结果。</summary>
     ShareView,
+
+    /// <summary>只打印 pu_screen_sources 枚举结果（显示器 id / 标题 / 分辨率 / 类型）后退出。</summary>
+    Sources,
 }
 
 /// <summary>
@@ -135,6 +138,9 @@ public sealed record ClientOptions
                     break;
                 case "--share-no-child":
                     options = options with { ShareNoChild = true };
+                    break;
+                case "--sources":
+                    options = options with { Mode = ClientMode.Sources };
                     break;
                 default:
                     // Avalonia 自己会忽略未知参数；这里也静默跳过，避免破坏 GUI 启动。

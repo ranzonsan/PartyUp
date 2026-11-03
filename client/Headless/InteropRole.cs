@@ -27,6 +27,7 @@ internal static class InteropRole
             ClientMode.Duo => await RunDuoAsync(options),
             ClientMode.ShareHost => await RunShareHostAsync(options),
             ClientMode.ShareView => await RunShareViewAsync(options),
+            ClientMode.Sources => RunSources(),
             ClientMode.RoleB => await RunSingleRoleAsync(options, isA: false),
             ClientMode.Send => await RunSendAsync(options),
             _ => await RunSingleRoleAsync(options, isA: true),
@@ -165,7 +166,14 @@ internal static class InteropRole
             // 等观看方订阅进来：offer 是广播，晚订阅就收不到。
             await connection.WaitForPresenceAsync(channel.Id, 2, PresenceTimeout);
 
-            var source = new MediaSource(options.ShareSourceId, "内置合成源（synthetic）", 640, 360, 2);
+            // 用 --share-source 指定的源；元数据（标题/真实分辨率/类型）从枚举结果里取，
+            // 不要硬编码——否则 screen.state 会把 2560×1440 的真实显示器报成 640×360 合成源。
+            var sources = engine.EnumerateSources();
+            var source = sources.FirstOrDefault(s => string.Equals(s.Id, options.ShareSourceId, StringComparison.Ordinal))
+                         ?? sources.FirstOrDefault(s => s.Kind == 0)
+                         ?? new MediaSource(options.ShareSourceId, options.ShareSourceId, 0, 0, 2);
+            AppLog.Pass($"share-host: source id={source.Id} title=\"{source.Title}\" " +
+                        $"{source.Width}x{source.Height} kind={source.Kind}");
             await session.StartSharingAsync(source);
 
             var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(options.ShareSeconds);
@@ -224,6 +232,44 @@ internal static class InteropRole
     }
 
     /// <summary>
+    /// --sources：只枚举可共享的源并打印（显示器 id 用于 `--share-source`）。
+    /// 不连服务端、不建窗口，纯读媒体核心。
+    /// </summary>
+    private static int RunSources()
+    {
+        MediaEngine? engine = null;
+        try
+        {
+            engine = MediaEngine.Load();
+            if (engine.MissingExports.Count > 0)
+            {
+                AppLog.Fail($"sources: DLL 缺 {engine.MissingExports.Count} 个导出");
+                Console.WriteLine("SOURCES_RESULT=FAIL");
+                return 1;
+            }
+            engine.Create("partyup-sources");
+            var sources = engine.EnumerateSources();
+            Console.WriteLine($"SOURCES_COUNT={sources.Count}");
+            foreach (var source in sources)
+            {
+                Console.WriteLine($"SOURCE id={source.Id} kind={source.Kind} {source.Width}x{source.Height} title=\"{source.Title}\"");
+            }
+            Console.WriteLine("SOURCES_RESULT=PASS");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            AppLog.Fail("sources: " + ex);
+            Console.WriteLine("SOURCES_RESULT=FAIL");
+            return 1;
+        }
+        finally
+        {
+            engine?.Dispose();
+        }
+    }
+
+    /// <summary>
     /// --share view：当观看方。等 offer → 交给媒体核心应答（answer 自动经 SIGNAL_OUT
     /// 回到共享方）→ 统计远端帧，够数就提前成功退出。
     /// </summary>
@@ -259,14 +305,31 @@ internal static class InteropRole
             AppLog.Pass("share-view: waiting for an offer");
 
             var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(options.ShareSeconds + 45);
+            var startedAt = DateTime.UtcNow;
             var nextReport = DateTime.UtcNow;
+            var lastCount = 0;
+            DateTime? firstFrameAt = null;
+            DateTime? lastFrameAt = null;
             while (DateTime.UtcNow < deadline)
             {
                 while (engine.Poll(0) is { } ev)
                 {
                     session.HandleMediaEvent(ev);
                 }
-                if (session.RemoteFrames >= 30)
+                if (session.RemoteFrames != lastCount)
+                {
+                    lastCount = session.RemoteFrames;
+                    firstFrameAt ??= DateTime.UtcNow;
+                    lastFrameAt = DateTime.UtcNow;
+                }
+                var runningFor = (DateTime.UtcNow - startedAt).TotalSeconds;
+                // 共享方停推 4 秒以上视为共享结束；否则至少看满 18 秒，帧率/CPU 统计才稳定。
+                if (session.RemoteFrames >= 10 && lastFrameAt is { } idleSince &&
+                    (DateTime.UtcNow - idleSince).TotalSeconds > 4)
+                {
+                    break;
+                }
+                if (session.RemoteFrames >= 30 && runningFor >= 18)
                 {
                     break;
                 }
@@ -283,8 +346,11 @@ internal static class InteropRole
             }
 
             var ok = session.RemoteFrames >= 10;
+            var span = firstFrameAt is { } ff && lastFrameAt is { } lf ? (lf - ff).TotalSeconds : 0;
+            var fps = span > 0.5 ? (session.RemoteFrames - 1) / span : 0;
             Console.WriteLine($"SHARE_VIEW_FRAMES={session.RemoteFrames}");
             Console.WriteLine($"SHARE_VIEW_SIZE={session.RemoteWidth}x{session.RemoteHeight}");
+            Console.WriteLine($"SHARE_VIEW_FPS={fps:F1} SHARE_VIEW_WINDOW={span:F1}s");
             Console.WriteLine($"SHARE_VIEW_SIGNALS_IN={session.SignalsIn} SHARE_VIEW_SIGNALS_OUT={session.SignalsOut}");
             Console.WriteLine($"SHARE_VIEW_RESULT={(ok ? "PASS" : "FAIL")}");
             return ok ? 0 : 1;

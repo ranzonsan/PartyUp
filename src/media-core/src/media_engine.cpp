@@ -770,6 +770,22 @@ class MediaEngine {
   webrtc::scoped_refptr<webrtc::AudioSourceInterface> voice_source_;
   webrtc::scoped_refptr<webrtc::AudioTrackInterface> voice_track_;
   webrtc::scoped_refptr<webrtc::RtpSenderInterface> voice_sender_;
+  // ---- v2.10 第 1 步：语音独立 PeerConnection（与屏幕的 pc_ 完全分开）----
+  // 语音 PC 只承载 audio，屏幕 PC（pc_）只承载 video；两者角色/候选/协商线程/统计
+  // 各自独立，一个失败或释放不影响另一个。
+  // TODO(step4): 合并到参数化的 MediaSession 版本，勿在此新增逻辑（只做搬家）。
+  webrtc::scoped_refptr<webrtc::PeerConnectionInterface> voice_pc_;
+  PcObserver* voice_observer_ = nullptr;   // 必须比 voice_pc_ 活得久
+  bool voice_offerer_ = false;             // 本端是语音会话的 offerer
+  bool voice_has_remote_description_ = false;
+  std::atomic<bool> voice_local_sdp_emitted_{false};
+  std::thread voice_negotiator_;
+  std::atomic<bool> voice_negotiator_stop_{false};
+  mutable std::mutex voice_cand_mu_;
+  std::vector<CandidateCopy> voice_gathered_;
+  std::vector<CandidateCopy> voice_buffered_;
+  std::atomic<int32_t> voice_peer_state_{PU_PEER_NONE};
+  std::atomic<int32_t> voice_ice_state_{PU_ICE_NEW};
   // 每条远端音频轨一个计数器（v2.7）。SFU relay 下会有 N 路音频同时进来，
   // 全局单 sink 只能数第一路，所以要按 track id 分别挂 sink。
   // 线程：attach/detach 在 signaling 线程（audio_tracks_mu_ 保护）；
@@ -914,14 +930,14 @@ class MediaEngine::PcObserver : public webrtc::PeerConnectionObserver {
 
   void OnIceConnectionChange(
       webrtc::PeerConnectionInterface::IceConnectionState state) override {
-    engine_->stat_ice_state_.store(static_cast<int32_t>(state), std::memory_order_relaxed);
+    IceState().store(static_cast<int32_t>(state), std::memory_order_relaxed);
     engine_->Log(3, "ice_connection_state=%s",
                  std::string(webrtc::PeerConnectionInterface::AsString(state)).c_str());
   }
 
   void OnConnectionChange(
       webrtc::PeerConnectionInterface::PeerConnectionState state) override {
-    engine_->stat_peer_state_.store(static_cast<int32_t>(state), std::memory_order_relaxed);
+    PeerState().store(static_cast<int32_t>(state), std::memory_order_relaxed);
     engine_->Log(3, "peer_connection_state=%s",
                  std::string(webrtc::PeerConnectionInterface::AsString(state)).c_str());
   }
@@ -940,13 +956,13 @@ class MediaEngine::PcObserver : public webrtc::PeerConnectionObserver {
     copy.mline_index = candidate->sdp_mline_index();
     copy.sdp = candidate->ToString();
     {
-      std::lock_guard<std::mutex> lock(engine_->cand_mu_);
-      engine_->gathered_candidates_.push_back(copy);
+      std::lock_guard<std::mutex> lock(CandMu());
+      GatheredCandidates().push_back(copy);
     }
     engine_->Log(3, "ice_candidate: %s", copy.sdp.c_str());
     // SDP 已经发出去了才来的候选，单独补一条 candidate 信令（trickle）。正常情况下
     // 我们要等收集完成才发 SDP，所以这条基本走不到；留着是为了将来接 TURN/SFU。
-    if (engine_->local_sdp_emitted_.load(std::memory_order_relaxed)) {
+    if (LocalSdpEmitted().load(std::memory_order_relaxed)) {
       engine_->EmitSignal("candidate", MakeCandidateEnvelope(copy), PU_SIGNAL_CANDIDATE);
     }
   }
@@ -1025,7 +1041,22 @@ class MediaEngine::PcObserver : public webrtc::PeerConnectionObserver {
                  id.c_str(), engine_->audio_tracks_.size(), peak_threshold);
   }
 
+  std::atomic<int32_t>& IceState() {
+    return voice_ ? engine_->voice_ice_state_ : engine_->stat_ice_state_;
+  }
+  std::atomic<int32_t>& PeerState() {
+    return voice_ ? engine_->voice_peer_state_ : engine_->stat_peer_state_;
+  }
+  std::atomic<bool>& LocalSdpEmitted() {
+    return voice_ ? engine_->voice_local_sdp_emitted_ : engine_->local_sdp_emitted_;
+  }
+  std::mutex& CandMu() { return voice_ ? engine_->voice_cand_mu_ : engine_->cand_mu_; }
+  std::vector<CandidateCopy>& GatheredCandidates() {
+    return voice_ ? engine_->voice_gathered_ : engine_->gathered_candidates_;
+  }
+
   MediaEngine* const engine_;
+  bool voice_ = false;
   std::atomic<bool> gathered_{false};
 };
 

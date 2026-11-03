@@ -192,6 +192,8 @@
             <!-- 屏幕共享：选源 → 开始/停止；观看方显示共享者与远端帧计数 -->
             <TextBlock Text="共享屏幕" FontSize="12"
                        FontWeight="SemiBold" Foreground="#FF9AA4B8" />
+            <TextBlock Text="{Binding ScreenModeText}" FontSize="11" Foreground="#FF7C8698"
+                       TextWrapping="Wrap" />
             <ComboBox x:Name="SourceCombo" ItemsSource="{Binding Sources}"
                       SelectedItem="{Binding SelectedSource}"
                       HorizontalAlignment="Stretch" FontSize="11">

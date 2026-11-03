@@ -78,10 +78,18 @@ HTTP 请求/响应体形状（2026-11-02 落地，此前文档未定义）：
 
 ## 4. 语音
 
-**传输方式由服务端策略决定，客户端无权也无需选择。** 服务端启动参数
-`--voice-mode=relay|direct`（环境变量 `PARTYUP_VOICE_MODE`，默认 `relay`，见 ADR-0002）
-决定语音走服务端中继还是 P2P 直连。客户端只从 `voice.join.ok.transport` 与
-`voice.state.mode` 读取结果，再按结果走对应媒体路径。
+**传输方式由服务端策略决定，客户端无权也无需选择。** 语音与屏幕共享是**两套独立策略**
+（ADR-0002「三类媒体各自决定路径」）：
+
+- `--voice-mode=relay|direct`（`PARTYUP_VOICE_MODE`，默认 `relay`）只管**语音**；
+- `--screen-mode=relay|direct`（`PARTYUP_SCREEN_MODE`，默认 `direct`）只管**屏幕共享**。
+
+两者可以不同：语音中继 + 屏幕直连是合法配置，反之亦然。客户端从
+`voice.join.ok.transport`（语音）与 `voice.state.voice_mode` / `voice.state.screen_mode`
+（两者）读取结果，再按结果走对应媒体路径。
+
+> `--screen-mode` 默认 `direct` 是过渡值：SFU 视频通道尚未实现，默认配置下屏幕共享必须可用。
+> 视频通道落地后默认值切到 `relay`（与语音对齐）。
 
 - `voice.join { channel_id }` —— 上行载荷**只有** `channel_id`。
   客户端即使多传一个 `mode` 字段也会被服务端忽略（协议不再定义该字段）。
@@ -90,9 +98,11 @@ HTTP 请求/响应体形状（2026-11-02 落地，此前文档未定义）：
 - `voice.leave { channel_id }`
 - `voice.set_mute { channel_id, muted }` / `voice.set_deafen { channel_id, deafened }`
   —— 上报本端静音/闭音状态。本地 ADM 状态仍由客户端自己控制；上报是为了让别人看见（`voice.state`）。
-- 广播 `voice.state { channel_id, mode, members: [{ member_id, muted, deafened }],
-  slots?: [{ index, member_id, muted }] }`
-  —— `mode` 就是服务端策略值；`members` 按 `member_id` 排序，稳定可比对。
+- 广播 `voice.state { channel_id, voice_mode, screen_mode,
+  members: [{ member_id, muted, deafened }], slots?: [{ index, member_id, muted }] }`
+  —— `voice_mode` / `screen_mode` 是两条独立策略的服务端实际值（`relay|direct`）；
+  旧字段 `mode` **已删除**（v1 客户端同版本发布，无兼容负担）。
+  `members` 按 `member_id` 排序，稳定可比对。
   `slots` 仅 relay 模式出现：**槽位序号 → 发布者**。它解决两件事：
   （a）客户端能把 native 侧 id 为 `partyup-slot-<index>` 的远端音轨映射到具体成员
   （后绑定的槽不再依赖随机的 msid）；
@@ -171,16 +181,29 @@ HTTP 请求/响应体形状（2026-11-02 落地，此前文档未定义）：
 
 服务端只做中转与定向投递，不解析也不改写 SDP：
 
-- `media.signal { channel_id, target?, to?, media, kind, payload }`
-  - `target` 省略 = 投递给频道成员（本节，direct 模式）；`target: "sfu"` = 交给服务端 SFU（§4.1，relay 模式）。
-    relay 下 `to` 被忽略；direct 下 `target` 必须为空。
-  - `media ∈ { screen, voice }`；`kind ∈ { offer, answer, candidate }`
+- `media.signal { channel_id, media, kind, payload, target?, to? }`
+  - **`media` 必填，`media ∈ { voice, screen }`，且是路由的唯一依据**：
+    - `media=voice` + `voice_mode=relay` → 交给服务端 SFU（§4.1，服务端是 offerer）
+    - `media=voice` + `voice_mode=direct` → 成员间转发（offer 广播 / answer·candidate 定向）
+    - `media=screen` + `screen_mode=direct` → 成员间转发
+    - `media=screen` + `screen_mode=relay` → SFU 视频通道（**尚未实现**，返回 `NOT_IMPLEMENTED`）
+  - `target` 仍接受（历史字段）但**只做一致性校验，不再参与路由**：与策略矛盾就报
+    `INVALID_ARGUMENT`（例如 `voice_mode=direct` 却带 `target:"sfu"`），避免「客户端以为走中继、
+    实际被当直连转发」这种静默错配。
+  - 为什么必须显式 `media`：语音与屏幕共享各用**独立 PeerConnection** 之后，原生侧必须把每条
+    offer/answer/candidate 精确投递到对应会话。`candidate` 的信封里只有 `mid`/`candidate` 文本，
+    **不带媒体类型**；靠 SDP 嗅探只能「两个会话各试一次、让 libwebrtc 拒掉一个」——那是静默失败。
+    客户端本来就知道信号属于哪个会话（媒体核心按会话发 `pu_signal_event`），直接标上去即可。
+  - `kind ∈ { offer, answer, candidate }`
   - `payload` 是**媒体核心产出的原始信令信封字符串**（`{"type":"offer","sdp":"…"}` /
     `{"type":"answer","sdp":"…"}` / `{"type":"candidate","mid":"0","mline":0,"candidate":"…"}`）。
     服务端当不透明字符串转发，长度上限 64 KiB。
   - `to` 省略 = 广播给频道内其它订阅者（offer 用这条）；`to` 指定成员 = 定向投递
     （answer / candidate 用这条，观看者只回给共享方，不打扰其他观看者）。
 - 服务端下发 `media.signal { channel_id, from, from_name, media, kind, payload }`，
+  接收方按 `media` 把 payload 交给对应会话：
+  `pu_signal_in_media(engine, "voice", payload, len)` 或 `pu_signal_in_media(engine, "screen", payload, len)`
+  （ABI v2 加法式扩张，第 20 个导出；**不要回退用 `pu_signal_in`**，那会让路由重新变得不可诊断）。
   接收方据此决定 answer/candidate 发给谁。
 
 2026-11-02 起 `media.signal` 就是屏幕共享直连的实际通道。原设计稿里的
@@ -196,14 +219,24 @@ HTTP 请求/响应体形状（2026-11-02 落地，此前文档未定义）：
   → `screen.start.ok { channel_id }`，随后服务端广播 `screen.state`
   - `source.kind ∈ { screen, window, synthetic }`；`id` 是媒体核心给的源 id
     （显示器为 HMONITOR 的十进制串），`width/height` 是源分辨率
-  - `mode ∈ { direct, relay }`，缺省 `direct`；当前只实现 direct（P2P），relay 留给 SFU
+  - **传输方式由服务端 `--screen-mode` 决定，与 `--voice-mode` 无关**；请求里的 `mode` 只作告知、
+    不参与决策（客户端传什么都不影响结果）。`screen.state` 里回显服务端实际值。
+  - `screen_mode=relay` 且 SFU 视频通道未就绪时，`screen.start` **在广播 `screen.state` 之前**
+    就返回 `NOT_IMPLEMENTED`（错误码），消息直接给用户看：
+    「当前服务器为纯 SFU 中继模式，暂不支持屏幕共享（视频通道开发中）」。
+    这是硬要求：不能在客户端先开采集再被拒——那会往已有的 PC 上挂视频轨，把语音一起拖坏
+    （历史实测 `role mismatch` → PCM 冻结）。
 - `screen.stop { channel_id }` → `screen.stop.ok { channel_id }`，广播 `screen.state`
-- 广播 `screen.state { channel_id, shares: [{ sharer_id, member_name, source, mode, viewers: [member_id] }] }`
-  —— 没有共享时 `shares` 是 `[]`，不推 `null`
+- 广播 `screen.state { channel_id, mode, shares: [{ sharer_id, member_name, source, mode, viewers: [member_id] }] }`
+  —— `mode` 是服务端屏幕共享策略（`relay|direct`），任何订阅者都能在加入共享/语音之前知道；
+  没有共享时 `shares` 是 `[]`，不推 `null`
 
-信令走 §4.2 的 `media.signal`：共享方 `screen.start` 后媒体核心产出 offer，经
-`media.signal kind=offer` 广播；观看方把 `payload` 原样喂给自己的媒体核心，应答的
-answer 经 `media.signal kind=answer to=<sharer_id>` 回给共享方；candidate 同理。
+信令走 §4.2 的 `media.signal`，**`media` 固定为 `"screen"`**：共享方 `screen.start` 后媒体核心
+产出 offer，经 `media.signal media=screen kind=offer` 发出；观看方按媒体类型交给自己的
+**屏幕会话**（`pu_signal_in_media(engine, "screen", …)`），应答的 answer 经
+`media.signal media=screen kind=answer to=<sharer_id>` 回给共享方；candidate 同理。
+屏幕共享与语音**各用独立 PeerConnection**，互不影响角色与协商状态（这正是 relay 下
+「点共享把语音搞坏」的根因修复）。
 
 `screen.watch` / `screen.unwatch`（每个观看者显式 opt-in，用于"为 N 人分别编码"的如实展示）
 在 v1 暂不实现：媒体核心的 `pu_screen_watch` 目前返回 `PU_NOT_IMPLEMENTED`，观看方收到

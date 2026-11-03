@@ -59,22 +59,31 @@ type Hub struct {
 	// voiceMode 是**服务端级**策略（启动参数 --voice-mode），不是每频道可变量：
 	// 客户端无权选择传输方式，语音/共享走中继还是直连由运维配置决定。
 	voiceMode string
-	rooms     map[string]*sfu.Room // channel_id → 中继房间（仅 relay 策略下存在）
+	// screenMode 是**屏幕共享**的独立传输策略（--screen-mode），与 voiceMode 无关：
+	// 语音走中继、共享走直连（或反过来）都是合法配置（ADR-0002 三类媒体各自决定路径）。
+	screenMode string
+	// sfuVideo 表示 SFU 中继是否已具备视频通道（屏幕共享）。
+	// v1 先只做音频；视频通道落地前 relay 下的 screen.start 必须干净失败，
+	// 绝不能落到「客户端当 offerer 发 offer」的旧路径——那会把语音 PC 一起搞坏。
+	sfuVideo bool
+	rooms    map[string]*sfu.Room // channel_id → 中继房间（仅 relay 策略下存在）
 }
 
 // NewHub 构造会话中心。
-func NewHub(st *store.Store, log *slog.Logger, name, version, voiceMode string) *Hub {
+func NewHub(st *store.Store, log *slog.Logger, name, version, voiceMode, screenMode string) *Hub {
 	return &Hub{
-		store:     st,
-		log:       log,
-		name:      name,
-		version:   version,
-		conns:     make(map[*conn]struct{}, 8),
-		subs:      make(map[string]map[*conn]struct{}, 8),
-		shares:    make(map[string]map[string]protocol.ShareState, 4),
-		voice:     make(map[string]map[string]protocol.VoiceMemberState, 4),
-		voiceMode: NormalizeVoiceMode(voiceMode),
-		rooms:     make(map[string]*sfu.Room, 4),
+		store:      st,
+		log:        log,
+		name:       name,
+		version:    version,
+		conns:      make(map[*conn]struct{}, 8),
+		subs:       make(map[string]map[*conn]struct{}, 8),
+		shares:     make(map[string]map[string]protocol.ShareState, 4),
+		voice:      make(map[string]map[string]protocol.VoiceMemberState, 4),
+		voiceMode:  NormalizeVoiceMode(voiceMode),
+		screenMode: NormalizeScreenMode(screenMode),
+		sfuVideo:   false, // 视频通道待实现；实现后置 true
+		rooms:      make(map[string]*sfu.Room, 4),
 		upgrader: websocket.Upgrader{
 			HandshakeTimeout: 10 * time.Second,
 			// 桌面客户端不是浏览器，没有同源概念；放开 Origin 检查。
@@ -718,8 +727,12 @@ func (h *Hub) broadcastScreenState(channelID string) {
 	}
 	h.mu.RUnlock()
 
+	h.mu.RLock()
+	screenMode := h.screenMode
+	h.mu.RUnlock()
 	data, err := protocol.MustNew(protocol.TypeScreenState, protocol.ScreenStatePayload{
 		ChannelID: channelID,
+		Mode:      screenMode,
 		Shares:    shares,
 	}).Marshal()
 	if err != nil {
@@ -775,12 +788,17 @@ func (c *conn) handleScreenStart(env protocol.Envelope) {
 		c.replyError(env.Type, protocol.CodeInvalidArgument, "invalid source", env.ID)
 		return
 	}
-	mode := strings.TrimSpace(req.Mode)
-	if mode == "" {
-		mode = "direct"
-	}
-	if mode != "direct" && mode != "relay" {
-		c.replyError(env.Type, protocol.CodeInvalidArgument, "mode must be direct or relay", env.ID)
+	// 传输方式完全由服务端 --screen-mode 决定（与语音 --voice-mode 相互独立）。
+	// 客户端传的 mode 仅作告知，不参与决策，因此也不校验它的取值。
+	c.hub.mu.RLock()
+	mode := c.hub.screenMode
+	sfuVideo := c.hub.sfuVideo
+	c.hub.mu.RUnlock()
+	if mode == "relay" && !sfuVideo {
+		// 视频通道未就绪时必须在广播 screen.state 之前拒绝：否则客户端会开始采集
+		// 并向已有语音 PC 上挂视频轨，把语音一起拖坏（历史实测 role mismatch → PCM 冻结）。
+		c.replyError(env.Type, protocol.CodeNotImplemented,
+			"当前服务器为纯 SFU 中继模式，暂不支持屏幕共享（视频通道开发中）", env.ID)
 		return
 	}
 
@@ -886,22 +904,60 @@ func (c *conn) handleMediaSignal(env protocol.Envelope) {
 
 	// relay 模式：这条信令的对象是服务端 SFU（offer 由服务端发，客户端只回 answer/candidate）。
 	// 用显式 target 区分 relay 与 direct，绝不靠 media/kind 猜——两条路径的信封长得一样。
-	if target := strings.TrimSpace(req.Target); target == "sfu" {
-		if media != "voice" {
-			c.replyError(env.Type, protocol.CodeInvalidArgument,
-				"target=sfu is only valid for media=voice", env.ID)
-			return
-		}
-		if err := c.hub.handleVoiceSignal(c.member.ID, channelID, kind, req.Payload); err != nil {
-			code := protocol.CodeInvalidArgument
-			if errors.Is(err, sfu.ErrNotInRoom) {
-				code = protocol.CodeConflict
+	// 路由只看 media + 服务端策略，**不再靠 target 猜**：
+	//   media=voice + voice_mode=relay  → 交给服务端 SFU（offer/answer/candidate 的对象都是服务端）
+	//   media=voice + voice_mode=direct → 成员间转发（按 to 定向 / 不带 to 广播 offer）
+	//   media=screen + screen_mode=relay → SFU 视频通道（尚未实现，明确 NOT_IMPLEMENTED）
+	//   media=screen + screen_mode=direct → 成员间转发
+	// target 仍接受但只做一致性校验：与策略矛盾就报错，避免客户端以为是 relay 却被当 direct 转发。
+	//
+	// 为什么必须显式 media：语音与屏幕各用独立 PeerConnection 后，candidate 的 SDP 行里
+	// 不带媒体类型，靠嗅探只能「两边都试一次让 libwebrtc 拒掉一个」——那是静默失败。
+	c.hub.mu.RLock()
+	voiceMode, screenMode := c.hub.voiceMode, c.hub.screenMode
+	sfuVideo := c.hub.sfuVideo
+	c.hub.mu.RUnlock()
+	target := strings.TrimSpace(req.Target)
+
+	if media == "voice" {
+		if voiceMode == "relay" {
+			if target != "" && target != "sfu" {
+				c.replyError(env.Type, protocol.CodeInvalidArgument,
+					"media=voice 且 voice_mode=relay 时信令对象只能是服务端 SFU", env.ID)
+				return
 			}
-			c.replyError(env.Type, code, err.Error(), env.ID)
+			if err := c.hub.handleVoiceSignal(c.member.ID, channelID, kind, req.Payload); err != nil {
+				code := protocol.CodeInvalidArgument
+				if errors.Is(err, sfu.ErrNotInRoom) {
+					code = protocol.CodeConflict
+				}
+				c.replyError(env.Type, code, err.Error(), env.ID)
+				return
+			}
+			c.replyOK(env, protocol.MediaSignalOK{ChannelID: channelID})
 			return
 		}
-		c.replyOK(env, protocol.MediaSignalOK{ChannelID: channelID})
-		return
+		if target == "sfu" {
+			c.replyError(env.Type, protocol.CodeInvalidArgument,
+				"voice_mode=direct 时不应带 target=sfu", env.ID)
+			return
+		}
+	} else { // media == "screen"
+		if screenMode == "relay" {
+			if !sfuVideo {
+				c.replyError(env.Type, protocol.CodeNotImplemented,
+					"屏幕共享 SFU 视频通道尚未实现（screen_mode=relay）", env.ID)
+				return
+			}
+			c.replyError(env.Type, protocol.CodeNotImplemented,
+				"屏幕共享 SFU 视频通道尚未实现（screen_mode=relay）", env.ID)
+			return
+		}
+		if target == "sfu" {
+			c.replyError(env.Type, protocol.CodeInvalidArgument,
+				"screen_mode=direct 时不应带 target=sfu", env.ID)
+			return
+		}
 	}
 
 	push := protocol.MediaSignalPush{

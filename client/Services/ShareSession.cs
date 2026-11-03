@@ -24,7 +24,10 @@ public sealed class ShareSession : IAsyncDisposable
     private readonly MediaEngine _engine;
     private readonly PartyUpConnection _connection;
     private readonly string _channelId;
-    private readonly Channel<string> _inbound = Channel.CreateUnbounded<string>(
+    /// <summary>一条待投递给媒体核心的信令：media 决定进 voice 还是 screen 会话。</summary>
+    private readonly record struct InboundSignal(string Media, string Payload);
+
+    private readonly Channel<InboundSignal> _inbound = Channel.CreateUnbounded<InboundSignal>(
         new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
     private readonly CancellationTokenSource _cts = new();
     private readonly Task _inboundLoop;
@@ -45,8 +48,17 @@ public sealed class ShareSession : IAsyncDisposable
     private readonly Dictionary<int, VoiceSlotDto> _voiceSlots = new();
     private string _lastSlotSignature = string.Empty;
 
+    /// <summary>
+    /// 屏幕共享的传输策略（服务端 --screen-mode，从 voice.state / screen.state 学习）。
+    /// 与语音 _voiceMode 完全独立：语音可中继、共享可直连。
+    /// </summary>
+    private string _screenMode = "direct";
+
     /// <summary>当前本端共享的源（断线重连后按原状恢复）。</summary>
     private MediaSource? _sharingSource;
+
+    /// <summary>最近一条 offer/answer 属于哪个会话（candidate 没有媒体类型，跟它走）。</summary>
+    private string? _lastSignalMedia;
 
     // 路径变化历史（v1 验收第 7 条）：最近 20 条，新的在前。
     private const int PathHistoryCapacity = 20;
@@ -125,6 +137,14 @@ public sealed class ShareSession : IAsyncDisposable
 
     public bool IsRelayMode => _voiceMode == "relay";
 
+    /// <summary>屏幕共享传输策略（服务端 --screen-mode）。</summary>
+    public string ScreenMode => _screenMode;
+
+    /// <summary>屏幕共享策略展示文本。</summary>
+    public string ScreenModeText => _screenMode == "relay"
+        ? "中继（服务端 SFU 视频通道，暂未实现）"
+        : "直连（P2P）";
+
     /// <summary>语音模式展示文本（服务端策略值；客户端不参与选择）。</summary>
     public string VoiceModeText => _voiceMode == "relay"
         ? "中继（服务端 SFU）"
@@ -168,13 +188,56 @@ public sealed class ShareSession : IAsyncDisposable
                 "共享源 id 为空：native 会把空 id 当成合成源，已拒绝启动（请重新选择显示器）");
         }
         LastError = null;
+
+        // 兜底：屏幕共享中继通道（SFU 视频）还没实现。这里在**碰本地采集和信令之前**就干净失败，
+        // 避免「点了个共享按钮，语音就没了」。服务端也会拒（权威），这里是快速失败 + 明确文案。
+        if (_screenMode == "relay")
+        {
+            LastError = "当前服务器为纯 SFU 中继模式，暂不支持屏幕共享（视频通道开发中）";
+            AppLog.Fail("share: " + LastError);
+            Changed?.Invoke();
+            throw new InvalidOperationException(LastError);
+        }
+
+        // 顺序很重要：**先让服务端批准，再开本地采集**。
+        // 纯 SFU 中继模式（视频通道未就绪）下服务端会回 NOT_IMPLEMENTED；如果先 StartScreen，
+        // 原生会给已有语音 PC 挂视频轨并发 offer，把语音一起拖坏（实测 role mismatch → PCM 冻结）。
+        try
+        {
+            await _connection.StartScreenAsync(
+                _channelId,
+                new ScreenSourceDto(source.Id, source.Title, (int)source.Width, (int)source.Height, KindName(source.Kind)),
+                "direct",
+                ct);
+        }
+        catch (Exception ex)
+        {
+            LastError = ex.Message;
+            _sharingSource = null;
+            IsSharing = false;
+            SharingSourceTitle = string.Empty;
+            AppLog.Fail("share: server rejected — " + ex.Message);
+            Changed?.Invoke();
+            throw new InvalidOperationException(ex.Message, ex);
+        }
+
+        try
+        {
+            _engine.StartScreen(source.Id);
+        }
+        catch (Exception ex)
+        {
+            // 本地采集起不来：把服务端登记回滚掉，避免别人看到一个永远不会有的共享。
+            try { await _connection.StopScreenAsync(_channelId, ct); } catch { /* 尽力而为 */ }
+            LastError = "本地采集启动失败：" + ex.Message;
+            _sharingSource = null;
+            IsSharing = false;
+            AppLog.Fail("share: " + LastError);
+            Changed?.Invoke();
+            throw new InvalidOperationException(LastError, ex);
+        }
+
         _sharingSource = source;
-        _engine.StartScreen(source.Id);
-        await _connection.StartScreenAsync(
-            _channelId,
-            new ScreenSourceDto(source.Id, source.Title, (int)source.Width, (int)source.Height, KindName(source.Kind)),
-            "direct",
-            ct);
         IsSharing = true;
         SharingSourceTitle = source.Title;
         AppLog.Pass($"share: started source=\"{source.Title}\" id={source.Id} size={source.Width}x{source.Height}");
@@ -222,13 +285,21 @@ public sealed class ShareSession : IAsyncDisposable
                     return;
                 }
                 SignalsOut++;
-                // 语音与屏幕共享共用同一条 media.signal、也共用同一个 PeerConnection，
-                // 所以不能用「当前是否在语音」来猜 media：语音时开始共享，第一个 offer 里已经带 video。
-                // 直接看 SDP：带 m=video 的 offer/answer 就是屏幕共享的协商，纯音频才是语音。
+                // media 必须显式标出：语音与屏幕共享各用独立 PeerConnection，服务端/原生侧都靠它
+                // 把 offer/answer/candidate 精确投递到对应会话（candidate 信封里没有媒体类型，
+                // 靠嗅探只能「两边都试」，属于静默失败）。
+                //
+                // 现阶段媒体核心的 signal 事件还没带 media 字段，所以这里分类：
+                //   - offer/answer 看 SDP：带 m=video 的一定是屏幕会话（语音会话只有 audio）；
+                //   - candidate 没有媒体类型，沿用同一轮协商的 media（_lastSignalMedia）。
+                // 媒体核心补上事件级 media 后，这里应改为直接读事件字段。
                 var hasVideo = ev.SignalPayload.Contains("m=video", StringComparison.Ordinal);
-                var media = hasVideo ? "screen" : (_voiceJoined || IsSharing ? "voice" : "screen");
-                // relay 模式下语音信令（音频 SDP / 候选）的对象是服务端 SFU；屏幕共享仍走 direct 转发。
-                var sfu = !hasVideo && _voiceMode == "relay";
+                var media = kind == PuSignalKind.Candidate
+                    ? (_lastSignalMedia ?? (hasVideo ? "screen" : "voice"))
+                    : (hasVideo ? "screen" : "voice");
+                if (kind != PuSignalKind.Candidate) _lastSignalMedia = media;
+                // target 由**各自策略**决定：voice 看 _voiceMode，screen 看 _screenMode。
+                var sfu = media == "screen" ? _screenMode == "relay" : _voiceMode == "relay";
                 var target = sfu ? "sfu" : null;
                 // direct：offer 广播；answer/candidate 定向回最后一个给我们发 offer 的人。
                 var to = sfu ? null : (kind == PuSignalKind.Offer ? null : _signalPeerId);
@@ -280,7 +351,7 @@ public sealed class ShareSession : IAsyncDisposable
         {
             SignalsIn++;
             AppLog.Info($"media: sfu signal in kind={signal.Kind} bytes={signal.Payload.Length}");
-            _inbound.Writer.TryWrite(signal.Payload);
+            _inbound.Writer.TryWrite(new InboundSignal(signal.Media, signal.Payload));
             Changed?.Invoke();
             return;
         }
@@ -301,7 +372,7 @@ public sealed class ShareSession : IAsyncDisposable
                         $"video={isVideoOffer}, hand to media core");
         }
         SignalsIn++;
-        _inbound.Writer.TryWrite(signal.Payload);
+        _inbound.Writer.TryWrite(new InboundSignal(signal.Media, signal.Payload));
         Changed?.Invoke();
     }
 
@@ -714,11 +785,18 @@ public sealed class ShareSession : IAsyncDisposable
                 AppLog.Info($"voice: slots {_voiceSlots.Count} [{desc}]");
             }
         }
-        var serverMode = IsDirectTransport(state.Mode) ? "direct" : "relay";
+        var serverMode = IsDirectTransport(state.VoiceMode) ? "direct" : "relay";
         if (!_voiceJoined && serverMode != _voiceMode)
         {
             _voiceMode = serverMode;
-            AppLog.Info($"voice: server policy transport={_voiceMode}");
+            AppLog.Info($"voice: server policy voice_mode={_voiceMode}");
+        }
+        // 屏幕共享策略独立：无论是否在语音都要学，UI 才能在点共享前就显示/拦截。
+        var screenMode = IsDirectTransport(state.ScreenMode) ? "direct" : "relay";
+        if (screenMode != _screenMode)
+        {
+            _screenMode = screenMode;
+            AppLog.Info($"share: server policy screen_mode={_screenMode}");
         }
         Changed?.Invoke();
     }
@@ -729,6 +807,15 @@ public sealed class ShareSession : IAsyncDisposable
 
     private void OnScreenState(ScreenStateDto state)
     {
+        if (!string.IsNullOrEmpty(state.Mode))
+        {
+            var screenMode = IsDirectTransport(state.Mode) ? "direct" : "relay";
+            if (screenMode != _screenMode)
+            {
+                _screenMode = screenMode;
+                AppLog.Info($"share: server policy screen_mode={_screenMode}");
+            }
+        }
         Shares = state.Shares;
         // 共享停止时清掉观看状态，UI 才不会一直显示"正在观看"。
         var stillShared = state.Shares.Any(s => s.SharerId == _remoteSharerId);
@@ -745,11 +832,25 @@ public sealed class ShareSession : IAsyncDisposable
     {
         try
         {
-            await foreach (var payload in _inbound.Reader.ReadAllAsync(_cts.Token))
+            await foreach (var signal in _inbound.Reader.ReadAllAsync(_cts.Token))
             {
-                // pu_signal_in 同步阻塞：这里已经是后台线程，UI 与 WS 接收循环都不受影响。
-                var bytes = Encoding.UTF8.GetBytes(payload);
-                var status = _engine.SignalIn(bytes);
+                // pu_signal_in_media 同步阻塞：这里已经是后台线程，UI 与 WS 接收循环都不受影响。
+                // media 决定进 voice 还是 screen 会话：语音/共享是两条独立 PeerConnection。
+                var bytes = Encoding.UTF8.GetBytes(signal.Payload);
+                int status;
+                try
+                {
+                    status = _engine.SignalIn(signal.Media, bytes);
+                }
+                catch (InvalidOperationException ex)
+                {
+                    // 能力缺失（DLL 还没有 pu_signal_in_media）：明确报错、不进静默降级。
+                    LastError = ex.Message;
+                    AppLog.Fail("media: " + ex.Message);
+                    Changed?.Invoke();
+                    _inbound.Writer.TryComplete();
+                    return;
+                }
                 if (status != 0)
                 {
                     var err = _engine.LastErrorText();
@@ -768,7 +869,7 @@ public sealed class ShareSession : IAsyncDisposable
                 }
                 else
                 {
-                    AppLog.Info($"share: signal in applied ({bytes.Length} bytes)");
+                    AppLog.Info($"media: signal in applied media={signal.Media} ({bytes.Length} bytes)");
                 }
             }
         }

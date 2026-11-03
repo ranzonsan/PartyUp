@@ -903,7 +903,11 @@ class MediaEngine::RemoteFrameSink : public webrtc::VideoSinkInterface<webrtc::V
 // 不加 final（不是必须，但和 spike 的写法保持一致，也免得套 RefCountedObject 时再踩）。
 class MediaEngine::PcObserver : public webrtc::PeerConnectionObserver {
  public:
-  explicit PcObserver(MediaEngine* engine) : engine_(engine) {}
+  // v2.10 第 1 步：同一个 observer 类服务两条会话，voice=true 时把状态/候选写到
+  // 语音自己那套成员上（语音和屏幕各自独立 PC，互不影响）。
+  // TODO(step4): 合并到参数化的 MediaSession 版本，勿在此新增逻辑（只做搬家）。
+  explicit PcObserver(MediaEngine* engine, bool voice = false)
+      : engine_(engine), voice_(voice) {}
 
   void OnSignalingChange(
       webrtc::PeerConnectionInterface::SignalingState /*state*/) override {}

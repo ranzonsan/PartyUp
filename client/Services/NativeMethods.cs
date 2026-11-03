@@ -82,6 +82,18 @@ internal static class NativeMethods
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
     public static extern int pu_signal_in(IntPtr engine, IntPtr payload, UIntPtr len);
 
+    /// <summary>
+    /// pu_signal_in_media（ABI v2 第 20 个导出，加法式扩张）：把一条信令明确投给
+    /// "voice" 或 "screen" 会话。语音/共享各用独立 PeerConnection 后必须显式指定，
+    /// 不能靠 SDP 嗅探（candidate 信封里没有媒体类型）。
+    /// </summary>
+    [DllImport(Library, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    public static extern int pu_signal_in_media(
+        IntPtr engine,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string media,
+        IntPtr payload,
+        UIntPtr len);
+
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
     public static extern int pu_peer_stats(IntPtr engine, ref PuStats stats);
 

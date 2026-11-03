@@ -113,6 +113,10 @@ public sealed partial class MainViewModel : ObservableObject
     [ObservableProperty]
     private string _voiceModeText = "模式：—";
 
+    /// <summary>屏幕共享传输策略（独立于语音，服务端 --screen-mode 决定）。</summary>
+    [ObservableProperty]
+    private string _screenModeText = "共享模式：—";
+
     public string VoiceJoinButtonText => IsInVoice ? "离开语音" : "加入语音";
 
     /// <summary>当前频道语音是否走服务端中继（relay / SFU）。</summary>
@@ -801,7 +805,8 @@ public sealed partial class MainViewModel : ObservableObject
         IsVoiceDeafened = share.IsVoiceDeafened;
         IsRelayMode = share.IsRelayMode;
         VoiceMemberCount = share.VoiceMemberCount;
-        VoiceModeText = "本频道：" + share.VoiceModeText + "（服务端策略）";
+        VoiceModeText = "语音传输：" + share.VoiceModeText + "（服务端策略）";
+        ScreenModeText = "共享传输：" + share.ScreenModeText + "（服务端策略）";
         VoiceStatusText = !share.IsInVoice
             ? "语音：未加入"
             : $"语音：已加入（{share.VoiceMemberCount} 人）" +

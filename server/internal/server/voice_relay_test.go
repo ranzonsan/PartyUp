@@ -658,10 +658,10 @@ func TestVoiceModeIsServerPolicy(t *testing.T) {
 			}
 			if !waitUntil(t, "voice.state carries server mode", 3*time.Second, func() bool {
 				st, ok := peer.lastState()
-				return ok && st.Mode == tc.want && len(st.Members) == 1 && st.Members[0].MemberID == member.ID
+				return ok && st.VoiceMode == tc.want && len(st.Members) == 1 && st.Members[0].MemberID == member.ID
 			}) {
 				st, _ := peer.lastState()
-				t.Fatalf("voice.state = mode=%q members=%d, want %q/1", st.Mode, len(st.Members), tc.want)
+				t.Fatalf("voice.state = mode=%q members=%d, want %q/1", st.VoiceMode, len(st.Members), tc.want)
 			}
 
 			if tc.want == "relay" {
@@ -699,10 +699,10 @@ func TestVoiceStateBroadcast(t *testing.T) {
 
 	if !waitUntil(t, "alice sees 2 voice members", 5*time.Second, func() bool {
 		st, ok := e.alice.lastState()
-		return ok && st.Mode == "relay" && len(st.Members) == 2
+		return ok && st.VoiceMode == "relay" && st.ScreenMode == "direct" && len(st.Members) == 2
 	}) {
 		st, _ := e.alice.lastState()
-		t.Fatalf("alice voice.state = mode=%q members=%d, want relay/2", st.Mode, len(st.Members))
+		t.Fatalf("alice voice.state = voice_mode=%q screen_mode=%q members=%d, want relay/direct/2", st.VoiceMode, st.ScreenMode, len(st.Members))
 	}
 
 	// 静音上报：bob 静音后，alice 侧的 voice.state 里 bob.muted 必须为 true。

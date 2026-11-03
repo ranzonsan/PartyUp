@@ -98,11 +98,12 @@ public sealed class MediaEngine : IDisposable
     private IntPtr _handle;
     private bool _disposed;
 
-    private MediaEngine(string libraryPath, IntPtr handle, IReadOnlyList<string> missingExports)
+    private MediaEngine(string libraryPath, IntPtr handle, IReadOnlyList<string> missingExports, bool hasMediaSignal)
     {
         LibraryPath = libraryPath;
         _handle = handle;
         MissingExports = missingExports;
+        HasMediaSignalSupport = hasMediaSignal;
     }
 
     /// <summary>
@@ -161,7 +162,14 @@ public sealed class MediaEngine : IDisposable
         var missing = ExportNames
             .Where(name => !NativeLibrary.TryGetExport(handle, name, out _))
             .ToArray();
-        return new MediaEngine(path, handle, missing);
+        // 可选导出（加法式 ABI）：有就用，没有就明确报缺，不静默降级。
+        var hasMediaSignal = NativeLibrary.TryGetExport(handle, "pu_signal_in_media", out _);
+        if (!hasMediaSignal)
+        {
+            AppLog.Fail("media: DLL 缺少 pu_signal_in_media（ABI v2 第 20 个导出）——" +
+                        "语音/屏幕共享信令无法按会话路由，需要新 DLL");
+        }
+        return new MediaEngine(path, handle, missing, hasMediaSignal);
     }
 
     /// <summary>DllImport 解析器：只接管 partyup_media，其余交给默认逻辑。</summary>
@@ -375,6 +383,37 @@ public sealed class MediaEngine : IDisposable
     public int Watch(string sharerId) => NativeMethods.pu_screen_watch(_engine, sharerId);
 
     public int Unwatch(string sharerId) => NativeMethods.pu_screen_unwatch(_engine, sharerId);
+
+    /// <summary>
+    /// 把信令投递给指定媒体会话（"voice" / "screen"）。
+    /// 语音与屏幕共享是两条独立 PeerConnection，媒体类型由客户端显式给出，不做 SDP 嗅探——
+    /// candidate 信封里根本没有媒体类型，嗅探只能「两边都试」，属于静默失败。
+    /// </summary>
+    /// <summary>
+    /// 媒体核心是否已提供 pu_signal_in_media（ABI v2 第 20 个导出）。
+    /// 没有它就无法把信令明确路由到 voice / screen 会话——这是**能力缺失**，
+    /// 不静默退回 pu_signal_in（那会让路由问题重新不可诊断）。
+    /// </summary>
+    public bool HasMediaSignalSupport { get; private set; }
+
+    public int SignalIn(string media, byte[] payload)
+    {
+        if (!HasMediaSignalSupport)
+        {
+            throw new InvalidOperationException(
+                "媒体核心缺少 pu_signal_in_media：需要带 ABI v2 第 20 个导出的新 DLL（语音/共享信令无法路由）");
+        }
+        var ptr = Marshal.AllocHGlobal(payload.Length);
+        try
+        {
+            Marshal.Copy(payload, 0, ptr, payload.Length);
+            return NativeMethods.pu_signal_in_media(_engine, media, ptr, (UIntPtr)(uint)payload.Length);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(ptr);
+        }
+    }
 
     public int SignalIn(byte[] payload)
     {

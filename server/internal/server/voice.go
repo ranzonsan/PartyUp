@@ -26,6 +26,16 @@ import (
 // 空值或无法识别的值一律回落到默认 relay（ADR-0002：语音默认中继）。
 //
 // 这是**服务端配置**，不是客户端请求参数；客户端无权选择传输方式。
+// NormalizeScreenMode 归一化屏幕共享传输策略。与语音策略完全独立（ADR-0002）。
+// SFU 视频通道尚未实现，所以默认 direct：默认配置下屏幕共享必须可用；
+// 视频通道落地后把 main.go 的默认值切到 relay。
+func NormalizeScreenMode(mode string) string {
+	if strings.EqualFold(strings.TrimSpace(mode), "relay") {
+		return "relay"
+	}
+	return "direct"
+}
+
 func NormalizeVoiceMode(mode string) string {
 	if strings.EqualFold(strings.TrimSpace(mode), "direct") {
 		return "direct"
@@ -105,6 +115,7 @@ func (h *Hub) handleVoiceSignal(memberID, channelID, kind, payload string) error
 func (h *Hub) broadcastVoiceState(channelID string) {
 	h.mu.RLock()
 	mode := h.voiceMode
+	screenMode := h.screenMode
 	members := make([]protocol.VoiceMemberState, 0, len(h.voice[channelID]))
 	for _, m := range h.voice[channelID] {
 		members = append(members, m)
@@ -136,10 +147,11 @@ func (h *Hub) broadcastVoiceState(channelID string) {
 	}
 
 	data, err := protocol.MustNew(protocol.TypeVoiceState, protocol.VoiceStatePayload{
-		ChannelID: channelID,
-		Mode:      mode,
-		Members:   members,
-		Slots:     slots,
+		ChannelID:  channelID,
+		VoiceMode:  mode,
+		ScreenMode: screenMode,
+		Members:    members,
+		Slots:      slots,
 	}).Marshal()
 	if err != nil {
 		h.log.Error("marshal voice.state", "err", err)

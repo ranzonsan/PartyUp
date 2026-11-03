@@ -34,6 +34,10 @@ const (
 	CodeRateLimited     = "RATE_LIMITED"
 	CodeInternal        = "INTERNAL"
 
+	// CodeNotImplemented 表示服务端当前配置不支持该能力（例如纯 SFU 中继模式下的屏幕共享）。
+	// 与 INTERNAL 区分开：这是**可预期的不支持**，客户端应把 message 直接展示给用户。
+	CodeNotImplemented = "NOT_IMPLEMENTED"
+
 	// CodeInvalidArgument 是骨架新增的码：载荷形状/字段非法。
 	// PROTOCOL.md 的第一批里没有它，而 HTTP 400 与 WS 参数错误需要一个稳定名字，
 	// 建议下一版文档补入（见 spike 文档）。
@@ -321,8 +325,11 @@ type ScreenStopRequest struct {
 
 // ScreenStatePayload 是 screen.state 推送的载荷：频道内当前所有共享。
 type ScreenStatePayload struct {
-	ChannelID string       `json:"channel_id"`
-	Shares    []ShareState `json:"shares"`
+	ChannelID string `json:"channel_id"`
+	// Mode 是服务端屏幕共享传输策略（--screen-mode），与 VoiceMode 独立。
+	// 客户端据此决定共享信令 target（relay → sfu，direct → 成员）以及本地角色。
+	Mode   string       `json:"mode"` // relay | direct
+	Shares []ShareState `json:"shares"`
 }
 
 // MediaSignalRequest 是客户端上行的一条媒体信令。
@@ -420,9 +427,14 @@ type VoiceSlotState struct {
 
 // VoiceStatePayload 是 voice.state 推送的载荷（频道内语音成员快照）。
 type VoiceStatePayload struct {
-	ChannelID string             `json:"channel_id"`
-	Mode      string             `json:"mode"` // relay | direct
-	Members   []VoiceMemberState `json:"members"`
+	ChannelID string `json:"channel_id"`
+	// VoiceMode / ScreenMode 是**两条独立的服务端策略**（--voice-mode / --screen-mode），
+	// 客户端只消费、不参与选择。刻意拆成两个字段而不是一个 mode：
+	// 语音与屏幕共享可以走不同路径（例如语音中继 + 屏幕直连）。
+	// 旧字段 mode 已删除（v1 客户端同版本发布，无兼容负担）。
+	VoiceMode  string             `json:"voice_mode"`  // relay | direct
+	ScreenMode string             `json:"screen_mode"` // relay | direct
+	Members    []VoiceMemberState `json:"members"`
 	// Slots 仅 relay 模式出现：槽位 → 成员映射，供客户端做「谁在说话」与按人统计。
 	Slots []VoiceSlotState `json:"slots,omitempty"`
 }

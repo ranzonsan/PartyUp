@@ -43,7 +43,14 @@ func newTestEnv(t *testing.T) *testEnv {
 }
 
 // newTestEnvWith 允许测试覆盖服务端选项（目前用于语音传输策略：relay / direct）。
+// 屏幕共享策略独立，默认 direct；需要覆盖时用 newTestEnvWithModes。
 func newTestEnvWith(t *testing.T, voiceMode string) *testEnv {
+	t.Helper()
+	return newTestEnvWithModes(t, voiceMode, "")
+}
+
+// newTestEnvWithModes 同时指定语音与屏幕共享策略（两者互相独立，见 ADR-0002）。
+func newTestEnvWithModes(t *testing.T, voiceMode, screenMode string) *testEnv {
 	t.Helper()
 
 	st, err := store.Open(t.TempDir())
@@ -58,10 +65,11 @@ func newTestEnvWith(t *testing.T, voiceMode string) *testEnv {
 	}
 	logger := slog.New(slog.NewTextHandler(logOut, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	srv := server.New(st, server.Options{
-		Name:      "test-server",
-		Version:   "0.0.0-test",
-		Logger:    logger,
-		VoiceMode: voiceMode,
+		Name:       "test-server",
+		Version:    "0.0.0-test",
+		Logger:     logger,
+		VoiceMode:  voiceMode,
+		ScreenMode: screenMode,
 	})
 
 	info, err := srv.EnsureFirstRun(context.Background())

@@ -95,6 +95,11 @@ func cmdServe(args []string) error {
 	// 语音传输策略：客户端无权选择，由运维在这里定（默认中继，见 ADR-0002）。
 	voiceMode := fs.String("voice-mode", envOr("PARTYUP_VOICE_MODE", "relay"),
 		"语音传输策略：relay（服务端 SFU 中继，默认）| direct（P2P 直连）")
+	// 屏幕共享是**独立**的传输策略，与语音互不影响（ADR-0002：三类媒体各自决定路径）。
+	// 默认 direct：SFU 视频通道尚未实现，默认配置下共享必须可用；
+	// 视频通道落地后把默认值切到 relay。
+	screenMode := fs.String("screen-mode", envOr("PARTYUP_SCREEN_MODE", "direct"),
+		"屏幕共享传输策略：direct（P2P 直连，当前默认）| relay（服务端 SFU 视频通道，开发中）")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -108,10 +113,11 @@ func cmdServe(args []string) error {
 	defer st.Close()
 
 	srv := server.New(st, server.Options{
-		Name:      *name,
-		Version:   version,
-		Logger:    logger,
-		VoiceMode: *voiceMode,
+		Name:       *name,
+		Version:    version,
+		Logger:     logger,
+		VoiceMode:  *voiceMode,
+		ScreenMode: *screenMode,
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -143,6 +149,7 @@ func cmdServe(args []string) error {
 		fmt.Printf("INVITE_CODE=%s\n", info.InviteCode)
 	}
 	fmt.Printf("VOICE_MODE=%s\n", server.NormalizeVoiceMode(*voiceMode))
+	fmt.Printf("SCREEN_MODE=%s\n", server.NormalizeScreenMode(*screenMode))
 	fmt.Printf("LISTEN_ADDR=%s\n", ln.Addr().String())
 	fmt.Println("READY")
 

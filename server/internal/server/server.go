@@ -29,9 +29,13 @@ type Options struct {
 	Version      string        // 二进制版本，auth.ok.server.version
 	BootstrapTTL time.Duration // bootstrap token 有效期，默认 24h
 	Logger       *slog.Logger  // 默认 slog.Default()
-	// VoiceMode 是服务端语音传输策略："relay"（服务端 SFU 中继，默认，见 ADR-0002）
+	// VoiceMode 是服务端**语音**传输策略："relay"（服务端 SFU 中继，默认，见 ADR-0002）
 	// 或 "direct"（P2P 直连）。客户端无权选择，只消费结果。
 	VoiceMode string
+	// ScreenMode 是服务端**屏幕共享**传输策略，与 VoiceMode 相互独立
+	// （ADR-0002：三类媒体各自决定路径）。"relay" = 走 SFU 视频通道；
+	// "direct" = 成员间 P2P。空值由 NormalizeScreenMode 归一到 direct。
+	ScreenMode string
 }
 
 // Server 持有依赖与路由。一个进程一个 Server。
@@ -67,7 +71,7 @@ func New(st *store.Store, opts Options) *Server {
 		version:      opts.Version,
 		bootstrapTTL: opts.BootstrapTTL,
 	}
-	s.hub = NewHub(st, s.log, s.name, s.version, opts.VoiceMode)
+	s.hub = NewHub(st, s.log, s.name, s.version, opts.VoiceMode, opts.ScreenMode)
 	s.mux = http.NewServeMux()
 	s.routes()
 	return s

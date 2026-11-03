@@ -43,7 +43,7 @@ public sealed record ScreenSourceDto(string Id, string Title, int Width, int Hei
 /// <summary>screen.state 里的一路共享。</summary>
 public sealed record ShareDto(string SharerId, string MemberName, ScreenSourceDto Source, string Mode, IReadOnlyList<string> Viewers);
 
-public sealed record ScreenStateDto(string ChannelId, IReadOnlyList<ShareDto> Shares);
+public sealed record ScreenStateDto(string ChannelId, string Mode, IReadOnlyList<ShareDto> Shares);
 
 public sealed record ScreenAckDto(string ChannelId);
 
@@ -70,7 +70,8 @@ public sealed record VoiceSlotDto(int Index, string MemberId, bool Muted);
 /// <summary>voice.state 推送：频道当前语音快照（mode + 成员 + relay 槽位映射）。</summary>
 public sealed record VoiceStateDto(
     string ChannelId,
-    string Mode,
+    string VoiceMode,
+    string ScreenMode,
     IReadOnlyList<VoiceMemberDto> Members,
     IReadOnlyList<VoiceSlotDto>? Slots);
 

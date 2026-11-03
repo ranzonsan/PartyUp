@@ -582,8 +582,14 @@ class NullAudioDeviceModule
 // OnData 照常回调、峰值恒为 0。所以「有回调」不等于「有人在说话」——必须先算峰值，
 // 只有峰值达到阈值才记帧数、才刷新 last_frame_ms；否则 tracks/活跃判定会把空槽全点亮。
 //
-// 阈值默认 8（16 bit 采样绝对值；实测环境噪声 5~7），可用环境变量
-// PARTYUP_VOICE_PEAK_THRESHOLD 覆盖（1~32767）。
+// 阈值定位（重要）：这是**非零门控**，不是 VAD / 人声检测。
+//   目标只有一个：挡掉 SFU 预协商空槽送来的**全零静音帧**（peak=0），
+//   让 pu_voice_tracks() 不会把 12 条空槽都当成「有人」返回。默认 8 足够。
+//   「谁在说话」要区分人声与环境噪声，取决于设备增益（实测某笔记本麦克风噪声峰值
+//   可达 ~300），由客户端基于 peak/last_frame_ms 自适应判定，媒体核心只给原始量。
+// 阈值默认 8（16 bit 采样绝对值），可用环境变量 PARTYUP_VOICE_PEAK_THRESHOLD 覆盖
+// （1~32767）。注意：/MT DLL 有自己一份 CRT environ，宿主 _putenv_s 改不到，
+// 必须用 GetEnvironmentVariableA 读 Win32 进程环境块（见 docs/spikes C ABI 文档）。
 uint32_t VoicePeakThresholdFromEnv() {
   // 注意：本 DLL 用 /MT（静态 CRT），std::getenv 读的是**本模块 CRT 自己那份**
   // environ 副本，宿主进程 _putenv_s 改不到它。所以这里直接问 Win32 进程环境块

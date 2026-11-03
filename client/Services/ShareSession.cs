@@ -41,6 +41,9 @@ public sealed class ShareSession : IAsyncDisposable
     private string _voiceMode = "relay";
     // 服务端 voice.state 的最新快照：member_id → 静音/闭音状态（比本地猜测可靠）。
     private readonly Dictionary<string, VoiceMemberDto> _voiceMembers = new(StringComparer.Ordinal);
+    // relay 槽位 → 成员（服务端下发；direct 为空）。native 远端音轨 id 形如 "partyup-slot-00"。
+    private readonly Dictionary<int, VoiceSlotDto> _voiceSlots = new();
+    private string _lastSlotSignature = string.Empty;
     private CancellationTokenSource? _voiceStatsCts;
     /// <summary>direct 模式下强制被动（仅测试/调试用；relay 本来就恒被动）。</summary>
     private readonly bool _forcePassive;
@@ -111,6 +114,9 @@ public sealed class ShareSession : IAsyncDisposable
 
     /// <summary>频道里正在语音的成员（服务端 voice.state 快照，含静音/闭音），含自己。</summary>
     public IReadOnlyDictionary<string, VoiceMemberDto> VoiceMembers => _voiceMembers;
+
+    /// <summary>relay 槽位映射（槽位序号 → 成员）；direct 模式下为空。</summary>
+    public IReadOnlyDictionary<int, VoiceSlotDto> VoiceSlots => _voiceSlots;
 
     public int VoiceMemberCount => _voiceMembers.Count;
 
@@ -471,6 +477,23 @@ public sealed class ShareSession : IAsyncDisposable
         if (state.ChannelId != _channelId) return;
         _voiceMembers.Clear();
         foreach (var m in state.Members) _voiceMembers[m.MemberId] = m;
+        _voiceSlots.Clear();
+        if (state.Slots is { Count: > 0 } slots)
+        {
+            foreach (var slot in slots)
+            {
+                if (slot.Index < 0) continue;
+                _voiceSlots[slot.Index] = slot;
+            }
+            // 只在映射变化时打一行：这是「谁在说话」把 track id 翻译成名字的依据。
+            var desc = string.Join(", ", _voiceSlots.OrderBy(kv => kv.Key)
+                .Select(kv => $"slot{kv.Key}->{kv.Value.MemberId}" + (kv.Value.Muted ? "(muted)" : "")));
+            if (desc != _lastSlotSignature)
+            {
+                _lastSlotSignature = desc;
+                AppLog.Info($"voice: slots {_voiceSlots.Count} [{desc}]");
+            }
+        }
         var serverMode = IsDirectTransport(state.Mode) ? "direct" : "relay";
         if (!_voiceJoined && serverMode != _voiceMode)
         {

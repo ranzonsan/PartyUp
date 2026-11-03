@@ -12,6 +12,7 @@ package server_test
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"github.com/pion/webrtc/v4/pkg/media"
 
 	"partyup/internal/protocol"
+	"partyup/internal/sfu"
 )
 
 // ------------------------------------------------------------------
@@ -42,7 +44,8 @@ type relayPeer struct {
 	mu        sync.Mutex
 	recv      map[string]int
 	total     int
-	sfuOffers int // 服务端下发过几次 relay offer（direct 策略下应为 0）
+	sfuOffers int      // 服务端下发过几次 relay offer（direct 策略下应为 0）
+	tracks    []string // 收到的远端音轨 track id（relay 下应为 partyup-slot-<n>）
 	states    []protocol.VoiceStatePayload
 
 	incoming chan protocol.Envelope
@@ -117,6 +120,9 @@ func newRelayPeer(t *testing.T, env *testEnv, name, token string) *relayPeer {
 
 	pc.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
 		p.t.Logf("%s: got remote track id=%q kind=%s", p.name, track.ID(), track.Kind().String())
+		p.mu.Lock()
+		p.tracks = append(p.tracks, track.ID())
+		p.mu.Unlock()
 		for {
 			if _, _, err := track.ReadRTP(); err != nil {
 				p.t.Logf("%s: track %q read ended: %v", p.name, track.ID(), err)
@@ -368,6 +374,23 @@ func (p *relayPeer) receivedTotal() int {
 }
 
 // lastState 返回最近一条 voice.state（没有则 false）。
+func containsString(items []string, want string) bool {
+	for _, item := range items {
+		if item == want {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *relayPeer) trackIDs() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]string, len(p.tracks))
+	copy(out, p.tracks)
+	return out
+}
+
 func (p *relayPeer) lastState() (protocol.VoiceStatePayload, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -530,6 +553,64 @@ func TestVoiceRelayThreeMembers(t *testing.T) {
 	}
 	t.Logf("PASS three-member reverse fan-out: alice=+%d carol=+%d packets (only bob sends)",
 		e.alice.receivedTotal()-beforeAlice, e.carol.receivedTotal()-beforeCarol)
+
+	// 槽位映射（B 的一部分）：每个成员的远端音轨 id 必须是稳定的 partyup-slot-<n>，
+	// 且 voice.state.slots 给出的「槽位 → 成员」在所有人那里是同一份。
+	// pion 侧远端轨是「收到 RTP 才创建」，所以这里只断言出现过的 id 都是稳定槽位 id，
+	// 以及收发关系对得上：alice 是第一个发布者 → 占 slot 0。
+	for _, p := range []*relayPeer{e.alice, e.bob, e.carol} {
+		ids := p.trackIDs()
+		if len(ids) == 0 {
+			t.Fatalf("%s: expected at least one remote track", p.name)
+		}
+		for _, id := range ids {
+			if !strings.HasPrefix(id, "partyup-slot-") {
+				t.Fatalf("%s: remote track id %q is not a stable slot id", p.name, id)
+			}
+		}
+	}
+	for _, consumer := range []*relayPeer{e.bob, e.carol} {
+		if !containsString(consumer.trackIDs(), sfu.SlotTrackID(0)) {
+			t.Fatalf("%s: missing alice's slot track %q: %v",
+				consumer.name, sfu.SlotTrackID(0), consumer.trackIDs())
+		}
+	}
+	if !containsString(e.alice.trackIDs(), sfu.SlotTrackID(1)) {
+		t.Fatalf("alice: missing bob's slot track %q: %v",
+			sfu.SlotTrackID(1), e.alice.trackIDs())
+	}
+	// 本测试里 carol 从不发声，所以发布者是 alice（slot 0）与 bob（slot 1）。
+	if !waitUntil(t, "voice.state slots (2 publishers)", 10*time.Second, func() bool {
+		st, ok := e.bob.lastState()
+		return ok && len(st.Slots) == 2
+	}) {
+		st, _ := e.bob.lastState()
+		t.Fatalf("voice.state slots: got %+v, want 2 entries", st.Slots)
+	}
+	st, _ := e.bob.lastState()
+	seen := map[int]string{}
+	for _, slot := range st.Slots {
+		if slot.Index < 0 || slot.Index >= sfu.MaxRemoteSlots {
+			t.Fatalf("slot index out of range: %+v", slot)
+		}
+		if prev, dup := seen[slot.Index]; dup {
+			t.Fatalf("slot index %d assigned twice: %s and %s", slot.Index, prev, slot.MemberID)
+		}
+		seen[slot.Index] = slot.MemberID
+	}
+	for _, want := range []string{e.alice.memberID, e.bob.memberID} {
+		found := false
+		for _, got := range seen {
+			if got == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("voice.state slots missing publisher %s: %+v", want, st.Slots)
+		}
+	}
+	t.Logf("PASS slot mapping: %+v (track ids stable)", st.Slots)
 }
 
 // TestVoiceModeIsServerPolicy：传输方式完全由服务端策略决定，客户端传的 mode 被忽略。

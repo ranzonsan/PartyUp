@@ -44,6 +44,9 @@ func (h *Hub) ensureRoom(channelID string) (*sfu.Room, error) {
 
 	room, err := sfu.New(channelID, h.log, func(memberID, kind, payload string) {
 		h.deliverVoiceSignal(channelID, memberID, kind, payload)
+	}, func() {
+		// 发布者首次发声 → 槽位分配完成 → 广播新的槽位映射。
+		h.broadcastVoiceState(channelID)
 	})
 	if err != nil {
 		return nil, err
@@ -110,15 +113,33 @@ func (h *Hub) broadcastVoiceState(channelID string) {
 	for peer := range h.subs[channelID] {
 		targets = append(targets, peer)
 	}
+	room := h.rooms[channelID]
 	h.mu.RUnlock()
 
 	// 顺序稳定：成员按 id 排序，测试与客户端 diff 都不会因为 map 顺序抖动。
 	sort.Slice(members, func(i, j int) bool { return members[i].MemberID < members[j].MemberID })
 
+	// relay 模式下补「槽位 → 成员」映射（direct 没有中继槽位，保持空）。
+	var slots []protocol.VoiceSlotState
+	if mode == "relay" && room != nil {
+		muted := make(map[string]bool, len(members))
+		for _, m := range members {
+			muted[m.MemberID] = m.Muted
+		}
+		for _, b := range room.Slots() {
+			slots = append(slots, protocol.VoiceSlotState{
+				Index:    b.Index,
+				MemberID: b.MemberID,
+				Muted:    muted[b.MemberID],
+			})
+		}
+	}
+
 	data, err := protocol.MustNew(protocol.TypeVoiceState, protocol.VoiceStatePayload{
 		ChannelID: channelID,
 		Mode:      mode,
 		Members:   members,
+		Slots:     slots,
 	}).Marshal()
 	if err != nil {
 		h.log.Error("marshal voice.state", "err", err)

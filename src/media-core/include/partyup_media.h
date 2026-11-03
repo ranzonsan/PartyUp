@@ -424,10 +424,14 @@ PU_API int pu_peer_stats(pu_engine* e, pu_stats* out);
 /* v2.7：单条远端音频轨的实时统计（SFU 中继下一个 PC 上会挂多条远端音频轨）。
  *
  * 语义约定：
- *   - 一条 track 对应一个远端说话人；本端自己的上行轨**不计入**。
- *   - tracks=N（pu_voice_tracks 的返回条数）是「当前挂载的远端音频轨数」，
- *     不等于频道人数（本端自己不算、还没协商出音频轨的人也不算）。
- *   - last_frame_ms 是单调时钟毫秒（不随系统时间跳变），0 表示这条轨从未收到过音频。
+ *   - 一条 track 对应一个远端音频轨。**注意 relay 会预协商多条 sendonly 槽**，
+ *     所以「轨对象数」不等于人数；只有**真的有声音**的轨才计入 pcm_frames/活跃判定。
+ *   - 判活方式：sink 里先算峰值，峰值低于阈值（默认 8，可用环境变量
+ *     PARTYUP_VOICE_PEAK_THRESHOLD 覆盖，1~32767）的帧算静音帧：不计帧、不刷新时间戳。
+ *     因此空槽恒为 frames=0、last_frame_ms=0，静音（ADM mute）的轨也会掉出活跃列表。
+ *   - tracks=N（pu_voice_tracks 的返回条数）是「当前活跃（有声音）的远端音频轨数」，
+ *     **不是**频道人数（本端自己不算、还没出声的人也不算）。轨对象总数见日志的 tracks=。
+ *   - last_frame_ms 是单调时钟毫秒（不随系统时间跳变），0 表示这条轨从未收到过有声帧。
  *     调用方据此判活：now - last_frame_ms < 300 可视为「正在说话」。
  *   - pu_voice_tracks() 只返回**活跃**轨（超过 1000 ms 没有新帧的轨会被过滤掉），
  *     所以对端离开后留下的冻结记录不会出现。
@@ -435,7 +439,7 @@ PU_API int pu_peer_stats(pu_engine* e, pu_stats* out);
 typedef struct pu_voice_track {
   uint32_t struct_size;
   char id[64];            /* 远端音频轨 id（webrtc track id，UTF-8，保证 NUL 结尾） */
-  uint32_t pcm_frames;    /* 累计解出的 PCM 帧数（每帧 10 ms） */
+  uint32_t pcm_frames;    /* 累计**有声** PCM 帧数（每帧 10 ms；静音帧不计） */
   uint32_t peak;          /* 最近一帧峰值振幅（16 bit 有符号采样绝对值），可用于说话指示灯 */
   uint64_t last_frame_ms; /* 最近一帧的单调时钟毫秒；0 = 从未收到 */
 } pu_voice_track;

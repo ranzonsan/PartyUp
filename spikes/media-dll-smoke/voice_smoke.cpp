@@ -5,7 +5,9 @@
 //   4. pu_voice_set_mode(RELAY) 返回 PU_NOT_IMPLEMENTED 且错误可读
 //   5. pu_voice_leave 干净拆除
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <windows.h>
 #include <chrono>
 #include <thread>
 
@@ -52,6 +54,13 @@ uint32_t ReceivedFrames(pu_engine* engine) {
   return stats.frames_received;
 }
 
+// DLL 是 /MT（自带一份 CRT environ），_putenv_s 只改本 exe 的副本；
+// 必须用 Win32 的 SetEnvironmentVariableA，DLL 里的 GetEnvironmentVariableA 才读得到。
+void SetPeakThreshold(const char* value) {
+  _putenv_s("PARTYUP_VOICE_PEAK_THRESHOLD", value);
+  ::SetEnvironmentVariableA("PARTYUP_VOICE_PEAK_THRESHOLD", value);
+}
+
 }  // namespace
 
 int main() {
@@ -79,6 +88,40 @@ int main() {
   params.struct_size = sizeof(params);
   params.channel_id = "smoke-channel";
   params.mode = PU_MODE_DIRECT;
+
+  // ---- 0b. 峰值门控（v2.8）：静音输入不应计入 ----
+  // relay 预协商 12 条槽，libwebrtc 对空槽也按 10ms 送静音帧、OnData 照常回调；
+  // 所以「有回调」不等于「有人说话」，只有峰值过阈值才记帧。
+  // 本机麦克风在冒烟里是静音的（peak≈1），默认阈值下应当一帧都不计。
+  {
+    // 注意：本机麦克风**不是**真正的数字静音（实测环境峰值能到 ~300），
+    // 所以这里把阈值调到 1000 来验证「峰值门控真的在过滤」，而不是验证默认阈值 8 合适。
+    SetPeakThreshold("1000");
+    for (pu_engine* e : {a, b}) {
+      pu_voice_params join = params;
+      join.flags = (e == b) ? 1u : 0u;
+      if (pu_voice_join(e, &join) != PU_OK) {
+        std::printf("FAIL: join (gating phase) rc=%d (%s)\n", pu_last_error(e));
+        return 1;
+      }
+    }
+    const auto gating_start = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() < gating_start + std::chrono::seconds(3)) {
+      if (PumpEngine(a, "A", b) < 0 || PumpEngine(b, "B", a) < 0) return 1;
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    const uint32_t silent_frames = ReceivedFrames(b);
+    const int silent_tracks = pu_voice_tracks(b, nullptr, 0);
+    std::printf("  gating (threshold=1000, above ambient): frames=%u tracks=%d (want 0/0)\n",
+                silent_frames, silent_tracks);
+    for (pu_engine* e : {a, b}) pu_voice_leave(e);
+    if (silent_frames != 0 || silent_tracks != 0) {
+      std::printf("FAIL: silent input was counted — peak gating is not working\n");
+      return 1;
+    }
+  }
+  // 后续链路测试（97.5/s、重进、按轨查询）要把阈值降到 1 才在这台静音机器上数得到帧。
+  SetPeakThreshold("1");
 
   for (pu_engine* e : {a, b}) {
     // A 是 offerer；B 用 flags bit0 = 被动加入（只回 answer），否则双方都发 offer 会 glare。

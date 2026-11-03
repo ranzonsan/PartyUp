@@ -408,11 +408,23 @@ type VoiceMemberState struct {
 	Deafened bool   `json:"deafened"`
 }
 
+// VoiceSlotState 是「第几个远端音频槽位 → 哪个成员」的映射项（仅 relay 模式有）。
+// 客户端用它把 native 侧 id 为 "partyup-slot-<index>" 的远端音轨映射到具体成员：
+// 槽位在设计上就决定它转发的发布者，且占位轨让每条 m-line 的 msid 在 offer 时就固定，
+// 所以即使发布者是后加入、后绑定的，track id 依然稳定可解析。
+type VoiceSlotState struct {
+	Index    int    `json:"index"`     // 槽位序号（0 起，= 远端音轨序号）
+	MemberID string `json:"member_id"` // 该槽位转发的发布者
+	Muted    bool   `json:"muted"`     // 该发布者当前是否静音（元数据，不拦 RTP）
+}
+
 // VoiceStatePayload 是 voice.state 推送的载荷（频道内语音成员快照）。
 type VoiceStatePayload struct {
 	ChannelID string             `json:"channel_id"`
 	Mode      string             `json:"mode"` // relay | direct
 	Members   []VoiceMemberState `json:"members"`
+	// Slots 仅 relay 模式出现：槽位 → 成员映射，供客户端做「谁在说话」与按人统计。
+	Slots []VoiceSlotState `json:"slots,omitempty"`
 }
 
 // VoiceJoinOK 是 voice.join 的响应：把服务端选定的传输方式回给客户端，

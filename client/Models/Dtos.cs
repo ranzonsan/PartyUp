@@ -61,8 +61,18 @@ public sealed record MediaSignalDto(
 /// <summary>voice.state 里的一个语音成员（PROTOCOL.md §4）。</summary>
 public sealed record VoiceMemberDto(string MemberId, bool Muted, bool Deafened);
 
-/// <summary>voice.state 推送：频道当前语音快照（mode + 成员，含静音/闭音）。</summary>
-public sealed record VoiceStateDto(string ChannelId, string Mode, IReadOnlyList<VoiceMemberDto> Members);
+/// <summary>
+/// voice.state.slots 的一项：第 <paramref name="Index"/> 个远端音频槽位转发的是哪个成员。
+/// 客户端据此把 native 侧 id 为 "partyup-slot-&lt;index&gt;" 的远端音轨映射到具体的人。
+/// </summary>
+public sealed record VoiceSlotDto(int Index, string MemberId, bool Muted);
+
+/// <summary>voice.state 推送：频道当前语音快照（mode + 成员 + relay 槽位映射）。</summary>
+public sealed record VoiceStateDto(
+    string ChannelId,
+    string Mode,
+    IReadOnlyList<VoiceMemberDto> Members,
+    IReadOnlyList<VoiceSlotDto>? Slots);
 
 /// <summary>voice.join / voice.leave / voice.set_mode / set_mute / set_deafen 的响应。</summary>
 public sealed record VoiceAckDto(string ChannelId, string? Mode, string? Transport);

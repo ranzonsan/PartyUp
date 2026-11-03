@@ -31,6 +31,22 @@ const MaxRemoteSlots = 12
 // ErrNotInRoom 表示该成员没有在这个房间里（比如已经 leave 或者从没 join）。
 var ErrNotInRoom = errors.New("member is not in this relay room")
 
+// SlotBinding 是「槽位序号 → 发布者」的公开映射（随 voice.state 下发）。
+// 槽位序号 == 客户端收到的 sendonly 音频 m-line 顺序（减去第 0 条麦克风 m-line，
+// 即第 i 条远端音轨对应槽位 i）。
+type SlotBinding struct {
+	Index    int
+	MemberID string
+}
+
+// SlotTrackID 是第 index 个槽位占位轨的 id。占位轨在建 PC 时就参与 SDP 协商，
+// 所以它（而不是后来 ReplaceTrack 进去的发布者轨）决定了客户端看到的远端 track id：
+// 客户端因此能靠 "partyup-slot-<n>" 稳定地把第 n 条远端音轨映射到槽位 n，
+// 不受「后绑定的槽没有 msid、id 随机」影响。
+func SlotTrackID(index int) string {
+	return fmt.Sprintf("partyup-slot-%02d", index)
+}
+
 // SignalSender 把一条信令投递给某个成员。
 // hub 注入的实现负责把它包成 media.signal（from=sfu, target=sfu）。
 type SignalSender func(memberID, kind, payload string)
@@ -41,10 +57,11 @@ type publication struct {
 }
 
 type peer struct {
-	id    string
-	pc    *webrtc.PeerConnection
-	slots []*webrtc.RTPSender // 预协商的 sendonly 槽，下标即槽位
-	bound map[string]int      // 发布者 memberID → 占用槽位下标
+	id           string
+	pc           *webrtc.PeerConnection
+	slots        []*webrtc.RTPSender           // 预协商的 sendonly 槽，下标即槽位
+	placeholders []*webrtc.TrackLocalStaticRTP // 槽位占位轨（决定客户端看到的 track id）
+	bound        map[string]int                // 发布者 memberID → 占用槽位下标
 }
 
 // Room 是**一频道**的语音中继房间。
@@ -54,14 +71,18 @@ type Room struct {
 	api       *webrtc.API
 	send      SignalSender
 
-	mu    sync.Mutex
-	peers map[string]*peer
-	pubs  map[string]*publication
-	done  bool
+	onChange func() // 槽位映射变化时通知 hub 重播 voice.state（可为 nil）
+
+	mu         sync.Mutex
+	peers      map[string]*peer
+	pubs       map[string]*publication
+	slotOwners []string // 槽位序号 → 发布者 memberID（"" = 空），全房间统一，保证每个成员看到的槽位映射一致
+	done       bool
 }
 
-// New 构造一个房间。send 负责把服务端产出的信令送给成员。
-func New(channelID string, log *slog.Logger, send SignalSender) (*Room, error) {
+// New 构造一个房间。send 负责把服务端产出的信令送给成员；
+// onChange 在「槽位 → 成员」映射变化时被调用（hub 用它重播 voice.state）。
+func New(channelID string, log *slog.Logger, send SignalSender, onChange func()) (*Room, error) {
 	media := &webrtc.MediaEngine{}
 	if err := media.RegisterDefaultCodecs(); err != nil {
 		return nil, fmt.Errorf("register default codecs: %w", err)
@@ -71,12 +92,14 @@ func New(channelID string, log *slog.Logger, send SignalSender) (*Room, error) {
 		log = slog.Default()
 	}
 	return &Room{
-		channelID: channelID,
-		log:       log.With("sfu", channelID),
-		api:       api,
-		send:      send,
-		peers:     make(map[string]*peer, 4),
-		pubs:      make(map[string]*publication, 4),
+		channelID:  channelID,
+		log:        log.With("sfu", channelID),
+		api:        api,
+		send:       send,
+		onChange:   onChange,
+		peers:      make(map[string]*peer, 4),
+		pubs:       make(map[string]*publication, 4),
+		slotOwners: make([]string, MaxRemoteSlots),
 	}, nil
 }
 
@@ -121,9 +144,22 @@ func (r *Room) Join(memberID string) error {
 	}
 
 	// 2) 预协商收别人的槽位：sendonly 音频 m-line × MaxRemoteSlots。
+	//    每条 m-line 先挂一条**占位轨**，它的 id 固定为 "partyup-slot-<n>"：
+	//    这样 msid 在 offer 时就写进 SDP，客户端收到的远端 track id 稳定可解析；
+	//    之后 ReplaceTrack 换成真实发布者轨不会改 msid（不重协商）。
 	for i := 0; i < MaxRemoteSlots; i++ {
-		tr, err := pc.AddTransceiverFromKind(
-			webrtc.RTPCodecTypeAudio,
+		placeholder, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{
+			MimeType:  webrtc.MimeTypeOpus,
+			ClockRate: 48000,
+			Channels:  2,
+		}, SlotTrackID(i), "partyup-relay")
+		if err != nil {
+			pc.Close()
+			r.removePeer(memberID)
+			return fmt.Errorf("new slot placeholder %d: %w", i, err)
+		}
+		tr, err := pc.AddTransceiverFromTrack(
+			placeholder,
 			webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendonly},
 		)
 		if err != nil {
@@ -132,19 +168,10 @@ func (r *Room) Join(memberID string) error {
 			return fmt.Errorf("add slot %d: %w", i, err)
 		}
 		p.slots = append(p.slots, tr.Sender())
+		p.placeholders = append(p.placeholders, placeholder)
 	}
 
-	// 3) 已经在说话的成员，直接填进空槽（新人一进来就能听见）。
-	r.mu.Lock()
-	for owner, pub := range r.pubs {
-		if owner == memberID {
-			continue
-		}
-		r.bindLocked(p, owner, pub.track)
-	}
-	r.mu.Unlock()
-
-	// 4) 服务端 offer。非 trickle：等 ICE 收集完，把候选一起塞进 SDP，
+	// 3) 服务端 offer。非 trickle：等 ICE 收集完，把候选一起塞进 SDP，
 	//    客户端一次 SetRemoteDescription 就够（ABI v2 的收信令路径能直接吃）。
 	offer, err := pc.CreateOffer(nil)
 	if err != nil {
@@ -173,6 +200,19 @@ func (r *Room) Join(memberID string) error {
 	}))
 	r.log.Info("offer sent", "member", memberID, "slots", len(p.slots),
 		"publishers", len(r.pubs), "sdp_bytes", len(local.SDP))
+
+	// 4) offer 发出去之后才把已在说话的成员填进槽位。顺序很重要：
+	//    如果在 CreateOffer 之前就 ReplaceTrack，那条 m-line 的 msid 会变成发布者
+	//    member_id，客户端只能靠 id 猜是谁；先发 offer 再绑定，则 12 条 m-line 的
+	//    msid 全是占位轨 id（partyup-slot-<n>），客户端可以稳定按槽位号映射成员。
+	r.mu.Lock()
+	for owner, pub := range r.pubs {
+		if owner == memberID {
+			continue
+		}
+		r.bindLocked(p, owner, pub.track)
+	}
+	r.mu.Unlock()
 	return nil
 }
 
@@ -240,6 +280,7 @@ func (r *Room) Leave(memberID string) {
 	delete(r.peers, memberID)
 	if _, ok := r.pubs[memberID]; ok {
 		delete(r.pubs, memberID)
+		r.releaseSlotLocked(memberID)
 	}
 	for _, other := range r.peers {
 		r.unbindLocked(other, memberID)
@@ -267,6 +308,7 @@ func (r *Room) Close() {
 	for id := range r.pubs {
 		delete(r.pubs, id)
 	}
+	r.slotOwners = make([]string, MaxRemoteSlots)
 	r.done = true
 	r.mu.Unlock()
 
@@ -300,6 +342,59 @@ func (r *Room) Publishers() []string {
 	return out
 }
 
+// Slots 返回「槽位序号 → 发布者」映射（按序号升序，空槽不返回）。
+// 广播给客户端后，客户端按远端音轨 id "partyup-slot-<n>" 反查成员。
+func (r *Room) Slots() []SlotBinding {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]SlotBinding, 0, MaxRemoteSlots)
+	for i, owner := range r.slotOwners {
+		if owner == "" {
+			continue
+		}
+		out = append(out, SlotBinding{Index: i, MemberID: owner})
+	}
+	return out
+}
+
+// notifyChange 在锁外通知 hub：槽位映射变了，voice.state 需要重播。
+func (r *Room) notifyChange() {
+	if r.onChange != nil {
+		r.onChange()
+	}
+}
+
+// assignSlotLocked 给新发布者分配一个空槽（最小可用序号）。
+func (r *Room) assignSlotLocked(memberID string) int {
+	for i, owner := range r.slotOwners {
+		if owner == "" {
+			r.slotOwners[i] = memberID
+			return i
+		}
+	}
+	return -1
+}
+
+// releaseSlotLocked 释放某发布者占的槽位。
+func (r *Room) releaseSlotLocked(memberID string) {
+	for i, owner := range r.slotOwners {
+		if owner == memberID {
+			r.slotOwners[i] = ""
+			return
+		}
+	}
+}
+
+// slotIndexOfLocked 查某发布者的槽位序号（-1 = 没有）。
+func (r *Room) slotIndexOfLocked(memberID string) int {
+	for i, owner := range r.slotOwners {
+		if owner == memberID {
+			return i
+		}
+	}
+	return -1
+}
+
 // ------------------------------------------------------------------
 // 内部实现
 // ------------------------------------------------------------------
@@ -329,6 +424,14 @@ func (r *Room) onTrack(memberID string, remote *webrtc.TrackRemote) {
 	r.mu.Lock()
 
 	r.pubs[memberID] = pub
+	assigned := false
+	if slot := r.assignSlotLocked(memberID); slot < 0 {
+		r.log.Warn("no free slot for publisher", "member", memberID, "slots", MaxRemoteSlots)
+	} else {
+		assigned = true
+		r.log.Info("slot assigned", "member", memberID, "slot", slot,
+			"track_id", SlotTrackID(slot))
+	}
 	for id, other := range r.peers {
 		if id == memberID {
 			continue
@@ -340,6 +443,9 @@ func (r *Room) onTrack(memberID string, remote *webrtc.TrackRemote) {
 
 	r.log.Info("publisher attached", "member", memberID,
 		"subscribers", subscribers, "sdp_tag", memberID)
+	if assigned {
+		r.notifyChange()
+	}
 
 	go func() {
 		for {
@@ -361,20 +467,11 @@ func (r *Room) bindLocked(p *peer, owner string, track *webrtc.TrackLocalStaticR
 	if _, exists := p.bound[owner]; exists {
 		return
 	}
-	used := make(map[int]struct{}, len(p.bound))
-	for _, idx := range p.bound {
-		used[idx] = struct{}{}
-	}
-	slot := -1
-	for i := range p.slots {
-		if _, busy := used[i]; !busy {
-			slot = i
-			break
-		}
-	}
+	// 槽位序号由房间级的发布者→槽位映射决定（不是「本 peer 里第一个空槽」），
+	// 这样同一个发布者在所有成员那里占用同一个序号，voice.state.slots 才能广播一份。
+	slot := r.slotIndexOfLocked(owner)
 	if slot < 0 {
-		r.log.Warn("no free slot for publisher", "member", p.id, "publisher", owner,
-			"slots", len(p.slots))
+		r.log.Warn("publisher has no assigned slot", "member", p.id, "publisher", owner)
 		return
 	}
 	p.bound[owner] = slot

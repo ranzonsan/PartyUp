@@ -577,35 +577,63 @@ class NullAudioDeviceModule
 // ---------------------------------------------------------------------------
 // 语音接收侧计数器：每收到一个 10 ms 音频帧 +1，并记录峰值振幅（mute 验收用）。
 // 由 ADM 播放线程调用，只碰原子量。
+// SFU 预协商槽位的坑（2026-11-03 实测）：relay 的 SDP 预协商 12 条 sendonly 槽，
+// 客户端为每条 m-line 建一个远端音轨，libwebrtc **对空槽也按 10ms 送静音帧**，
+// OnData 照常回调、峰值恒为 0。所以「有回调」不等于「有人在说话」——必须先算峰值，
+// 只有峰值达到阈值才记帧数、才刷新 last_frame_ms；否则 tracks/活跃判定会把空槽全点亮。
+//
+// 阈值默认 8（16 bit 采样绝对值；实测环境噪声 5~7），可用环境变量
+// PARTYUP_VOICE_PEAK_THRESHOLD 覆盖（1~32767）。
+uint32_t VoicePeakThresholdFromEnv() {
+  // 注意：本 DLL 用 /MT（静态 CRT），std::getenv 读的是**本模块 CRT 自己那份**
+  // environ 副本，宿主进程 _putenv_s 改不到它。所以这里直接问 Win32 进程环境块
+  // （GetEnvironmentVariableA），宿主用 SetEnvironmentVariable 或进程启动环境都能生效。
+  char buffer[32] = {0};
+  const DWORD len = ::GetEnvironmentVariableA("PARTYUP_VOICE_PEAK_THRESHOLD", buffer,
+                                              static_cast<DWORD>(sizeof(buffer)));
+  if (len == 0 || len >= sizeof(buffer)) return 8;
+  const long parsed = std::strtol(buffer, nullptr, 10);
+  if (parsed < 1) return 1;
+  if (parsed > 32767) return 32767;
+  return static_cast<uint32_t>(parsed);
+}
+
 class AudioCountSink : public webrtc::AudioTrackSinkInterface {
  public:
   AudioCountSink(std::atomic<uint32_t>* frames, std::atomic<uint32_t>* peak,
-                 std::atomic<int64_t>* last_ms)
-      : frames_(frames), peak_(peak), last_ms_(last_ms) {}
+                 std::atomic<int64_t>* last_ms, std::atomic<uint32_t>* max_peak,
+                 uint32_t threshold)
+      : frames_(frames), peak_(peak), last_ms_(last_ms), max_peak_(max_peak),
+        threshold_(threshold) {}
 
   void OnData(const void* audio_data, int bits_per_sample, int sample_rate,
               size_t number_of_channels, size_t number_of_frames,
               std::optional<int64_t> absolute_capture_timestamp_ms) override {
     static_cast<void>(sample_rate);
     static_cast<void>(absolute_capture_timestamp_ms);
+    if (audio_data == nullptr || bits_per_sample != 16) return;
+    const int16_t* pcm = static_cast<const int16_t*>(audio_data);
+    const size_t count = number_of_channels * number_of_frames;
+    uint32_t peak = 0;
+    for (size_t i = 0; i < count; ++i) {
+      const int32_t v = pcm[i] < 0 ? -static_cast<int32_t>(pcm[i]) : pcm[i];
+      if (static_cast<uint32_t>(v) > peak) peak = static_cast<uint32_t>(v);
+    }
+    peak_->store(peak, std::memory_order_relaxed);
+    if (max_peak_ != nullptr && peak > max_peak_->load(std::memory_order_relaxed)) {
+      max_peak_->store(peak, std::memory_order_relaxed);
+    }
+    if (peak < threshold_) return;  // 静音帧/空槽：不计帧、不刷新时间戳
     frames_->fetch_add(1, std::memory_order_relaxed);
     if (last_ms_ != nullptr) last_ms_->store(NowUsSteady() / 1000, std::memory_order_relaxed);
-    if (audio_data != nullptr && bits_per_sample == 16) {
-      const int16_t* pcm = static_cast<const int16_t*>(audio_data);
-      const size_t count = number_of_channels * number_of_frames;
-      uint32_t peak = 0;
-      for (size_t i = 0; i < count; ++i) {
-        const int32_t v = pcm[i] < 0 ? -static_cast<int32_t>(pcm[i]) : pcm[i];
-        if (static_cast<uint32_t>(v) > peak) peak = static_cast<uint32_t>(v);
-      }
-      peak_->store(peak, std::memory_order_relaxed);
-    }
   }
 
  private:
   std::atomic<uint32_t>* frames_;
   std::atomic<uint32_t>* peak_;
   std::atomic<int64_t>* last_ms_;
+  std::atomic<uint32_t>* max_peak_;
+  uint32_t threshold_;
 };
 
 class MediaEngine {
@@ -747,6 +775,7 @@ class MediaEngine {
     std::atomic<uint32_t> frames{0};
     std::atomic<uint32_t> peak{0};
     std::atomic<int64_t> last_frame_ms{0};  // 单调时钟毫秒，用于判活/判「正在说话」
+    std::atomic<uint32_t> max_peak{0};      // 历史最大峰值（调阈值用，日志可见）
   };
   std::mutex audio_tracks_mu_;
   std::vector<std::unique_ptr<TrackAudioStat>> audio_tracks_;
@@ -976,12 +1005,14 @@ class MediaEngine::PcObserver : public webrtc::PeerConnectionObserver {
     auto stat = std::make_unique<TrackAudioStat>();
     stat->id = id;
     stat->track = audio_track;
+    const uint32_t peak_threshold = VoicePeakThresholdFromEnv();
     stat->sink = std::make_unique<AudioCountSink>(&stat->frames, &stat->peak,
-                                                  &stat->last_frame_ms);
+                                                  &stat->last_frame_ms, &stat->max_peak,
+                                                  peak_threshold);
     audio_track->AddSink(stat->sink.get());
     engine_->audio_tracks_.push_back(std::move(stat));
-    engine_->Log(3, "remote audio track -> sink: id=%s (total tracks=%zu)", id.c_str(),
-                 engine_->audio_tracks_.size());
+    engine_->Log(3, "remote audio track -> sink: id=%s (total tracks=%zu, peakThreshold=%u)",
+                 id.c_str(), engine_->audio_tracks_.size(), peak_threshold);
   }
 
   MediaEngine* const engine_;
@@ -2048,25 +2079,34 @@ int MediaEngine::PeerStats(pu_stats* out) {
   out->frames_received = stat_frames_received_.load(std::memory_order_relaxed);
   // v2.6：语音模式下 frames_received 表示「远端解出的音频 PCM 帧数」（每帧 10 ms），
   // 因为语音没有视频帧可数；两者互斥，不会同时有值。峰值振幅靠日志观察（mute 验收）。
-  // v2.7：按轨聚合。relay 下 N 路音频各有自己的计数；frames_received 保持「远端
-  // 解出的 PCM 帧总数」语义（多路时是各轨之和），分轨明细走日志（track=<id>）。
+  // v2.7：按轨聚合。relay 预协商 12 条槽 → 远端音轨对象恒为 12 条，但只有**真有声音**
+  // 的轨才计帧（AudioCountSink 里按峰值阈值过滤，见 VoicePeakThresholdFromEnv），
+  // 所以这里把「轨对象数」和「活跃（有声音）轨数」分开报，别混。
+  // frames_received = 各活跃轨的 voiced PCM 帧数之和。
   if (voice_joined_) {
     uint32_t total_frames = 0;
     uint32_t max_peak = 0;
     size_t tracks = 0;
+    size_t active = 0;
+    const int64_t now_ms = NowUsSteady() / 1000;
     {
       std::lock_guard<std::mutex> lock(audio_tracks_mu_);
       tracks = audio_tracks_.size();
       for (const auto& stat : audio_tracks_) {
         const uint32_t f = stat->frames.load(std::memory_order_relaxed);
         const uint32_t p = stat->peak.load(std::memory_order_relaxed);
+        const int64_t last = stat->last_frame_ms.load(std::memory_order_relaxed);
         total_frames += f;
         if (p > max_peak) max_peak = p;
-        Log(3, "voice track: id=%s pcmFrames=%u peak=%u", stat->id.c_str(), f, p);
+        if (last != 0 && now_ms - last <= 1000) ++active;
+        Log(3, "voice track: id=%s pcmFrames=%u peak=%u maxPeak=%u active=%d", stat->id.c_str(),
+            f, p, stat->max_peak.load(std::memory_order_relaxed),
+            (last != 0 && now_ms - last <= 1000) ? 1 : 0);
       }
     }
     out->frames_received = total_frames;
-    Log(3, "voice stats: tracks=%zu pcmFrames=%u peak=%u", tracks, total_frames, max_peak);
+    Log(3, "voice stats: tracks=%zu active=%zu pcmFrames=%u peak=%u", tracks, active,
+        total_frames, max_peak);
   }
   out->signal_out_count = stat_signal_out_.load(std::memory_order_relaxed);
   {

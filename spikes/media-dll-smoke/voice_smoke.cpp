@@ -92,31 +92,86 @@ int main() {
   // ---- 0b. 峰值门控（v2.8）：静音输入不应计入 ----
   // relay 预协商 12 条槽，libwebrtc 对空槽也按 10ms 送静音帧、OnData 照常回调；
   // 所以「有回调」不等于「有人说话」，只有峰值过阈值才记帧。
-  // 本机麦克风在冒烟里是静音的（peak≈1），默认阈值下应当一帧都不计。
+  //
+  // v2.10 起改成**自适应阈值**：以前硬编码 1000，但这台机器的环境噪声峰值实测能到 ~300、
+  // 偶尔更高，于是「3 秒窗口里 0 帧」等于在赌这一刻没人在说话/敲键盘（实测连跑 4 次
+  // 有 3 次在 3 秒里数到 1–13 帧）。现在分两步：
+  //   1) 阈值 1 先采 2 秒，密集采样 pu_voice_tracks().peak 得到环境峰值 ambient_max；
+  //   2) 门控阈值 = max(1000, ambient_max * 4)（上限 32000），再跑 3 秒必须 0 帧 0 轨。
+  // 这样验证的是「低于阈值的帧被过滤」这条产品行为，而不是「1000 这个数字对本机合适」。
+  // 若第 2 步仍被环境突发尖峰打断，只重试一次（阈值翻倍），不把环境噪声判成产品 bug。
   {
-    // 注意：本机麦克风**不是**真正的数字静音（实测环境峰值能到 ~300），
-    // 所以这里把阈值调到 1000 来验证「峰值门控真的在过滤」，而不是验证默认阈值 8 合适。
-    SetPeakThreshold("1000");
-    for (pu_engine* e : {a, b}) {
-      pu_voice_params join = params;
-      join.flags = (e == b) ? 1u : 0u;
-      if (pu_voice_join(e, &join) != PU_OK) {
-        std::printf("FAIL: join (gating phase) rc=%d (%s)\n", pu_last_error(e));
-        return 1;
+    auto join_pair = [&](const char* phase) {
+      for (pu_engine* e : {a, b}) {
+        pu_voice_params join = params;
+        join.flags = (e == b) ? 1u : 0u;
+        if (pu_voice_join(e, &join) != PU_OK) {
+          std::printf("FAIL: join (%s) rc=%d (%s)\n", phase, pu_last_error(e));
+          return false;
+        }
+      }
+      return true;
+    };
+    auto leave_pair = [&]() {
+      for (pu_engine* e : {a, b}) pu_voice_leave(e);
+    };
+    // 泵 engines `seconds` 秒，同时记录远端音轨 peak 的最大值（密集采样，5 ms 一次）。
+    auto pump_and_track_peak = [&](int seconds, uint32_t* peak_out) {
+      const auto start = std::chrono::steady_clock::now();
+      while (std::chrono::steady_clock::now() < start + std::chrono::seconds(seconds)) {
+        if (PumpEngine(a, "A", b) < 0 || PumpEngine(b, "B", a) < 0) return false;
+        pu_voice_track track;
+        std::memset(&track, 0, sizeof(track));
+        track.struct_size = sizeof(track);
+        if (pu_voice_tracks(b, &track, 1) == 1 && track.peak > *peak_out) {
+          *peak_out = track.peak;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      }
+      return true;
+    };
+
+    // 1) 量环境峰值。
+    SetPeakThreshold("1");
+    if (!join_pair("ambient measure")) return 1;
+    uint32_t ambient_max = 0;
+    const bool measured = pump_and_track_peak(2, &ambient_max);
+    leave_pair();
+    if (!measured) return 1;
+
+    // 2) 用 4 倍余量做门控，必须一帧都不计。
+    uint32_t gate = ambient_max * 4;
+    if (gate < 1000) gate = 1000;
+    if (gate > 32000) gate = 32000;
+    bool gating_ok = false;
+    uint32_t last_frames = 0;
+    int last_tracks = 0;
+    for (int attempt = 1; attempt <= 2 && !gating_ok; ++attempt) {
+      char gate_text[16];
+      std::snprintf(gate_text, sizeof(gate_text), "%u", gate);
+      SetPeakThreshold(gate_text);
+      if (!join_pair("gating verify")) return 1;
+      uint32_t gating_peak = 0;
+      const bool pumped = pump_and_track_peak(3, &gating_peak);
+      last_frames = ReceivedFrames(b);
+      last_tracks = pu_voice_tracks(b, nullptr, 0);
+      leave_pair();
+      if (!pumped) return 1;
+      std::printf(
+          "  gating (threshold=%u = max(1000, ambient %u x4), attempt %d): "
+          "frames=%u tracks=%d (want 0/0)\n",
+          gate, ambient_max, attempt, last_frames, last_tracks);
+      gating_ok = (last_frames == 0 && last_tracks == 0);
+      if (!gating_ok) {
+        std::printf("  WARN: gate %u was crossed (peak seen %u). Raising it and retrying once.\n",
+                    gate, gating_peak);
+        gate = (gate > 16000) ? 32000 : gate * 2;
       }
     }
-    const auto gating_start = std::chrono::steady_clock::now();
-    while (std::chrono::steady_clock::now() < gating_start + std::chrono::seconds(3)) {
-      if (PumpEngine(a, "A", b) < 0 || PumpEngine(b, "B", a) < 0) return 1;
-      std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    }
-    const uint32_t silent_frames = ReceivedFrames(b);
-    const int silent_tracks = pu_voice_tracks(b, nullptr, 0);
-    std::printf("  gating (threshold=1000, above ambient): frames=%u tracks=%d (want 0/0)\n",
-                silent_frames, silent_tracks);
-    for (pu_engine* e : {a, b}) pu_voice_leave(e);
-    if (silent_frames != 0 || silent_tracks != 0) {
-      std::printf("FAIL: silent input was counted — peak gating is not working\n");
+    if (!gating_ok) {
+      std::printf("FAIL: silent input was counted (frames=%u tracks=%d) — either peak gating "
+                  "is not working, or the room was loud during both attempts\n",
+                  last_frames, last_tracks);
       return 1;
     }
   }

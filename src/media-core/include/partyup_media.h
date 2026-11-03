@@ -23,6 +23,12 @@
  *         PU_EVENT_REMOTE_FRAME（解出的远端帧）；
  *       - pu_screen_start 现在会建 PeerConnection、AddTrack、生成 offer；
  *       - v1 的 6 个函数语义**不变**，v1 的调用方无需改代码。
+ *   v2.10（加法式扩张，ABI 仍 v2）：语音与屏幕共享拆成两条独立 PeerConnection，
+ *       信令必须能明确指定投给哪条会话（candidate 信封里没有媒体类型，SDP 嗅探只能
+ *       猜）。新增两个导出、共 21 个：
+ *       - pu_signal_in_media(e, media, payload, len)：显式指定 "voice" / "screen"；
+ *       - pu_signal_media(event, out, capacity)：从 SIGNAL_OUT 事件读回它的 media；
+ *       - pu_signal_in 保留为兼容入口（media==nullptr，退回 SDP 嗅探）。
  *
  * 线程约定：所有 pu_* 调用必须来自同一个「控制线程」（通常是 UI 线程），
  * 且不得在库触发的任何回调里重入——本库没有任何回调，通知一律走 pu_poll_event。
@@ -412,8 +418,53 @@ PU_API const char* pu_last_error(pu_engine* e);
  * 详细原因在 pu_last_error()。
  *
  * 线程：与其它 pu_* 一样，只能从控制线程调用；内部会阻塞最多几秒（等 SDP 往返），
- * 不要在 UI 线程的渲染路径上直接调——C# 侧应放到后台队列。 */
+ * 不要在 UI 线程的渲染路径上直接调——C# 侧应放到后台队列。
+ *
+ * v2.10 起本函数是**兼容入口**：内部等价于 pu_signal_in_media(e, NULL, payload, len)，
+ * 会话归属靠 SDP 嗅探（m=audio / m=video）+ candidate 启发式推断。语音与共享同时在线
+ * 时这条推断会歧义（candidate 信封里没有媒体类型），新代码请用 pu_signal_in_media。 */
 PU_API int pu_signal_in(pu_engine* e, const char* payload, size_t len);
+
+/* v2.10（第 20 个导出）：把一条信令**明确**投给指定媒体会话。
+ *
+ *   media = "voice"  → 语音会话（voice_pc_，只有 m=audio）
+ *   media = "screen" → 屏幕共享会话（pc_，m=video）
+ *   其余值           → PU_ERR_INVALID_ARG（不猜、不静默降级）
+ *
+ * 为什么必须显式：语音与共享各用一条独立 PeerConnection，而 candidate 信令信封里
+ * 只有 mid/mline、没有媒体类型，靠 SDP 嗅探无法判定（会「两边都试」= 静默失败）。
+ * 客户端从服务端信令的 media 字段拿到归属后原样转发即可。
+ *
+ * 语义与 pu_signal_in 完全一致（同步执行、信封格式、返回码、线程要求都相同），
+ * 只是去掉了会话归属推断这一步。payload 由**调用方持有**，只在本次调用期间读取。
+ * 返回：PU_OK / PU_ERR_INVALID_ARG（media 未知、envelope 不合法、candidate 解析失败）/
+ * PU_ERR_STATE（例如把 answer 投给 answerer 角色：role mismatch）/
+ * PU_ERR_MEDIA（SetRemote/CreateAnswer 等 webrtc 操作失败）/ PU_ERR_INTERNAL。
+ * 详细原因在 pu_last_error()。 */
+PU_API int pu_signal_in_media(pu_engine* e, const char* media, const char* payload, size_t len);
+
+/* v2.10（第 21 个导出）：读回一条 PU_EVENT_SIGNAL_OUT 事件属于哪条媒体会话。
+ *
+ * 为什么需要：UI 把 SIGNAL_OUT 转发给服务端/对端时必须带上 media（服务端按 media
+ * 路由；对端也要知道投给哪条会话）。事件结构 pu_event 是 ABI、没有 media 字段，
+ * 所以本函数用事件里的 payload 指针向引擎内部查询（media 是内部登记，不跨 ABI）。
+ *
+ * 参数：
+ *   event    由 pu_poll_event 取到的 pu_event（必须原样传，不要自己伪造）
+ *   media_out 输出缓冲区，写成 UTF-8、0 结尾的 "voice" / "screen"
+ *   capacity  media_out 的字节数，必须 >= 媒体名长度 + 1（当前最大 7）
+ *
+ * 返回：
+ *   PU_OK            成功，media_out 已写入并以 0 结尾
+ *   PU_ERR_INVALID_ARG event 为 NULL / struct_size 小于 sizeof(pu_event) /
+ *                     event->type != PU_EVENT_SIGNAL_OUT（不是信令事件）/
+ *                     media_out 为 NULL / capacity <= 0 / capacity 太小装不下
+ *   PU_ERR_STATE      该事件没有 media：不是本引擎本轮投递的信令事件（伪造的、
+ *                     或 payload 已被回收——保留期是「该引擎又取走 64 条信令」）
+ *
+ * 线程：无状态查询，可以从任意线程调用；不设置 pu_last_error（本函数没有引擎参数）。
+ * 指针有效期与 pu_signal_event.payload 一致。 */
+PU_API int pu_signal_media(const pu_event* event, char* media_out, int capacity);
 
 /* 读引擎统计（发/收帧数、PC/ICE 状态、信令条数、事件丢弃数）。
  * out->struct_size 必须 ≥ sizeof(pu_stats)（库只写这一版认识的字段），

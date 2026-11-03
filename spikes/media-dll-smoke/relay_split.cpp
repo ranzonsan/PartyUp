@@ -7,16 +7,19 @@
 //
 // 验收：「先 join 语音、再点共享」——A 被动加入语音（先建 answerer PC，等 B 的 offer），
 // 语音 PCM 稳定后 A 再 pu_screen_start（屏幕共享走 A 自己的第二条 PC）。
-// 判据：共享开始前后，A 解出的语音 PCM 帧数必须持续以 ~100/s（每帧 10 ms）增长，
-// 长停顿时长 <= 500 ms；同时 C 必须解出视频帧。
+// 判据：共享开始前后，A 解出的语音 PCM 帧数必须持续增长，长停顿时长 <= 500 ms；
+// 同时 C 必须解出视频帧。
 //
-// 为什么要三引擎：第 1 步之前语音/屏幕共用一个 pc_，A 同时是语音 answerer 和共享
-// offerer，点共享就会把语音会话的 signaling state 拖坏（relay 下实测 role mismatch、
-// PCM 冻结）。只有「语音对面是 offerer、共享对面是 answerer」这个拓扑能复现它。
+// v2.10 第 2 步追加（信令路由 ABI）：
+//   * 每条 SIGNAL_OUT 都用 pu_signal_media 读回 media，并和 SDP 里的 m= 行对照；
+//   * 转发默认走 pu_signal_in_media（显式 media，生产路径）；
+//     --legacy 改成走 pu_signal_in（media==nullptr，SDP 嗅探兼容路径）；
+//   * 非信令事件调 pu_signal_media 必须返回 INVALID_ARG；伪造信令事件必须返回 STATE；
+//   * pu_signal_in_media 传未知 media 必须返回 INVALID_ARG。
 //
-// 范围说明：本测试**不经过 Go SFU 与 C# 客户端**——那需要 pu_signal_in_media（ABI v2
-// 第 20 个导出），而第 1 步的导出预算固定 19。它证明的是原生传输层里两条 PeerConnection
-// 的独立性，不替代端到端 GUI 验收。
+// 范围说明：本测试**不经过 Go SFU 与 C# 客户端**（那需要真实服务端 + GUI 构建，
+// 且 Windows↔WSL 的 UDP 不通）。它证明的是原生传输层里两条 PeerConnection 的独立性与
+// 信令路由 ABI，不替代端到端 GUI 验收。
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -30,7 +33,7 @@
 namespace {
 
 // 计数器口径：这台机器的麦克风是静音的（peak≈1），AudioCountSink 默认按峰值阈值门控，
-// 会把静音帧全部滤掉，数出来只剩噪声尖峰的零散几帧（实测 50/s，会误判成「语音掉了一半」）。
+// 会把静音帧全部滤掉，数出来只剩噪声尖峰的零散几帧（会误判成「语音掉了一半」）。
 // 冒烟要的是「PCM 有没有在路上」，所以和 voice_smoke 一样把阈值降到 1。
 // DLL 是 /MT（自带一份 CRT environ），_putenv_s 只改 exe 的副本；必须用 Win32 的
 // SetEnvironmentVariableA，DLL 里的 GetEnvironmentVariableA 才读得到。
@@ -40,10 +43,15 @@ void SetPeakThreshold(const char* value) {
 }
 
 struct Counters {
-  int video_frames = 0;  // 远端视频帧（PU_EVENT_REMOTE_FRAME / PU_EVENT_FRAME）
-  int voice_signals = 0;
-  int video_signals = 0;
-  int stray_signals = 0;  // 没有 m= 行的信令（candidate 之类）；本设计里应恒为 0
+  int video_frames = 0;        // 远端视频帧（PU_EVENT_REMOTE_FRAME / PU_EVENT_FRAME）
+  int voice_signals = 0;       // 转发出去的语音信令条数
+  int video_signals = 0;       // 转发出去的屏幕信令条数
+  int unroutable = 0;          // 既读不出 media、SDP 里也没有 m= 行的信令
+  int media_ok = 0;            // pu_signal_media 读出 media（且与 SDP 的 m= 行一致）
+  int media_wrong = 0;         // 读出的 media 与 SDP 的 m= 行矛盾
+  int media_missing = 0;       // SIGNAL_OUT 却读不出 media（应为 0）
+  int non_signal_checked = 0;  // 非信令事件调用 pu_signal_media 的次数
+  int non_signal_bad = 0;      // 其中没有返回 INVALID_ARG 的次数（应为 0）
 };
 
 pu_engine* CreateEngine(const char* name) {
@@ -77,13 +85,16 @@ std::string Payload(const pu_event& event) {
   return std::string(event.data.signal.payload, event.data.signal.payload_len);
 }
 
-// 抽干 from 的事件。SIGNAL_OUT 按 SDP 内容路由：
-//   含 m=video             → video_to（屏幕会话）
-//   含 m=audio 且无 m=video → voice_to（语音会话，SDP 里只有 audio）
-//   两者都没有（candidate）→ 只计数不转发：本设计里候选随 SDP 一起发，正常恒为 0；
-//                            真出现了说明 trickle 开始生效，需要显式 media 才能正确路由。
+// 抽干 from 的事件。
+//
+// 会话归属**不靠 SDP 嗅探**：每条 SIGNAL_OUT 都先问 pu_signal_media（v2.10 第 2 步新增的
+// 第 21 个导出），拿到的 media 既用于路由、也用于验收。candidate 信封里没有 m= 行，
+// 正是「只有它能说出归属」的场景。
+//
+// legacy=true 时用 pu_signal_in（media==nullptr，SDP 嗅探的兼容路径）转发，
+// 用来证明老入口仍然正确路由。
 int PumpRouted(pu_engine* from, const char* name, pu_engine* voice_to, pu_engine* video_to,
-               Counters* counters) {
+               Counters* counters, bool legacy) {
   for (;;) {
     pu_event event;
     std::memset(&event, 0, sizeof(event));
@@ -94,6 +105,11 @@ int PumpRouted(pu_engine* from, const char* name, pu_engine* voice_to, pu_engine
       std::printf("FAIL: [%s] pu_poll_event rc=%d (%s)\n", name, rc, pu_last_error(from));
       return -1;
     }
+
+    // pu_signal_media 对所有事件都能调：信令事件应给出 media，其它事件应报 INVALID_ARG。
+    char media_buf[16] = {0};
+    const int media_rc = pu_signal_media(&event, media_buf, static_cast<int>(sizeof(media_buf)));
+
     switch (event.type) {
       case PU_EVENT_REMOTE_FRAME:
       case PU_EVENT_FRAME:
@@ -105,39 +121,84 @@ int PumpRouted(pu_engine* from, const char* name, pu_engine* voice_to, pu_engine
         return -1;
       case PU_EVENT_SIGNAL_OUT: {
         const std::string payload = Payload(event);
-        const bool has_video = payload.find("m=video") != std::string::npos;
-        const bool has_audio = payload.find("m=audio") != std::string::npos;
+        const bool sdp_has_video = payload.find("m=video") != std::string::npos;
+        const bool sdp_has_audio = payload.find("m=audio") != std::string::npos;
+        const char* sdp_media =
+            sdp_has_video ? "screen" : (sdp_has_audio ? "voice" : nullptr);
+
+        if (media_rc != PU_OK) {
+          ++counters->media_missing;
+          std::printf("FAIL: [%s] pu_signal_media on SIGNAL_OUT rc=%d\n", name, media_rc);
+        } else if (sdp_media == nullptr) {
+          // candidate：信封里没有 m= 行 —— 只有 pu_signal_media 能说出归属。
+          ++counters->media_ok;
+        } else if (std::strcmp(media_buf, sdp_media) != 0) {
+          ++counters->media_wrong;
+          std::printf("FAIL: [%s] media mismatch: pu_signal_media=%s but SDP says %s\n", name,
+                      media_buf, sdp_media);
+        } else {
+          ++counters->media_ok;
+        }
+
         pu_engine* target = nullptr;
-        if (has_video) {
-          target = video_to;
-          ++counters->video_signals;
-        } else if (has_audio) {
+        if (media_rc == PU_OK) {
+          target = std::strcmp(media_buf, "voice") == 0 ? voice_to : video_to;
+        } else if (sdp_has_video) {
+          target = video_to;  // 读不出 media 时退回 SDP 嗅探，仅用于诊断
+        } else if (sdp_has_audio) {
           target = voice_to;
+        }
+        if (target == nullptr) {
+          ++counters->unroutable;
+          break;
+        }
+        // 按**解析出的 media** 计数，不要按目标指针比：B/C 的 voice_to 与 video_to 是
+        // 同一个引擎，指针比较会把 video answer 记成 voice。
+        const bool forward_to_voice =
+            media_rc == PU_OK ? (std::strcmp(media_buf, "voice") == 0)
+                              : (!sdp_has_video && sdp_has_audio);
+        if (forward_to_voice) {
           ++counters->voice_signals;
         } else {
-          ++counters->stray_signals;
+          ++counters->video_signals;
         }
-        if (target == nullptr) break;
-        const int in_rc =
-            pu_signal_in(target, event.data.signal.payload, event.data.signal.payload_len);
+
+        const char* media_for_forward =
+            media_rc == PU_OK ? media_buf : sdp_media;
+        int in_rc = PU_ERR_INTERNAL;
+        if (legacy) {
+          in_rc = pu_signal_in(target, payload.data(), static_cast<size_t>(payload.size()));
+        } else {
+          in_rc = pu_signal_in_media(target, media_for_forward, payload.data(),
+                                     static_cast<size_t>(payload.size()));
+        }
         if (in_rc != PU_OK) {
-          std::printf("FAIL: [%s] pu_signal_in rc=%d (%s)\n", name, in_rc, pu_last_error(target));
+          std::printf("FAIL: [%s] forward(%s) rc=%d (%s)\n", name,
+                      legacy ? "pu_signal_in" : "pu_signal_in_media", in_rc,
+                      pu_last_error(target));
           return -1;
         }
         break;
       }
       default:
+        ++counters->non_signal_checked;
+        if (media_rc != PU_ERR_INVALID_ARG) {
+          ++counters->non_signal_bad;
+          std::printf(
+              "FAIL: [%s] pu_signal_media on non-signal event type=%u rc=%d (want INVALID_ARG)\n",
+              name, event.type, media_rc);
+        }
         break;
     }
   }
 }
 
 // 双向抽一次事件：A↔B 走语音、A↔C 走屏幕。任何一条失败返回 -1。
-int PumpAll(pu_engine* a, pu_engine* b, pu_engine* c, Counters* ca, Counters* cb,
-            Counters* cc) {
-  if (PumpRouted(a, "A", b, c, ca) < 0) return -1;
-  if (PumpRouted(b, "B(sfu)", a, a, cb) < 0) return -1;
-  if (PumpRouted(c, "C(viewer)", a, a, cc) < 0) return -1;
+int PumpAll(pu_engine* a, pu_engine* b, pu_engine* c, Counters* ca, Counters* cb, Counters* cc,
+            bool legacy) {
+  if (PumpRouted(a, "A", b, c, ca, legacy) < 0) return -1;
+  if (PumpRouted(b, "B(sfu)", a, a, cb, legacy) < 0) return -1;
+  if (PumpRouted(c, "C(viewer)", a, a, cc, legacy) < 0) return -1;
   return 0;
 }
 
@@ -146,15 +207,68 @@ struct Sample {
   uint32_t pcm = 0;
 };
 
+// pu_signal_media / pu_signal_in_media 的负例（边界契约）。
+int CheckSignalAbiNegative(pu_engine* engine) {
+  char buffer[16] = {0};
+  int failures = 0;
+
+  if (pu_signal_media(nullptr, buffer, sizeof(buffer)) != PU_ERR_INVALID_ARG) {
+    std::printf("FAIL: pu_signal_media(NULL event) did not return INVALID_ARG\n");
+    ++failures;
+  }
+  // 结构体过小：调用方传旧版 pu_event。
+  pu_event small;
+  std::memset(&small, 0, sizeof(small));
+  small.struct_size = 8;
+  if (pu_signal_media(&small, buffer, sizeof(buffer)) != PU_ERR_INVALID_ARG) {
+    std::printf("FAIL: pu_signal_media(small struct_size) did not return INVALID_ARG\n");
+    ++failures;
+  }
+  // 非信令事件。
+  pu_event fake;
+  std::memset(&fake, 0, sizeof(fake));
+  fake.struct_size = sizeof(fake);
+  fake.type = PU_EVENT_STATE;
+  if (pu_signal_media(&fake, buffer, sizeof(buffer)) != PU_ERR_INVALID_ARG) {
+    std::printf("FAIL: pu_signal_media(non-signal event) did not return INVALID_ARG\n");
+    ++failures;
+  }
+  // 伪造的信令事件：没有 payload → 没有 media 记录 → STATE。
+  std::memset(&fake, 0, sizeof(fake));
+  fake.struct_size = sizeof(fake);
+  fake.type = PU_EVENT_SIGNAL_OUT;
+  if (pu_signal_media(&fake, buffer, sizeof(buffer)) != PU_ERR_STATE) {
+    std::printf("FAIL: pu_signal_media(forged signal event) did not return STATE\n");
+    ++failures;
+  }
+  // 未知 media：必须在解析 payload 之前就被拒。
+  const char kPayload[] = "{\"type\":\"answer\",\"sdp\":\"v=0\"}";
+  if (pu_signal_in_media(engine, "bogus", kPayload, sizeof(kPayload) - 1) != PU_ERR_INVALID_ARG) {
+    std::printf("FAIL: pu_signal_in_media(bogus media) did not return INVALID_ARG\n");
+    ++failures;
+  }
+  // 显式 media + 空 payload：仍是 INVALID_ARG。
+  if (pu_signal_in_media(engine, "voice", nullptr, 0) != PU_ERR_INVALID_ARG) {
+    std::printf("FAIL: pu_signal_in_media(NULL payload) did not return INVALID_ARG\n");
+    ++failures;
+  }
+  return failures;
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+  bool legacy = false;
+  for (int i = 1; i < argc; ++i) {
+    if (std::strcmp(argv[i], "--legacy") == 0) legacy = true;
+  }
   // 先把计数阈值降到 1（见 SetPeakThreshold 的注释），再建引擎。
   SetPeakThreshold("1");
   std::printf(
       "partyup_media relay-topology smoke: voice(answerer, relay-like) + screen(offerer, "
-      "direct)\n");
+      "direct) [forwarding=%s]\n",
+      legacy ? "pu_signal_in(sniff)" : "pu_signal_in_media(explicit)");
 
   pu_engine* a = CreateEngine("relay-A-client");
   pu_engine* b = CreateEngine("relay-B-sfu");
@@ -163,6 +277,11 @@ int main() {
     std::printf("FAIL: pu_engine_create returned null: %s\n", pu_last_error(nullptr));
     return 1;
   }
+
+  Counters ca, cb, cc;
+  const int abi_failures = CheckSignalAbiNegative(a);
+  std::printf("  ABI 负例（pu_signal_media / pu_signal_in_media 边界）: %s (%d failure)\n",
+              abi_failures == 0 ? "OK" : "FAIL", abi_failures);
 
   const int64_t t0 = std::chrono::duration_cast<std::chrono::milliseconds>(
                          std::chrono::steady_clock::now().time_since_epoch())
@@ -195,11 +314,10 @@ int main() {
   }
   std::printf("  B: voice joined active (offerer — stands in for the SFU)\n");
 
-  Counters ca, cb, cc;
   const int64_t voice_deadline = now_ms() + 15000;
   bool voice_connected = false;
   while (now_ms() < voice_deadline) {
-    if (PumpAll(a, b, c, &ca, &cb, &cc) < 0) return 1;
+    if (PumpAll(a, b, c, &ca, &cb, &cc, legacy) < 0) return 1;
     // 此时还没有屏幕 PC，pu_peer_stats 报的就是语音会话的状态。
     if (PeerState(a) == PU_PEER_CONNECTED && PeerState(b) == PU_PEER_CONNECTED) {
       voice_connected = true;
@@ -219,7 +337,7 @@ int main() {
   const uint32_t voice_only_start = PcmFrames(a);
   const int64_t baseline_until = now_ms() + 2000;
   while (now_ms() < baseline_until) {
-    if (PumpAll(a, b, c, &ca, &cb, &cc) < 0) return 1;
+    if (PumpAll(a, b, c, &ca, &cb, &cc, legacy) < 0) return 1;
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
   const uint32_t voice_only_frames = PcmFrames(a) - voice_only_start;
@@ -242,7 +360,7 @@ int main() {
   int sample_count = 0;
   const int64_t observe_until = now_ms() + 8000;
   while (now_ms() < observe_until) {
-    if (PumpAll(a, b, c, &ca, &cb, &cc) < 0) return 1;
+    if (PumpAll(a, b, c, &ca, &cb, &cc, legacy) < 0) return 1;
     if (sample_count < 64) {
       samples[sample_count].at_ms = now_ms();
       samples[sample_count].pcm = PcmFrames(a);
@@ -253,10 +371,10 @@ int main() {
 
   const int64_t observe_elapsed_ms = now_ms() - share_started_ms;
   const uint32_t pcm_after_share = PcmFrames(a) - pcm_before_share;
-  const double after_rate =
-      observe_elapsed_ms > 0 ? static_cast<double>(pcm_after_share) * 1000.0 /
-                                   static_cast<double>(observe_elapsed_ms)
-                             : 0.0;
+  const double after_rate = observe_elapsed_ms > 0
+                                ? static_cast<double>(pcm_after_share) * 1000.0 /
+                                      static_cast<double>(observe_elapsed_ms)
+                                : 0.0;
 
   // ---- 5. 判据 ----
   // 5a. 语音 PCM 不得中断：逐 250 ms 采样看「有没有新帧」，统计连续无帧的最长时长。
@@ -292,10 +410,13 @@ int main() {
               static_cast<long long>(longest_stall_ms),
               static_cast<long long>(longest_stall_at_ms));
   std::printf("  viewer video frames : %d (want >= 30)\n", cc.video_frames);
-  std::printf("  signals             : A voice=%d video=%d stray=%d | C video=%d\n",
-              ca.voice_signals, ca.video_signals, ca.stray_signals, cc.video_signals);
+  std::printf("  signals             : A voice=%d video=%d unroutable=%d | C video=%d\n",
+              ca.voice_signals, ca.video_signals, ca.unroutable, cc.video_signals);
+  std::printf("  signal media (ABI)  : A ok=%d wrong=%d missing=%d | non-signal=%d bad=%d\n",
+              ca.media_ok, ca.media_wrong, ca.media_missing, ca.non_signal_checked,
+              ca.non_signal_bad);
 
-  int failures = 0;
+  int failures = abi_failures;
   // 绝对 PCM 帧率受本机麦克风噪声影响：阈值 1 时只有 peak>1 的帧才计数（见 av_smoke 的
   // 同一条注释），所以这里和 av_smoke 一样用 >= 30/s 作为「链路还活着」的下限；
   // 「不中断」由 0 个空窗口 + 最长停顿 <= 500 ms 来判定，那才是本步要证明的东西。
@@ -313,21 +434,34 @@ int main() {
     std::printf("  FAIL: viewer decoded only %d video frame(s)\n", cc.video_frames);
     ++failures;
   }
-  if (ca.stray_signals != 0) {
-    std::printf("  WARN: %d signal(s) had no m= line (candidate trickle); see TODO(step2)\n",
-                ca.stray_signals);
+  if (ca.media_missing != 0 || ca.media_wrong != 0) {
+    std::printf("  FAIL: %d SIGNAL_OUT without media / %d with a wrong media\n", ca.media_missing,
+                ca.media_wrong);
+    ++failures;
+  }
+  if (ca.media_ok == 0) {
+    std::printf("  FAIL: pu_signal_media never returned a media for any SIGNAL_OUT\n");
+    ++failures;
+  }
+  if (ca.non_signal_bad != 0) {
+    std::printf("  FAIL: pu_signal_media accepted %d non-signal event(s)\n", ca.non_signal_bad);
+    ++failures;
+  }
+  if (ca.unroutable != 0) {
+    std::printf("  FAIL: %d signal(s) could not be routed at all\n", ca.unroutable);
+    ++failures;
   }
 
   // ---- 6. 附加观测（不参与 PASS/FAIL）：停止共享时语音会不会被一起拆掉 ----
   // 这是 step5「ReleaseStreamObjects() 末尾 ReleaseVoiceSession()」的直接后果：
   // pu_screen_stop → Stop() → ReleaseStreamObjects() → ReleaseVoiceSession()。
-  // 数字交给设计裁定（第 2/4 步是否要把语音收尾移出屏幕停止路径），这里是真实结果。
+  // 数字交给设计裁定（第 4 步修，已写进代码里的 TODO(step4)），这里是真实结果。
   const uint32_t pcm_before_stop = PcmFrames(a);
   const int64_t stop_at_ms = now_ms();
   pu_screen_stop(a);
   const int64_t stop_until = now_ms() + 1500;
   while (now_ms() < stop_until) {
-    if (PumpAll(a, b, c, &ca, &cb, &cc) < 0) return 1;
+    if (PumpAll(a, b, c, &ca, &cb, &cc, legacy) < 0) return 1;
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
   const uint32_t pcm_after_stop = PcmFrames(a);

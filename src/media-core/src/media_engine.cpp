@@ -54,6 +54,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -171,6 +172,49 @@ constexpr int kSdpTimeoutMs = 10000;     // CreateOffer / CreateAnswer
 constexpr int kSetSdpTimeoutMs = 10000;  // SetLocal / SetRemote
 // 已投递的信令 JSON 保留多少条。见头文件 pu_signal_event 注释。
 constexpr size_t kMaxRetainedSignals = 64;
+
+// ---- 信令会话标识（v2.10 第 2 步）----
+// pu_signal_in_media 的 media 取值；也是 pu_signal_media 的输出值。
+constexpr const char* kMediaVoice = "voice";
+constexpr const char* kMediaScreen = "screen";
+
+// 「已投递信令 → media」登记表（pu_signal_media 的实现基础）。
+//
+// 为什么不放进 pu_event：事件结构是对外 ABI 契约（见文件头的 static_assert 与头文件
+// 注释），没有也不该有 media 字段；media 只在本库内部记录。而 pu_signal_media 的签名
+// 是 (event, out, capacity)——没有引擎句柄，所以只能按「事件里的 payload 指针」查。
+// 生命周期与 pu_signal_event.payload 完全一致：Poll 把指针交给调用方时登记，
+// 该 payload 被回收（保留环滚出 64 条 / 引擎销毁）时删除。指针在 deque 里稳定，
+// 同一时刻不可能被两条事件共用，所以指针做键是唯一的。
+std::mutex g_delivered_media_mu;
+std::unordered_map<const char*, std::string> g_delivered_media;
+
+void RegisterDeliveredMedia(const char* payload, const std::string& media) {
+  if (payload == nullptr) return;
+  std::lock_guard<std::mutex> lock(g_delivered_media_mu);
+  g_delivered_media[payload] = media;
+}
+
+void UnregisterDeliveredMedia(const char* payload) {
+  if (payload == nullptr) return;
+  std::lock_guard<std::mutex> lock(g_delivered_media_mu);
+  g_delivered_media.erase(payload);
+}
+
+// pu_signal_media 的实现主体（无引擎参数，见头文件契约）。
+int SignalMediaOfEvent(const pu_event* event, char* media_out, int capacity) {
+  if (event == nullptr || media_out == nullptr || capacity <= 0) return PU_ERR_INVALID_ARG;
+  if (event->struct_size < sizeof(pu_event)) return PU_ERR_INVALID_ARG;
+  if (event->type != PU_EVENT_SIGNAL_OUT) return PU_ERR_INVALID_ARG;
+  if (event->data.signal.payload == nullptr) return PU_ERR_STATE;
+  std::lock_guard<std::mutex> lock(g_delivered_media_mu);
+  const auto it = g_delivered_media.find(event->data.signal.payload);
+  if (it == g_delivered_media.end() || it->second.empty()) return PU_ERR_STATE;
+  const size_t needed = it->second.size() + 1;  // 含结尾 0
+  if (static_cast<size_t>(capacity) < needed) return PU_ERR_INVALID_ARG;
+  std::memcpy(media_out, it->second.c_str(), needed);
+  return PU_OK;
+}
 
 int64_t NowUsSystem() {
   return std::chrono::duration_cast<std::chrono::microseconds>(
@@ -672,7 +716,8 @@ class MediaEngine {
   void SetLastError(const std::string& message);
 
   // v2：把一条服务端信令灌进引擎（同步执行）
-  int SignalIn(const char* payload, size_t len, std::string* error);
+  // v2.10 第 2 步：media 显式指定会话（"voice"/"screen"）；nullptr/"" 退回 SDP 嗅探。
+  int SignalIn(const char* media, const char* payload, size_t len, std::string* error);
 
   // v2.5：远端帧的 BGRA 快照（pu_frame_acquire / pu_frame_release 的后端）。
   // 没有比上次 acquire 更新的帧时返回 PU_ERR_TIMEOUT（"还没好"，不是错误）。
@@ -715,7 +760,9 @@ class MediaEngine {
   void PushState(int32_t state, int32_t previous, int32_t reason);
   void PushError(int32_t code, const std::string& message);
   void PushEvent(const pu_event& event);
-  void PushEventWithPayload(pu_event event, std::string payload);
+  // v2.10 第 2 步：media 是这条事件所属的信令会话（"voice"/"screen"），
+  // 只对 PU_EVENT_SIGNAL_OUT 有意义；其它事件传空串。
+  void PushEventWithPayload(pu_event event, std::string payload, std::string media = {});
   pu_event MakeEvent(uint32_t type) const;
   void Fail(const std::string& message, std::string* error);
   void ReleaseStreamObjects();
@@ -745,7 +792,9 @@ class MediaEngine {
   void NegotiationEmitLoop(std::string signal_type,
                            webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc);
   std::string BuildLocalSdpWithCandidates(webrtc::PeerConnectionInterface* pc);
-  void EmitSignal(const char* type, const std::string& payload, uint32_t kind);
+  // v2.10 第 2 步：media 是该信令所属会话（kMediaVoice / kMediaScreen）。
+  // 事件里没有 media 字段（ABI 不变），它随队列项走到 Poll，再由 pu_signal_media 查回。
+  void EmitSignal(const char* media, const char* type, const std::string& payload, uint32_t kind);
   void ApplyBufferedCandidates();
   std::vector<CandidateCopy> SnapshotCandidates() const;
   void ResetSignalingStateLocked();
@@ -899,6 +948,9 @@ class MediaEngine {
   struct QueuedEvent {
     pu_event event{};
     std::string payload;  // 只有 PU_EVENT_SIGNAL_OUT 会用到
+    // v2.10 第 2 步：这条信令属于哪条会话（"voice"/"screen"）。内部结构，不跨 ABI；
+    // Poll 投递时登记到 g_delivered_media，pu_signal_media 按 payload 指针查回。
+    std::string media;
   };
   std::mutex queue_mu_;
   std::condition_variable queue_cv_;
@@ -980,8 +1032,11 @@ class MediaEngine::PcObserver : public webrtc::PeerConnectionObserver {
     engine_->Log(3, "ice_candidate: %s", copy.sdp.c_str());
     // SDP 已经发出去了才来的候选，单独补一条 candidate 信令（trickle）。正常情况下
     // 我们要等收集完成才发 SDP，所以这条基本走不到；留着是为了将来接 TURN/SFU。
+    // v2.10 第 2 步：candidate 信封里没有媒体类型，media 只能由 observer 自己的会话
+    // 给出（这正是 pu_signal_in_media 存在的原因）。
     if (LocalSdpEmitted().load(std::memory_order_relaxed)) {
-      engine_->EmitSignal("candidate", MakeCandidateEnvelope(copy), PU_SIGNAL_CANDIDATE);
+      engine_->EmitSignal(Media(), "candidate", MakeCandidateEnvelope(copy),
+                          PU_SIGNAL_CANDIDATE);
     }
   }
 
@@ -1062,6 +1117,8 @@ class MediaEngine::PcObserver : public webrtc::PeerConnectionObserver {
   std::atomic<int32_t>& IceState() {
     return voice_ ? engine_->voice_ice_state_ : engine_->stat_ice_state_;
   }
+  // v2.10 第 2 步：本 observer 服务的会话名，用于给 SIGNAL_OUT 标 media。
+  const char* Media() const { return voice_ ? kMediaVoice : kMediaScreen; }
   std::atomic<int32_t>& PeerState() {
     return voice_ ? engine_->voice_peer_state_ : engine_->stat_peer_state_;
   }
@@ -1082,6 +1139,17 @@ MediaEngine::~MediaEngine() {
   Log(3, "dtor: enter");
   Stop();
   Log(3, "dtor: Stop() returned");
+
+  // v2.10 第 2 步：把本引擎仍保留的「已投递信令 → media」登记清掉。
+  // 那些 payload 指针随 delivered_signals_ 一起失效，登记表里不能留悬空键
+  // （pu_signal_media 的指针有效期契约见头文件）。
+  {
+    std::lock_guard<std::mutex> lock(queue_mu_);
+    for (const std::string& delivered : delivered_signals_) {
+      UnregisterDeliveredMedia(delivered.c_str());
+    }
+    delivered_signals_.clear();
+  }
 
   // 顺序照抄 spike：Close()/track/pc（signaling 线程）→ source → factory → 三条线程 Stop。
   ReleaseStreamObjects();
@@ -1126,8 +1194,7 @@ MediaEngine::~MediaEngine() {
   // 三条 webrtc 线程都停了，才删「可能被它们回调」的对象：远端 sink（解码线程）
   // 与 PC 观察者（signaling 线程）。这样即使有回调在飞也没有线程能再碰它们。
   delete remote_sink_;
-  remote_sink_ = nullptr;
-  delete pc_observer_;
+  remote_sink_ = nullptr;  delete pc_observer_;
   pc_observer_ = nullptr;
   // v2.10：语音 observer 的常规回收在 ReleaseVoiceSession()（上面 ReleaseStreamObjects
   // 里已经跑过一次，这里通常已是 nullptr）。留一行兜底，保证任何提前 return 的收尾路径
@@ -1675,6 +1742,10 @@ void MediaEngine::ReleaseStreamObjects() {
   //   * destroy 路径上不跑它对 voice_pc_ / voice_observer_ / voice_negotiator_ 就没机会释放，
   //     observer 会活到 webrtc 线程 Stop 之后（0xC0000005 的老来源）；
   //   * 释放顺序：先 join 协商线程（它可能正要推一条 answer），再关 PC，最后删 observer。
+  // TODO(step4): 这里有个已知的过度耦合——pu_screen_stop 会经由本函数把**语音会话也拆掉**
+  //   （实测：停止共享后 PCM 计数归零、日志 release-voice: enter (pc=1 joined=1)）。
+  //   第 4 步应把 ReleaseVoiceSession 挪出屏幕停止路径（放 ~MediaEngine 与显式 voice leave），
+  //   让「停止共享」不影响正在进行的语音。现在保持现状，勿在此单独改。
   ReleaseVoiceSession();
   Log(3, "release: done");
 }
@@ -1948,7 +2019,7 @@ void MediaEngine::VoiceNegotiationEmitLoop(
     return;
   }
   const uint32_t kind = (signal_type == "offer") ? PU_SIGNAL_OFFER : PU_SIGNAL_ANSWER;
-  EmitSignal(signal_type.c_str(), MakeSdpEnvelope(signal_type.c_str(), sdp), kind);
+  EmitSignal(kMediaVoice, signal_type.c_str(), MakeSdpEnvelope(signal_type.c_str(), sdp), kind);
   voice_local_sdp_emitted_.store(true, std::memory_order_relaxed);
 }
 
@@ -2269,19 +2340,20 @@ void MediaEngine::NegotiationEmitLoop(
     return;
   }
   const uint32_t kind = (signal_type == "offer") ? PU_SIGNAL_OFFER : PU_SIGNAL_ANSWER;
-  EmitSignal(signal_type.c_str(), MakeSdpEnvelope(signal_type.c_str(), sdp), kind);
+  EmitSignal(kMediaScreen, signal_type.c_str(), MakeSdpEnvelope(signal_type.c_str(), sdp), kind);
   local_sdp_emitted_.store(true, std::memory_order_relaxed);
 }
 
-void MediaEngine::EmitSignal(const char* type, const std::string& payload, uint32_t kind) {
+void MediaEngine::EmitSignal(const char* media, const char* type, const std::string& payload,
+                             uint32_t kind) {
   pu_event event = MakeEvent(PU_EVENT_SIGNAL_OUT);
   event.data.signal.payload = nullptr;  // 真正投递时才填，见 Poll
   event.data.signal.payload_len = static_cast<uint32_t>(payload.size());
   event.data.signal.kind = kind;
   event.data.signal.reserved = 0;
   stat_signal_out_.fetch_add(1, std::memory_order_relaxed);
-  Log(3, "signal out: %s (%zu bytes)", type, payload.size());
-  PushEventWithPayload(event, payload);
+  Log(3, "signal out [%s]: %s (%zu bytes)", media != nullptr ? media : "?", type, payload.size());
+  PushEventWithPayload(event, payload, media != nullptr ? media : std::string());
 }
 
 void MediaEngine::ApplyBufferedCandidates() {
@@ -2302,7 +2374,8 @@ void MediaEngine::ApplyBufferedCandidates() {
   }
 }
 
-int MediaEngine::SignalIn(const char* payload, size_t len, std::string* error) {
+int MediaEngine::SignalIn(const char* media, const char* payload, size_t len,
+                          std::string* error) {
   auto reject = [&](int code, const std::string& message) {
     if (error != nullptr) *error = message;
     SetLastError(message);
@@ -2313,25 +2386,43 @@ int MediaEngine::SignalIn(const char* payload, size_t len, std::string* error) {
     return reject(PU_ERR_INVALID_ARG, "pu_signal_in: payload is null or empty");
   }
 
+  // v2.10 第 2 步：会话归属**优先取显式 media**（pu_signal_in_media 传入 "voice"/"screen"）。
+  // 先验 media、再解析 payload：未知 media 与 payload 内容无关，早失败更便宜。
+  // media == nullptr 或空串时退回 SDP 嗅探（pu_signal_in 兼容入口）：
+  //   * 只带 m=audio、不带 m=video → 语音会话（voice_pc_）
+  //   * 带 m=video（含音视频混合的老式重协商）→ 屏幕会话（pc_）
+  // 嗅探的已知缺陷：candidate 信封里没有 m= 行，两条 PC 并存时只能推断（见 candidate 段）。
+  bool explicit_media = false;
+  bool route_to_voice = false;
+  if (media != nullptr && media[0] != '\0') {
+    if (std::strcmp(media, kMediaVoice) == 0) {
+      route_to_voice = true;
+      explicit_media = true;
+    } else if (std::strcmp(media, kMediaScreen) == 0) {
+      route_to_voice = false;
+      explicit_media = true;
+    } else {
+      return reject(PU_ERR_INVALID_ARG,
+                    std::string("pu_signal_in: unknown media \"") + media +
+                        "\" (want \"voice\" or \"screen\")");
+    }
+  }
+
   SignalMessage message;
   if (!ParseSignal(payload, len, &message, error)) {
     SetLastError("pu_signal_in: " + (error != nullptr ? *error : std::string("bad payload")));
     return PU_ERR_INVALID_ARG;
   }
-  Log(3, "signal in: type=%s (%zu bytes)", message.type.c_str(), len);
+  Log(3, "signal in [%s]: type=%s (%zu bytes)", media != nullptr ? media : "sniff",
+      message.type.c_str(), len);
 
-  // v2.10 第 1 步：语音与屏幕是两条独立 PeerConnection，但 ABI v2 只有 pu_signal_in
-  // （没有显式 media 字段），所以这里先按 SDP 里的 m= 行嗅探路由：
-  //   * 只带 m=audio、不带 m=video → 语音会话（voice_pc_）
-  //   * 带 m=video（含音视频混合的老式重协商）→ 屏幕会话（pc_）
-  //   * candidate 信封里没有 m= 行，只能按「哪条会话存在」推断（见 candidate 段）
-  // TODO(step2): 由 pu_signal_in_media 的显式 media 取代（client 已按 media 分流，
-  //              原生侧缺这条导出）。显式 media 到位后删除本段嗅探，勿在此新增逻辑。
-  const bool is_voice_sdp = message.sdp.find("m=audio") != std::string::npos &&
-                            message.sdp.find("m=video") == std::string::npos;
+  if (!explicit_media) {
+    route_to_voice = message.sdp.find("m=audio") != std::string::npos &&
+                     message.sdp.find("m=video") == std::string::npos;
+  }
 
   if (message.type == "offer") {
-    if (is_voice_sdp) {
+    if (route_to_voice) {
       // ---- 语音会话：只有 audio 的 SDP ----
       // 与屏幕侧同构的三态日志（断线重连的验收门，不能误报）：
       //   1) 已有远端描述 → 同一语音会话上的真重协商；
@@ -2402,7 +2493,7 @@ int MediaEngine::SignalIn(const char* payload, size_t len, std::string* error) {
   }
 
   if (message.type == "answer") {
-    if (is_voice_sdp) {
+    if (route_to_voice) {
       // ---- 语音会话：本端必须是这条会话的 offerer ----
       if (voice_pc_ == nullptr) {
         return reject(PU_ERR_STATE,
@@ -2456,16 +2547,18 @@ int MediaEngine::SignalIn(const char* payload, size_t len, std::string* error) {
                     "pu_signal_in: bad candidate (" + sdp_error.description + ")");
     }
   }
-  // 选目标会话：candidate 信封里没有 m= 行（只有 mid/mline），嗅探做不到逐条判定。
-  // 先按「哪条会话存在」的确定性判据路由：
-  //   * 只有语音 PC（纯语音会话）→ 语音，无歧义；
-  //   * 其余（只有屏幕 PC，或两条都在）→ 屏幕。两条都在时给屏幕是有意的：我们的语音
-  //     候选在等 ICE 收集完成阶段就已随 SDP 一起发出，late candidate 极少；真正的修法
-  //     是显式 media。
-  // TODO(step2): 由 pu_signal_in_media 的显式 media 取代（client 已按 media 分流，
-  //              原生侧缺这条导出）。显式 media 到位后删除本段推断，勿在此新增逻辑。
-  const bool candidate_to_voice = voice_pc_ != nullptr && pc_ == nullptr;
+  // 选目标会话：有显式 media 时直接用它（无歧义）；否则退回「哪条会话存在」的推断：
+  //   * 只有语音 PC（纯语音会话）→ 语音；
+  //   * 其余（只有屏幕 PC，或两条都在）→ 屏幕。两条都在时给屏幕是**兼容入口的兜底**
+  //     （语音候选在等 ICE 收集完成阶段就已随 SDP 一起发出，late candidate 极少）；
+  //     客户端现在一律走 pu_signal_in_media 显式传 media。
+  const bool candidate_to_voice = explicit_media ? route_to_voice
+                                                 : (voice_pc_ != nullptr && pc_ == nullptr);
   if (candidate_to_voice) {
+    if (voice_pc_ == nullptr) {
+      return reject(PU_ERR_STATE,
+                    "received a voice candidate but this engine has no voice peer connection");
+    }
     if (!voice_has_remote_description_) {
       // 远端描述还没设好就先存着（trickle 可能比 SDP 先到），等 SetRemote 之后统一加。
       std::lock_guard<std::mutex> lock(voice_cand_mu_);
@@ -3099,7 +3192,7 @@ void MediaEngine::PushEvent(const pu_event& event) {
   PushEventWithPayload(event, std::string());
 }
 
-void MediaEngine::PushEventWithPayload(pu_event event, std::string payload) {
+void MediaEngine::PushEventWithPayload(pu_event event, std::string payload, std::string media) {
   std::lock_guard<std::mutex> lock(queue_mu_);
   if (queue_.size() >= capacity_) {
     ++dropped_events_;
@@ -3115,6 +3208,7 @@ void MediaEngine::PushEventWithPayload(pu_event event, std::string payload) {
     entry.event.data.signal.payload_len = static_cast<uint32_t>(payload.size());
   }
   entry.payload = std::move(payload);
+  entry.media = std::move(media);
   queue_.push_back(std::move(entry));
   queue_cv_.notify_one();
 }
@@ -3146,8 +3240,14 @@ int MediaEngine::Poll(pu_event* out, int timeout_ms) {
     // 把这条 JSON 移进「已投递」保留区，出队的只是队列项，字符串本体仍然有效
     // （std::deque<std::string> 的 push_back 不会让已有元素搬家）。
     delivered_signals_.push_back(std::move(front.payload));
-    while (delivered_signals_.size() > kMaxRetainedSignals) delivered_signals_.pop_front();
+    // v2.10 第 2 步：登记 (payload 指针 → media)，供 pu_signal_media 查回。
+    // 必须在滚动淘汰之前登记，淘汰时同步注销，保证表里只有「指针仍有效」的项。
     const std::string& payload = delivered_signals_.back();
+    RegisterDeliveredMedia(payload.c_str(), front.media);
+    while (delivered_signals_.size() > kMaxRetainedSignals) {
+      UnregisterDeliveredMedia(delivered_signals_.front().c_str());
+      delivered_signals_.pop_front();
+    }
     out->data.signal.payload = payload.c_str();
     out->data.signal.payload_len = static_cast<uint32_t>(payload.size());
   }
@@ -3156,6 +3256,13 @@ int MediaEngine::Poll(pu_event* out, int timeout_ms) {
 }
 
 }  // namespace
+
+// v2.10：pu_signal_media 的桥。导出函数在 extern "C" 里、不能直接引用匿名命名空间的
+// 符号，所以在这里（partyup 命名空间内）转一手。
+int SignalMediaOfDeliveredEvent(const pu_event* event, char* media_out, int capacity) {
+  return SignalMediaOfEvent(event, media_out, capacity);
+}
+
 }  // namespace partyup
 
 // ---------------------------------------------------------------------------
@@ -3250,11 +3357,12 @@ PU_API const char* pu_last_error(pu_engine* e) {
 
 /* ---- v2：信令通道 ---- */
 
+/* v2.10 起是兼容入口：media == nullptr，会话归属靠 SDP 嗅探（见头文件）。 */
 PU_API int pu_signal_in(pu_engine* e, const char* payload, size_t len) {
   if (e == nullptr) return PU_ERR_INVALID_ARG;
   try {
     std::string error;
-    return e->core.SignalIn(payload, len, &error);
+    return e->core.SignalIn(nullptr, payload, len, &error);
   } catch (const std::exception& ex) {
     e->core.SetLastError(std::string("pu_signal_in exception: ") + ex.what());
     return PU_ERR_INTERNAL;
@@ -3262,6 +3370,27 @@ PU_API int pu_signal_in(pu_engine* e, const char* payload, size_t len) {
     e->core.SetLastError("pu_signal_in: unknown exception");
     return PU_ERR_INTERNAL;
   }
+}
+
+/* v2.10：显式指定信令投给哪条会话（"voice" / "screen"），不做嗅探。 */
+PU_API int pu_signal_in_media(pu_engine* e, const char* media, const char* payload, size_t len) {
+  if (e == nullptr) return PU_ERR_INVALID_ARG;
+  try {
+    std::string error;
+    return e->core.SignalIn(media, payload, len, &error);
+  } catch (const std::exception& ex) {
+    e->core.SetLastError(std::string("pu_signal_in_media exception: ") + ex.what());
+    return PU_ERR_INTERNAL;
+  } catch (...) {
+    e->core.SetLastError("pu_signal_in_media: unknown exception");
+    return PU_ERR_INTERNAL;
+  }
+}
+
+/* v2.10：读回一条 SIGNAL_OUT 事件的 media（"voice"/"screen"）。无引擎参数，
+ * 实现见文件顶部的 g_delivered_media 登记表。 */
+PU_API int pu_signal_media(const pu_event* event, char* media_out, int capacity) {
+  return partyup::SignalMediaOfDeliveredEvent(event, media_out, capacity);
 }
 
 PU_API int pu_peer_stats(pu_engine* e, pu_stats* out) {

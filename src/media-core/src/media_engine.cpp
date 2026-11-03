@@ -91,6 +91,8 @@
 #include "api/stats/rtc_stats_collector_callback.h"
 #include "api/stats/rtc_stats_report.h"
 #include "api/stats/rtcstats_objects.h"
+#include "libyuv.h"
+
 #include "api/video/i420_buffer.h"
 #include "api/video/video_broadcaster.h"
 #include "api/video/video_frame.h"
@@ -594,6 +596,34 @@ class MediaEngine {
 
   // v2：把一条服务端信令灌进引擎（同步执行）
   int SignalIn(const char* payload, size_t len, std::string* error);
+
+  // v2.5：远端帧的 BGRA 快照（pu_frame_acquire / pu_frame_release 的后端）。
+  // 没有比上次 acquire 更新的帧时返回 PU_ERR_TIMEOUT（"还没好"，不是错误）。
+  int AcquireFrame(const char* stream_id, pu_frame* out);
+  void ReleaseFrame(pu_frame* frame);
+
+  // ---- 远端帧三槽缓冲 ----
+  // 解码线程写、UI 线程读。写入方只在「没被 acquire 占用」的槽里转换，转完再把
+  // 它挂成 ready；读取方拿到 ready 槽并置 busy，直到 release 才允许复用 ——
+  // 读到的永远是完整一帧，不会撕裂；也不需要每帧分配。
+  struct FrameSlot {
+    std::vector<uint8_t> bytes;  // BGRA8，按需扩容后复用
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t stride = 0;         // 如实行步长（当前 == width*4，但不做假设）
+    int64_t timestamp_us = 0;
+    uint64_t seq = 0;
+    bool busy = false;
+  };
+  static constexpr int kFrameSlots = 3;
+  FrameSlot frame_slots_[kFrameSlots];
+  std::mutex frame_mu_;
+  int frame_write_slot_ = 0;   // 只有解码线程读写
+  int frame_ready_slot_ = -1;  // 以下都受 frame_mu_ 保护
+  int frame_acquired_slot_ = -1;
+  uint64_t frame_ready_seq_ = 0;
+  uint64_t frame_served_seq_ = 0;
+  uint64_t frame_unpaired_release_ = 0;
   // v2：读统计快照
   int PeerStats(pu_stats* out);
 
@@ -1888,6 +1918,53 @@ void MediaEngine::OnRemoteFrame(const webrtc::VideoFrame& frame) {
         static_cast<long long>(frame.timestamp_us()));
   }
 
+  // v2.5：把解码后的 I420 转成 BGRA 存进三槽之一，供 pu_frame_acquire 取用。
+  // 只在解码线程写：先挑一个没被 acquire 占用的槽（占用中的绝不碰），转换完成
+  // 后再挂成 ready —— 读取方看到 ready 时像素一定是完整的。
+  {
+    webrtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer = frame.video_frame_buffer();
+    if (buffer != nullptr && buffer->type() == webrtc::VideoFrameBuffer::Type::kI420) {
+      const int width = buffer->width();
+      const int height = buffer->height();
+      const uint32_t stride = static_cast<uint32_t>(width) * 4u;
+      const size_t needed = static_cast<size_t>(stride) * static_cast<size_t>(height);
+      int slot_index = -1;
+      int picked_width = 0;
+      {
+        std::lock_guard<std::mutex> lock(frame_mu_);
+        for (int i = 0; i < kFrameSlots; ++i) {
+          const int candidate = (frame_write_slot_ + i) % kFrameSlots;
+          if (!frame_slots_[candidate].busy) {
+            slot_index = candidate;
+            break;
+          }
+        }
+      }
+      if (slot_index >= 0) {
+        FrameSlot& slot = frame_slots_[slot_index];
+        if (slot.bytes.size() < needed) slot.bytes.resize(needed);
+        const webrtc::I420BufferInterface* i420 = buffer->GetI420();
+        if (i420 != nullptr && i420->width() == width && i420->height() == height) {
+          // 行步长如实填 stride：绝不让下游假设 stride == width*4。
+          libyuv::I420ToARGB(i420->DataY(), i420->StrideY(), i420->DataU(),
+                             i420->StrideU(), i420->DataV(), i420->StrideV(),
+                             slot.bytes.data(), static_cast<int>(stride), width,
+                             height);
+          std::lock_guard<std::mutex> lock(frame_mu_);
+          slot.width = static_cast<uint32_t>(width);
+          slot.height = static_cast<uint32_t>(height);
+          slot.stride = stride;
+          slot.timestamp_us = frame.timestamp_us();
+          slot.seq = ++frame_ready_seq_;
+          frame_ready_slot_ = slot_index;
+          frame_write_slot_ = (slot_index + 1) % kFrameSlots;
+          picked_width = width;
+        }
+      }
+      static_cast<void>(picked_width);
+    }
+  }
+
   pu_event event = MakeEvent(PU_EVENT_REMOTE_FRAME);
   event.data.remote.sequence = sequence;
   event.data.remote.timestamp_us = frame.timestamp_us();
@@ -1897,6 +1974,58 @@ void MediaEngine::OnRemoteFrame(const webrtc::VideoFrame& frame) {
   event.data.remote.frames_received = received;
   event.data.remote.reserved = 0;
   PushEvent(event);
+}
+
+// v2.5：pu_frame_acquire 的后端。语义见 partyup_media.h 的 pu_frame 注释。
+int MediaEngine::AcquireFrame(const char* stream_id, pu_frame* out) {
+  if (out == nullptr) {
+    SetLastError("pu_frame_acquire: out is null");
+    return PU_ERR_INVALID_ARG;
+  }
+  const std::string requested = stream_id != nullptr ? stream_id : "";
+  if (!requested.empty() && requested != "remote") {
+    SetLastError("pu_frame_acquire: unknown stream_id '" + requested + "'");
+    return PU_ERR_INVALID_ARG;
+  }
+  if (out->struct_size != 0 && out->struct_size < sizeof(pu_frame)) {
+    SetLastError("pu_frame_acquire: pu_frame.struct_size is smaller than the ABI struct");
+    return PU_ERR_INVALID_ARG;
+  }
+
+  std::lock_guard<std::mutex> lock(frame_mu_);
+  if (frame_ready_slot_ < 0 ||
+      frame_slots_[frame_ready_slot_].seq <= frame_served_seq_) {
+    // 还没比上次更新过的帧：这是「未就绪」，不是失败。
+    return PU_ERR_TIMEOUT;
+  }
+  FrameSlot& slot = frame_slots_[frame_ready_slot_];
+  slot.busy = true;
+  frame_acquired_slot_ = frame_ready_slot_;
+  frame_ready_slot_ = -1;
+  frame_served_seq_ = slot.seq;
+
+  out->struct_size = static_cast<uint32_t>(sizeof(pu_frame));
+  out->width = slot.width;
+  out->height = slot.height;
+  out->stride = slot.stride;
+  out->timestamp_us = slot.timestamp_us;
+  out->pixels = slot.bytes.data();
+  out->stream_id = 1;  // 当前只有远端视频流
+  return PU_OK;
+}
+
+void MediaEngine::ReleaseFrame(pu_frame* frame) {
+  static_cast<void>(frame);
+  std::lock_guard<std::mutex> lock(frame_mu_);
+  if (frame_acquired_slot_ < 0) {
+    // 不配对的 release：计数 + 记日志，但不影响引擎（也不能泄漏内存）。
+    ++frame_unpaired_release_;
+    Log(2, "pu_frame_release without a matching acquire (%llu total)",
+        static_cast<unsigned long long>(frame_unpaired_release_));
+    return;
+  }
+  frame_slots_[frame_acquired_slot_].busy = false;
+  frame_acquired_slot_ = -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -2513,17 +2642,25 @@ PU_API int pu_screen_unwatch(pu_engine* e, const char* sharer_id) {
 }
 
 PU_API int pu_frame_acquire(pu_engine* e, const char* stream_id, pu_frame* out) {
-  static_cast<void>(stream_id);
-  static_cast<void>(out);
   if (e == nullptr) return PU_ERR_INVALID_ARG;
-  e->core.SetLastError("pu_frame_acquire: not implemented in ABI v2");
-  return PU_NOT_IMPLEMENTED;
+  try {
+    return e->core.AcquireFrame(stream_id, out);
+  } catch (const std::exception& ex) {
+    e->core.SetLastError(std::string("pu_frame_acquire exception: ") + ex.what());
+    return PU_ERR_INTERNAL;
+  } catch (...) {
+    e->core.SetLastError("pu_frame_acquire: unknown exception");
+    return PU_ERR_INTERNAL;
+  }
 }
 
 PU_API void pu_frame_release(pu_engine* e, pu_frame* f) {
-  static_cast<void>(f);
   if (e == nullptr) return;
-  e->core.SetLastError("pu_frame_release: not implemented in ABI v2");
+  try {
+    e->core.ReleaseFrame(f);
+  } catch (...) {
+    e->core.SetLastError("pu_frame_release: unknown exception");
+  }
 }
 
 }  // extern "C"

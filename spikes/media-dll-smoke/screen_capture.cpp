@@ -30,6 +30,8 @@
 #include <vector>
 
 #include <windows.h>
+#include <psapi.h>  // GetProcessMemoryInfo：pu_frame_acquire 300 帧的泄漏检查
+#pragma comment(lib, "psapi.lib")
 
 #include "partyup_media.h"
 
@@ -180,6 +182,64 @@ int ForwardSignals(pu_engine* from, pu_engine* to, int* remote_frames, const cha
       }
     } else if (event.type == PU_EVENT_REMOTE_FRAME) {
       ++*remote_frames;
+      // pu_frame_acquire / release 实测（观看方事件由这里统一消费）。
+      static int acquired = 0;
+      static int not_ready = 0;
+      static int failed = 0;
+      static SIZE_T private_first = 0;
+      pu_frame grabbed;
+      std::memset(&grabbed, 0, sizeof(grabbed));
+      grabbed.struct_size = static_cast<uint32_t>(sizeof(grabbed));
+      const int acq_rc = pu_frame_acquire(from, "remote", &grabbed);
+      if (acq_rc == PU_OK) {
+        ++acquired;
+        if (acquired == 1) {
+          PROCESS_MEMORY_COUNTERS counters;
+          std::memset(&counters, 0, sizeof(counters));
+          if (GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters))) {
+            private_first = counters.PagefileUsage;
+          }
+          const std::string bgra_path = AbsolutePath("frame-acquire.bgra");
+          FILE* fp = std::fopen(bgra_path.c_str(), "wb");
+          if (fp != nullptr) {
+            const uint8_t* base = static_cast<const uint8_t*>(grabbed.pixels);
+            for (uint32_t row = 0; row < grabbed.height; ++row) {
+              std::fwrite(base + static_cast<size_t>(row) * grabbed.stride,
+                          sizeof(uint8_t), static_cast<size_t>(grabbed.width) * 4, fp);
+            }
+            std::fclose(fp);
+          }
+          std::printf(
+              "pu_frame_acquire #1: %ux%u stride=%u ts=%lld stream=%llu -> %s\n",
+              grabbed.width, grabbed.height, grabbed.stride,
+              static_cast<long long>(grabbed.timestamp_us),
+              static_cast<unsigned long long>(grabbed.stream_id), bgra_path.c_str());
+        }
+        pu_frame_release(from, &grabbed);
+        if (acquired == 300) {
+          PROCESS_MEMORY_COUNTERS counters;
+          std::memset(&counters, 0, sizeof(counters));
+          SIZE_T private_last = 0;
+          if (GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters))) {
+            private_last = counters.PagefileUsage;
+          }
+          std::printf(
+              "pu_frame acquire/release x300: ok=%d not_ready=%d failed=%d "
+              "private_first=%llu private_last=%llu delta=%lld bytes\n",
+              acquired, not_ready, failed,
+              static_cast<unsigned long long>(private_first),
+              static_cast<unsigned long long>(private_last),
+              static_cast<long long>(static_cast<int64_t>(private_last) -
+                                     static_cast<int64_t>(private_first)));
+        }
+      } else if (acq_rc == PU_ERR_TIMEOUT) {
+        ++not_ready;
+      } else {
+        ++failed;
+        if (failed == 1) {
+          std::printf("FAIL: pu_frame_acquire rc=%d (%s)\n", acq_rc, pu_last_error(from));
+        }
+      }
     }
   }
 }
@@ -395,9 +455,75 @@ int main(int argc, char** argv) {
         }
         break;
       }
-      case PU_EVENT_REMOTE_FRAME:
+      case PU_EVENT_REMOTE_FRAME: {
         ++viewer_remote_frames;
+        // ---- pu_frame_acquire / release 实测（v2.5 起是真实现）----
+        static int acquired = 0;
+        static int not_ready = 0;
+        static int failed = 0;
+        static SIZE_T private_first = 0;
+        static uint32_t acq_w = 0;
+        static uint32_t acq_h = 0;
+        static uint32_t acq_stride = 0;
+        pu_frame grabbed;
+        std::memset(&grabbed, 0, sizeof(grabbed));
+        grabbed.struct_size = static_cast<uint32_t>(sizeof(grabbed));
+        const int acq_rc = pu_frame_acquire(viewer, "remote", &grabbed);
+        if (acq_rc == PU_OK) {
+          ++acquired;
+          if (acquired == 1) {
+            acq_w = grabbed.width;
+            acq_h = grabbed.height;
+            acq_stride = grabbed.stride;
+            PROCESS_MEMORY_COUNTERS counters;
+            std::memset(&counters, 0, sizeof(counters));
+            if (GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters))) {
+              private_first = counters.PagefileUsage;
+            }
+            const std::string bgra_path = AbsolutePath("frame-acquire.bgra");
+            FILE* fp = std::fopen(bgra_path.c_str(), "wb");
+            if (fp != nullptr) {
+              const uint8_t* base = static_cast<const uint8_t*>(grabbed.pixels);
+              for (uint32_t row = 0; row < grabbed.height; ++row) {
+                std::fwrite(base + static_cast<size_t>(row) * grabbed.stride,
+                            sizeof(uint8_t), static_cast<size_t>(grabbed.width) * 4, fp);
+              }
+              std::fclose(fp);
+            }
+            std::printf(
+                "pu_frame_acquire #1: %ux%u stride=%u ts=%lld stream=%llu -> %s\n",
+                grabbed.width, grabbed.height, grabbed.stride,
+                static_cast<long long>(grabbed.timestamp_us),
+                static_cast<unsigned long long>(grabbed.stream_id), bgra_path.c_str());
+          }
+          pu_frame_release(viewer, &grabbed);
+          if (acquired == 300) {
+            PROCESS_MEMORY_COUNTERS counters;
+            std::memset(&counters, 0, sizeof(counters));
+            SIZE_T private_last = 0;
+            if (GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters))) {
+              private_last = counters.PagefileUsage;
+            }
+            std::printf(
+                "pu_frame acquire/release x300: ok=%d not_ready=%d failed=%d "
+                "private_first=%llu private_last=%llu delta=%lld bytes\n",
+                acquired, not_ready, failed,
+                static_cast<unsigned long long>(private_first),
+                static_cast<unsigned long long>(private_last),
+                static_cast<long long>(static_cast<int64_t>(private_last) -
+                                       static_cast<int64_t>(private_first)));
+          }
+        } else if (acq_rc == PU_ERR_TIMEOUT) {
+          ++not_ready;
+        } else {
+          ++failed;
+          if (failed == 1) {
+            std::printf("FAIL: pu_frame_acquire rc=%d (%s)\n", acq_rc,
+                        pu_last_error(viewer));
+          }
+        }
         break;
+      }
       default:
         break;
     }

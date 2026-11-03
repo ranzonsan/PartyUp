@@ -322,7 +322,19 @@ typedef struct pu_source_list {
   const pu_source_info* items;
 } pu_source_list;
 
-/* 一帧待渲染数据（pu_frame_acquire）。由引擎持有，pu_frame_release 前不可跨帧复用。 */
+/* 一帧待渲染数据（pu_frame_acquire）。
+ *
+ * 语义（v2.5 起是真实现，结构体布局与 v2 完全一致、未改动）：
+ *   * pixels 由引擎持有，**在 pu_frame_release 之前一直有效**且内容稳定
+ *     （不会撕裂，也不会被下一帧覆盖）。
+ *   * acquire / release 必须**配对**；漏掉 release 时该槽位不会回收，
+ *     引擎会记日志 + 计数（不会泄漏内存）。
+ *   * 没有比上次更新过的帧时 `pu_frame_acquire` 返回 **PU_ERR_TIMEOUT**，
+ *     表示「还没好，继续等」，不是失败。
+ *   * stride 是**如实**的行字节数，客户端必须按 stride 逐行拷贝，
+ *     不能假设 stride == width * 4。
+ *   * stream_id 是不透明流标识（当前远端视频流为 1）。
+ */
 typedef struct pu_frame {
   uint32_t struct_size;   /* sizeof(pu_frame) */
   uint32_t width;

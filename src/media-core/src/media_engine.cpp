@@ -719,6 +719,10 @@ class MediaEngine {
   pu_event MakeEvent(uint32_t type) const;
   void Fail(const std::string& message, std::string* error);
   void ReleaseStreamObjects();
+  // v2.10：语音会话自己的收尾（关 voice_pc_、join voice_negotiator_、删 voice_observer_）。
+  // 与 ReleaseStreamObjects（屏幕会话）互不依赖：两条 PC 各自关闭、各自释放。
+  // TODO(step4): 合并到参数化的 MediaSession 版本，勿在此新增逻辑（只做搬家）。
+  void ReleaseVoiceSession();
   void Log(int level, const char* format, ...);
 
   // ---- v2.1：PU_EVENT_FRAME 的数据源是 PC 的 GetStats ----
@@ -747,6 +751,20 @@ class MediaEngine {
   void ResetSignalingStateLocked();
   // 等一个 ICE 收集完成的时刻（轮询，最多 kGatherTimeoutMs）
   bool WaitIceGatheringComplete(webrtc::PeerConnectionInterface* pc);
+
+  // ---- v2.10 第 1 步：语音独立 PeerConnection 的协商 helper ----
+  // 与上面那组屏幕 helper 一一对应，只是把 pc_ / cand_mu_ / gathered_candidates_ /
+  // negotiator_* 换成 voice_pc_ / voice_cand_mu_ / voice_gathered_ / voice_negotiator_*。
+  // TODO(step4): 合并到参数化的 MediaSession 版本，勿在此新增逻辑（只做搬家）。
+  bool EnsureVoicePeerConnection(bool for_sending, std::string* error);
+  bool VoiceCreateOfferAndSetLocal(std::string* error);
+  bool VoiceCreateAnswerAndSetLocal(std::string* error);
+  bool VoiceSetRemoteDescription(int type, const std::string& sdp, std::string* error);
+  std::string VoiceBuildSdpWithCandidates(webrtc::PeerConnectionInterface* pc);
+  void VoiceStartNegotiationEmit(const char* signal_type);
+  void VoiceNegotiationEmitLoop(std::string signal_type,
+                                webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc);
+  void VoiceApplyBufferedCandidates();
 
   // WinsockInitializer 必须先构造、最后析构（成员逆序析构）。
   webrtc::WinsockInitializer winsock_;
@@ -1111,6 +1129,11 @@ MediaEngine::~MediaEngine() {
   remote_sink_ = nullptr;
   delete pc_observer_;
   pc_observer_ = nullptr;
+  // v2.10：语音 observer 的常规回收在 ReleaseVoiceSession()（上面 ReleaseStreamObjects
+  // 里已经跑过一次，这里通常已是 nullptr）。留一行兜底，保证任何提前 return 的收尾路径
+  // 都不会把它带进下一个引擎实例（历史上泄漏的 observer 是 0xC0000005 的来源之一）。
+  delete voice_observer_;
+  voice_observer_ = nullptr;
   Log(3, "dtor: sinks/observer deleted");
   // v2.4：与 Init 里的 MFStartup 配对。放在最后：编码/解码器线程已在
   // ReleaseStreamObjects() 里拆完，MFT 与 D3D 设备都已释放。
@@ -1304,6 +1327,10 @@ bool MediaEngine::Init(const pu_config* cfg, std::string* error) {
   // 所以只在析构函数里、三条线程都 Stop 之后才删。
   remote_sink_ = new RemoteFrameSink(this);
   pc_observer_ = new PcObserver(this);
+  // v2.10：语音会话有自己的 observer（voice=true → 状态/候选/本地 SDP 分流到语音那套成员）。
+  // 它的生命周期跟 voice_pc_ 绑定，由 ReleaseVoiceSession() 释放；这里先建好，
+  // 保证「建 PC 之前 observer 一定存在」的次序。
+  voice_observer_ = new PcObserver(this, /*voice=*/true);
 
   return true;
 }
@@ -1643,7 +1670,305 @@ void MediaEngine::ReleaseStreamObjects() {
   local_sdp_emitted_.store(false, std::memory_order_relaxed);
   stat_peer_state_.store(PU_PEER_NONE, std::memory_order_relaxed);
   stat_ice_state_.store(PU_ICE_NEW, std::memory_order_relaxed);
+  // v2.10 第 1 步：屏幕会话收尾后，把语音会话也收干净。
+  // 两条 PC 虽然独立，但引擎的收尾路径（pu_screen_stop / pu_engine_destroy）都汇到这里：
+  //   * destroy 路径上不跑它对 voice_pc_ / voice_observer_ / voice_negotiator_ 就没机会释放，
+  //     observer 会活到 webrtc 线程 Stop 之后（0xC0000005 的老来源）；
+  //   * 释放顺序：先 join 协商线程（它可能正要推一条 answer），再关 PC，最后删 observer。
+  ReleaseVoiceSession();
   Log(3, "release: done");
+}
+
+// ---------------------------------------------------------------------------
+// v2.10 第 1 步：语音会话收尾
+// ---------------------------------------------------------------------------
+
+void MediaEngine::ReleaseVoiceSession() {
+  Log(3, "release-voice: enter (pc=%d joined=%d)", voice_pc_ != nullptr ? 1 : 0,
+      voice_joined_ ? 1 : 0);
+  // 1) 协商线程先收掉。它会在 ICE 收集完成后往事件队列推 answer/offer ——
+  //    「stop 之后还冒出一条信令」就是漏了这一 join。
+  voice_negotiator_stop_.store(true, std::memory_order_relaxed);
+  if (voice_negotiator_.joinable()) voice_negotiator_.join();
+  // 2) 关 PC 必须在 signaling 线程上（VideoTrack/AudioTrack 与 PC 都有线程断言）。
+  //    正常调用点都在控制线程；万一有人在 signaling 线程上进来，BlockingCall 会自锁，
+  //    所以显式跳过（此时也只剩把引用放掉这一条安全路径）。
+  if (signaling_ != nullptr && !signaling_->IsCurrent()) {
+    signaling_->BlockingCall([this] {
+      if (voice_pc_ != nullptr) {
+        // 远端音频 sink 属于语音会话，先摘再关（RemoveSink 有线程断言）。
+        DetachAllAudioSinks();
+        voice_pc_->Close();
+      }
+      // 引用在 signaling 线程上放掉：PC 的析构由它检查线程归属。
+      voice_pc_ = nullptr;
+    });
+  } else {
+    voice_pc_ = nullptr;
+  }
+  {
+    std::lock_guard<std::mutex> lock(voice_cand_mu_);
+    voice_gathered_.clear();
+    voice_buffered_.clear();
+  }
+  voice_sender_ = nullptr;
+  voice_track_ = nullptr;
+  voice_source_ = nullptr;
+  voice_joined_ = false;
+  voice_offerer_ = false;
+  voice_has_remote_description_ = false;
+  voice_local_sdp_emitted_.store(false, std::memory_order_relaxed);
+  voice_peer_state_.store(PU_PEER_NONE, std::memory_order_relaxed);
+  voice_ice_state_.store(PU_ICE_NEW, std::memory_order_relaxed);
+  // 3) 最后删 observer：voice_pc_ 已经在 signaling 线程上放掉了，之后没有对象会再回调它。
+  //    下一次 VoiceJoin 由 EnsureVoicePeerConnection 重建。
+  delete voice_observer_;
+  voice_observer_ = nullptr;
+  Log(3, "release-voice: done");
+}
+
+// ---------------------------------------------------------------------------
+// v2.10 第 1 步：语音独立 PeerConnection 的协商 helper
+//
+// 这 8 个函数是上面「v2：PeerConnection 与信令」那组的逐行搬运，唯一区别是把
+// pc_ / cand_mu_ / gathered_candidates_ / negotiator_* 换成
+// voice_pc_ / voice_cand_mu_ / voice_gathered_ / voice_negotiator_*。
+// 两条会话因此互不干扰：屏幕 PC 的 CreateOffer 不会把语音 PC 的 signaling state 拖进
+// have-local-offer（relay 下点共享曾因此把语音 answer 打成 role mismatch）。
+// TODO(step4): 合并到参数化的 MediaSession 版本，勿在此新增逻辑（只做搬家）。
+// ---------------------------------------------------------------------------
+
+// 下面「v2：PeerConnection 与信令」段里的两个公共实现（线程归属 + 超时 + 观测者）。
+// 语音这组直接复用，不另写一遍；先前置声明是因为它们的定义在本段之后。
+bool ApplyLocalDescription(webrtc::Thread* signaling,
+                           webrtc::PeerConnectionInterface* pc,
+                           webrtc::SdpType type,
+                           const std::string& sdp,
+                           std::string* error);
+bool ApplyRemoteDescription(webrtc::Thread* signaling,
+                            webrtc::PeerConnectionInterface* pc,
+                            webrtc::SdpType type,
+                            const std::string& sdp,
+                            std::string* error);
+
+bool MediaEngine::EnsureVoicePeerConnection(bool for_sending, std::string* error) {
+  // observer 由 ReleaseVoiceSession 删除，重进频道时在这里补建。
+  if (voice_observer_ == nullptr) {
+    voice_observer_ = new PcObserver(this, /*voice=*/true);
+  }
+  if (voice_pc_ != nullptr) {
+    // 已有语音 PC：把（可能后建的）音频轨补挂上去，但不要重复 AddTrack。
+    if (for_sending && voice_track_ != nullptr && voice_sender_ == nullptr) {
+      std::string add_error;
+      signaling_->BlockingCall([&] {
+        auto added = voice_pc_->AddTrack(voice_track_, {"voice"});
+        if (!added.ok()) {
+          add_error = std::string("AddTrack(audio) failed: ") + added.error().message();
+        } else {
+          voice_sender_ = added.value();
+        }
+      });
+      if (!add_error.empty()) {
+        *error = add_error;
+        return false;
+      }
+    }
+    return true;
+  }
+  if (signaling_ == nullptr || pc_factory_ == nullptr) {
+    *error = "engine is not initialised";
+    return false;
+  }
+
+  std::string create_error;
+  webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc;
+  signaling_->BlockingCall([&] {
+    webrtc::PeerConnectionInterface::RTCConfiguration config;
+    // 与屏幕会话同策略：同进程回环只需要 host 候选；接 STUN/TURN 时在这里加。
+    webrtc::PeerConnectionDependencies dependencies(voice_observer_);
+    auto created = pc_factory_->CreatePeerConnectionOrError(config, std::move(dependencies));
+    if (!created.ok()) {
+      create_error = std::string("CreatePeerConnection (voice) failed: ") +
+                     created.error().message();
+      return;
+    }
+    pc = created.value();
+    // 音频轨由 VoiceJoin 在 PC 建好之后创建并 AddTrack；这里 for_sending 只表示角色。
+  });
+  if (pc == nullptr) {
+    *error = create_error.empty() ? "voice peer connection creation failed" : create_error;
+    return false;
+  }
+
+  voice_pc_ = pc;
+  voice_offerer_ = for_sending;
+  voice_has_remote_description_ = false;
+  {
+    std::lock_guard<std::mutex> lock(voice_cand_mu_);
+    voice_gathered_.clear();
+    voice_buffered_.clear();
+  }
+  Log(3, "voice peer connection created (role=%s)", for_sending ? "offerer" : "answerer");
+  return true;
+}
+
+bool MediaEngine::VoiceCreateOfferAndSetLocal(std::string* error) {
+  if (voice_pc_ == nullptr) {
+    *error = "no voice peer connection";
+    return false;
+  }
+  AsyncResult create;
+  webrtc::scoped_refptr<webrtc::CreateSessionDescriptionObserver> observer(
+      new webrtc::RefCountedObject<CreateSdpObserver>(&create));
+  signaling_->BlockingCall([&] {
+    webrtc::PeerConnectionInterface::RTCOfferAnswerOptions options;  // 默认 sendrecv
+    voice_pc_->CreateOffer(observer.get(), options);
+  });
+  if (!WaitAsync(&create, kSdpTimeoutMs) || !create.ok) {
+    *error = "CreateOffer (voice) failed: " +
+             (create.done ? create.error : std::string("timeout"));
+    return false;
+  }
+  Log(3, "voice offer generated (%zu bytes)", create.sdp.size());
+  return ApplyLocalDescription(signaling_.get(), voice_pc_.get(), webrtc::SdpType::kOffer,
+                               create.sdp, error);
+}
+
+bool MediaEngine::VoiceCreateAnswerAndSetLocal(std::string* error) {
+  if (voice_pc_ == nullptr) {
+    *error = "no voice peer connection";
+    return false;
+  }
+  AsyncResult create;
+  webrtc::scoped_refptr<webrtc::CreateSessionDescriptionObserver> observer(
+      new webrtc::RefCountedObject<CreateSdpObserver>(&create));
+  signaling_->BlockingCall([&] {
+    webrtc::PeerConnectionInterface::RTCOfferAnswerOptions options;
+    voice_pc_->CreateAnswer(observer.get(), options);
+  });
+  if (!WaitAsync(&create, kSdpTimeoutMs) || !create.ok) {
+    *error = "CreateAnswer (voice) failed: " +
+             (create.done ? create.error : std::string("timeout"));
+    return false;
+  }
+  Log(3, "voice answer generated (%zu bytes)", create.sdp.size());
+  return ApplyLocalDescription(signaling_.get(), voice_pc_.get(), webrtc::SdpType::kAnswer,
+                               create.sdp, error);
+}
+
+bool MediaEngine::VoiceSetRemoteDescription(int type, const std::string& sdp,
+                                            std::string* error) {
+  return ApplyRemoteDescription(signaling_.get(), voice_pc_.get(),
+                                static_cast<webrtc::SdpType>(type), sdp, error);
+}
+
+std::string MediaEngine::VoiceBuildSdpWithCandidates(webrtc::PeerConnectionInterface* pc) {
+  if (pc == nullptr) return {};
+  const webrtc::SessionDescriptionInterface* local = pc->local_description();
+  if (local == nullptr) return {};
+
+  // 与屏幕版同算法：先序列化一份，再把「SDP 里还没有的候选」补进 Clone。
+  const std::string base = webrtc::SdpSerialize(*local);
+  std::unique_ptr<webrtc::SessionDescriptionInterface> desc = local->Clone();
+  if (desc == nullptr) return base;
+
+  std::vector<CandidateCopy> candidates;
+  {
+    std::lock_guard<std::mutex> lock(voice_cand_mu_);
+    candidates = voice_gathered_;
+  }
+  int added = 0;
+  int already = 0;
+  for (const CandidateCopy& candidate : candidates) {
+    if (base.find(candidate.sdp) != std::string::npos) {
+      ++already;
+      continue;
+    }
+    std::unique_ptr<webrtc::IceCandidate> parsed =
+        webrtc::IceCandidate::Create(candidate.mid, candidate.mline_index, candidate.sdp, nullptr);
+    if (parsed != nullptr && desc->AddCandidate(parsed.get())) ++added;
+  }
+
+  std::string out = webrtc::SdpSerialize(*desc);
+  int candidate_lines = 0;
+  for (size_t pos = 0; (pos = out.find("a=candidate:", pos)) != std::string::npos; ++pos) {
+    ++candidate_lines;
+  }
+  Log(3, "voice local sdp: %zu bytes, %d a=candidate line(s) (%d added here, %d already present)",
+      out.size(), candidate_lines, added, already);
+  return out;
+}
+
+void MediaEngine::VoiceStartNegotiationEmit(const char* signal_type) {
+  if (voice_negotiator_.joinable()) {
+    voice_negotiator_stop_.store(true, std::memory_order_relaxed);
+    voice_negotiator_.join();
+  }
+  voice_negotiator_stop_.store(false, std::memory_order_relaxed);
+  webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc = voice_pc_;
+  if (pc == nullptr) return;
+  const std::string type = signal_type;
+  voice_negotiator_ = std::thread([this, type, pc] { VoiceNegotiationEmitLoop(type, pc); });
+}
+
+void MediaEngine::VoiceNegotiationEmitLoop(
+    std::string signal_type,
+    webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc) {
+  // 等 ICE 收集完成（轮询，最多 kGatherTimeoutMs）——与 WaitIceGatheringComplete 同一算法，
+  // 但判的是语音自己的停止标志，不能借用屏幕那条（否则停屏幕会打断语音的 SDP 发送）。
+  bool gathered = false;
+  if (signaling_ != nullptr) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(kGatherTimeoutMs);
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (voice_negotiator_stop_.load(std::memory_order_relaxed)) return;
+      const auto state = signaling_->BlockingCall([pc] { return pc->ice_gathering_state(); });
+      if (state == webrtc::PeerConnectionInterface::kIceGatheringComplete) {
+        gathered = true;
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  }
+  if (voice_negotiator_stop_.load(std::memory_order_relaxed)) return;
+  if (!gathered) {
+    size_t candidates = 0;
+    {
+      std::lock_guard<std::mutex> lock(voice_cand_mu_);
+      candidates = voice_gathered_.size();
+    }
+    Log(2, "voice ICE gathering timed out (%d ms), emitting SDP with %zu candidate(s) anyway",
+        kGatherTimeoutMs, candidates);
+  }
+
+  std::string sdp = signaling_->BlockingCall(
+      [this, pc] { return VoiceBuildSdpWithCandidates(pc.get()); });
+  if (sdp.empty()) {
+    PushError(PU_ERR_MEDIA, "voice local description is empty, cannot emit " + signal_type);
+    return;
+  }
+  const uint32_t kind = (signal_type == "offer") ? PU_SIGNAL_OFFER : PU_SIGNAL_ANSWER;
+  EmitSignal(signal_type.c_str(), MakeSdpEnvelope(signal_type.c_str(), sdp), kind);
+  voice_local_sdp_emitted_.store(true, std::memory_order_relaxed);
+}
+
+void MediaEngine::VoiceApplyBufferedCandidates() {
+  std::vector<CandidateCopy> pending;
+  {
+    std::lock_guard<std::mutex> lock(voice_cand_mu_);
+    pending.swap(voice_buffered_);
+  }
+  if (pending.empty() || voice_pc_ == nullptr) return;
+  for (const CandidateCopy& candidate : pending) {
+    bool applied = false;
+    signaling_->BlockingCall([this, &candidate, &applied] {
+      std::unique_ptr<webrtc::IceCandidate> parsed = webrtc::IceCandidate::Create(
+          candidate.mid, candidate.mline_index, candidate.sdp, nullptr);
+      if (parsed != nullptr) applied = voice_pc_->AddIceCandidate(parsed.get());
+    });
+    Log(3, "voice buffered candidate %s: %s", applied ? "applied" : "rejected",
+        candidate.sdp.c_str());
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1995,23 +2320,66 @@ int MediaEngine::SignalIn(const char* payload, size_t len, std::string* error) {
   }
   Log(3, "signal in: type=%s (%zu bytes)", message.type.c_str(), len);
 
+  // v2.10 第 1 步：语音与屏幕是两条独立 PeerConnection，但 ABI v2 只有 pu_signal_in
+  // （没有显式 media 字段），所以这里先按 SDP 里的 m= 行嗅探路由：
+  //   * 只带 m=audio、不带 m=video → 语音会话（voice_pc_）
+  //   * 带 m=video（含音视频混合的老式重协商）→ 屏幕会话（pc_）
+  //   * candidate 信封里没有 m= 行，只能按「哪条会话存在」推断（见 candidate 段）
+  // TODO(step2): 由 pu_signal_in_media 的显式 media 取代（client 已按 media 分流，
+  //              原生侧缺这条导出）。显式 media 到位后删除本段嗅探，勿在此新增逻辑。
+  const bool is_voice_sdp = message.sdp.find("m=audio") != std::string::npos &&
+                            message.sdp.find("m=video") == std::string::npos;
+
   if (message.type == "offer") {
+    if (is_voice_sdp) {
+      // ---- 语音会话：只有 audio 的 SDP ----
+      // 与屏幕侧同构的三态日志（断线重连的验收门，不能误报）：
+      //   1) 已有远端描述 → 同一语音会话上的真重协商；
+      //   2) 有 PC 但没有远端描述、且当前不在语音里 → 上一轮残留，拆掉重建；
+      //   3) 有 PC、没有远端描述、语音在通话中 → 全新 PC 的第一个 offer。
+      if (voice_pc_ != nullptr && voice_has_remote_description_) {
+        Log(3, "voice offer: renegotiation on the existing voice session");
+      } else if (voice_pc_ != nullptr && !voice_joined_) {
+        Log(3, "voice offer: dropping stale answerer session (voice pc exists, not joined)");
+        ReleaseVoiceSession();
+      } else if (voice_pc_ != nullptr) {
+        Log(3, "voice offer: first offer on a fresh voice session");
+      }
+      std::string local_error;
+      if (!EnsureVoicePeerConnection(/*for_sending=*/false, &local_error)) {
+        return reject(PU_ERR_MEDIA, "pu_signal_in(voice): " + local_error);
+      }
+      if (!VoiceSetRemoteDescription(static_cast<int>(webrtc::SdpType::kOffer), message.sdp,
+                                     &local_error)) {
+        ReleaseVoiceSession();
+        return reject(PU_ERR_MEDIA, "pu_signal_in(voice): " + local_error);
+      }
+      voice_has_remote_description_ = true;
+      VoiceApplyBufferedCandidates();
+      if (!VoiceCreateAnswerAndSetLocal(&local_error)) {
+        ReleaseVoiceSession();
+        return reject(PU_ERR_MEDIA, "pu_signal_in(voice): " + local_error);
+      }
+      // answer 同样要等 ICE 收集完成再发，交给语音自己的协商线程。
+      VoiceStartNegotiationEmit("answer");
+      return PU_OK;
+    }
+    // ---- 屏幕会话（原逻辑）----
     if (pc_ != nullptr && sharing_) {
       return reject(PU_ERR_STATE,
                     "received an offer while sharing (glare): ABI v2 has no perfect negotiation");
     }
-    // 收到 offer 时 PC 的三种状态要分清（这条日志是断线重连的验收门，不能误报）：
-    //   1) PC 上已有远端描述 → 同一个会话上的**真重协商**（语音通话中加屏幕共享走这条）；
-    //   2) PC 存在但没有远端描述、且当前不在语音里 → 上一轮会话的残留，拆掉重建；
-    //   3) PC 存在但没有远端描述、语音在通话中 → **全新 PC 的第一个 offer**
-    //      （断线重连后 VoiceLeave 已拆掉旧 PC、VoiceJoin 又建了新的），不是重协商。
+    // 收到 offer 时屏幕 PC 的三种状态要分清（这条日志是断线重连的验收门，不能误报）：
+    //   1) PC 上已有远端描述 → 同一个会话上的**真重协商**；
+    //   2) PC 存在但没有远端描述、且本端不是 offerer → 上一轮会话的残留，拆掉重建；
+    //   3) PC 存在但没有远端描述、本端是 offerer → 全新 PC 的第一个 offer。
     if (pc_ != nullptr && has_remote_description_) {
-      Log(3, "offer: renegotiation on the existing session");
-    } else if (pc_ != nullptr && !voice_joined_) {
+      Log(3, "offer: renegotiation on the existing screen session");
+    } else if (pc_ != nullptr && !sharing_) {
       Log(3, "offer: dropping stale answerer session (pc exists, local is viewer)");
       ReleaseStreamObjects();
     } else if (pc_ != nullptr) {
-      Log(3, "offer: first offer on a fresh session (pc has no remote description yet)");
+      Log(3, "offer: first offer on a fresh screen session (pc has no remote description yet)");
     }
     std::string local_error;
     if (!EnsurePeerConnection(/*for_sending=*/false, &local_error)) {
@@ -2034,6 +2402,26 @@ int MediaEngine::SignalIn(const char* payload, size_t len, std::string* error) {
   }
 
   if (message.type == "answer") {
+    if (is_voice_sdp) {
+      // ---- 语音会话：本端必须是这条会话的 offerer ----
+      if (voice_pc_ == nullptr) {
+        return reject(PU_ERR_STATE,
+                      "received a voice answer but this engine has no voice peer connection");
+      }
+      if (!voice_offerer_) {
+        return reject(PU_ERR_STATE,
+                      "received an answer but this engine is the voice answerer (role mismatch)");
+      }
+      std::string local_error;
+      if (!VoiceSetRemoteDescription(static_cast<int>(webrtc::SdpType::kAnswer), message.sdp,
+                                     &local_error)) {
+        return reject(PU_ERR_MEDIA, "pu_signal_in(voice): " + local_error);
+      }
+      voice_has_remote_description_ = true;
+      VoiceApplyBufferedCandidates();
+      return PU_OK;
+    }
+    // ---- 屏幕会话（原逻辑）----
     if (pc_ == nullptr) {
       return reject(PU_ERR_STATE, "received an answer but this engine has no peer connection");
     }
@@ -2067,6 +2455,38 @@ int MediaEngine::SignalIn(const char* payload, size_t len, std::string* error) {
       return reject(PU_ERR_INVALID_ARG,
                     "pu_signal_in: bad candidate (" + sdp_error.description + ")");
     }
+  }
+  // 选目标会话：candidate 信封里没有 m= 行（只有 mid/mline），嗅探做不到逐条判定。
+  // 先按「哪条会话存在」的确定性判据路由：
+  //   * 只有语音 PC（纯语音会话）→ 语音，无歧义；
+  //   * 其余（只有屏幕 PC，或两条都在）→ 屏幕。两条都在时给屏幕是有意的：我们的语音
+  //     候选在等 ICE 收集完成阶段就已随 SDP 一起发出，late candidate 极少；真正的修法
+  //     是显式 media。
+  // TODO(step2): 由 pu_signal_in_media 的显式 media 取代（client 已按 media 分流，
+  //              原生侧缺这条导出）。显式 media 到位后删除本段推断，勿在此新增逻辑。
+  const bool candidate_to_voice = voice_pc_ != nullptr && pc_ == nullptr;
+  if (candidate_to_voice) {
+    if (!voice_has_remote_description_) {
+      // 远端描述还没设好就先存着（trickle 可能比 SDP 先到），等 SetRemote 之后统一加。
+      std::lock_guard<std::mutex> lock(voice_cand_mu_);
+      CandidateCopy copy;
+      copy.mid = message.mid;
+      copy.mline_index = message.mline;
+      copy.sdp = message.candidate;
+      voice_buffered_.push_back(copy);
+      Log(3, "voice candidate buffered until remote description is set: %s", copy.sdp.c_str());
+      return PU_OK;
+    }
+    bool voice_applied = false;
+    signaling_->BlockingCall([this, &message, &voice_applied] {
+      std::unique_ptr<webrtc::IceCandidate> parsed = webrtc::IceCandidate::Create(
+          message.mid, message.mline, message.candidate, nullptr);
+      if (parsed != nullptr) voice_applied = voice_pc_->AddIceCandidate(parsed.get());
+    });
+    if (!voice_applied) {
+      Log(2, "voice AddIceCandidate returned false for: %s", message.candidate.c_str());
+    }
+    return PU_OK;
   }
   if (pc_ == nullptr) {
     return reject(PU_ERR_STATE, "received a candidate but this engine has no peer connection");
@@ -2106,9 +2526,15 @@ int MediaEngine::PeerStats(pu_stats* out) {
   }
   std::memset(out, 0, sizeof(*out));
   out->struct_size = static_cast<uint32_t>(sizeof(pu_stats));
-  out->peer_state = stat_peer_state_.load(std::memory_order_relaxed);
-  out->ice_state = stat_ice_state_.load(std::memory_order_relaxed);
-  out->has_peer = pc_ != nullptr ? 1u : 0u;
+  // v2.10：语音会话有独立的 PC 与状态原子量。纯语音（没有屏幕 PC）时报语音那套，
+  // 这样 peer_state/ice_state 的语义不变（= 当前唯一那条会话的状态）；屏幕在时报屏幕那套
+  // （它才是 UI 的「共享连接」指标）。
+  const bool has_screen_pc = pc_ != nullptr;
+  out->peer_state = has_screen_pc ? stat_peer_state_.load(std::memory_order_relaxed)
+                                  : voice_peer_state_.load(std::memory_order_relaxed);
+  out->ice_state = has_screen_pc ? stat_ice_state_.load(std::memory_order_relaxed)
+                                 : voice_ice_state_.load(std::memory_order_relaxed);
+  out->has_peer = (has_screen_pc || voice_pc_ != nullptr) ? 1u : 0u;
   out->frames_sent = stat_frames_sent_.load(std::memory_order_relaxed);
   // v2.1：本地编码器已删除，这个数就是 PC 的 outbound-rtp.framesEncoded（1:1 编码
   // 时等于 PU_EVENT_FRAME 的条数）。采样节拍 250 ms，最多陈旧一个窗口。
@@ -2871,9 +3297,11 @@ int MediaEngine::VoiceJoin(const pu_voice_params* params, std::string* error) {
   // 字段本身是预留 u32，不涉及 ABI 布局变更。
   const bool passive = (params->flags & 1u) != 0;
 
-  // for_sending=false：视频轨的 AddTrack 由 pu_screen_start 负责，语音自己加音频轨
-  // （EnsurePeerConnection(true) 会要求 track_ != nullptr，那是视频专用路径）。
-  if (!EnsurePeerConnection(/*for_sending=*/false, error)) return PU_ERR_STATE;
+  // v2.10 第 1 步：语音改用**自己的** PeerConnection（voice_pc_），不再借用屏幕的 pc_。
+  // for_sending = !passive：主动加入的一方是 offerer，被动加入（1:1 的后加入者 / relay 下
+  // 服务端是 offerer）是 answerer。两条 PC 因此各自有独立的 signaling state：
+  // relay 语音（answerer）与直连共享（offerer）同时存在也不会互相打成 role mismatch。
+  if (!EnsureVoicePeerConnection(/*for_sending=*/!passive, error)) return PU_ERR_STATE;
   std::string add_error;
   signaling_->BlockingCall([&] {
     voice_source_ = pc_factory_->CreateAudioSource(webrtc::AudioOptions());
@@ -2886,7 +3314,7 @@ int MediaEngine::VoiceJoin(const pu_voice_params* params, std::string* error) {
       add_error = "CreateAudioTrack returned null";
       return;
     }
-    auto added = pc_->AddTrack(voice_track_, {"voice"});
+    auto added = voice_pc_->AddTrack(voice_track_, {"voice"});
     if (!added.ok()) {
       add_error = added.error().message();
       return;
@@ -2929,48 +3357,31 @@ int MediaEngine::VoiceJoin(const pu_voice_params* params, std::string* error) {
     return PU_OK;
   }
   // 和 pu_screen_start 一样：先 CreateOffer + SetLocalDescription，再起信令发射线程
-  // （NegotiationEmitLoop 要读 pc->local_description()，没 SetLocal 的话 SDP 是空的）。
-  // sharing_ 是引擎里「我是 offerer」的角色位（SignalIn 用它做 glare/角色校验），
-  // 语音发起方也必须置 true，否则收到 answer 会被判成 role mismatch。
-  sharing_ = true;
+  // （VoiceNegotiationEmitLoop 要读 pc->local_description()，没 SetLocal 的话 SDP 是空的）。
+  // 角色位必须写在**语音自己的** voice_offerer_ 上，不能动屏幕的 sharing_——那是屏幕会话
+  // 的 offerer 标志，语音置 true 会让屏幕侧的 answer 被误判成 role mismatch。
+  voice_offerer_ = true;
   {
     std::string sdp_error;
-    if (!CreateOfferAndSetLocal(&sdp_error)) {
+    if (!VoiceCreateOfferAndSetLocal(&sdp_error)) {
       voice_joined_ = false;
       if (error != nullptr) *error = sdp_error;
       return PU_ERR_MEDIA;
     }
   }
-  StartNegotiationEmit("offer");
+  VoiceStartNegotiationEmit("offer");
   Log(3, "voice: joined channel=%s mode=direct", voice_channel_id_.c_str());
   return PU_OK;
 }
 
 int MediaEngine::VoiceLeave() {
-  if (!voice_joined_) return PU_OK;
-  signaling_->BlockingCall([this] {
-    DetachAllAudioSinks();
-    if (pc_ != nullptr && voice_sender_ != nullptr) {
-      (void)pc_->RemoveTrackOrError(voice_sender_);
-    }
-    voice_sender_ = nullptr;
-    voice_track_ = nullptr;
-    voice_source_ = nullptr;
-  });
+  // v2.10 第 1 步：语音会话有自己的 PC，释放它不再依赖屏幕是否在跑。
+  // 旧代码用 !running_ 判据是因为语音/屏幕共用一个 pc_（共享中不能拆）；现在两条 PC
+  // 独立，恒拆即可——重进频道也从干净会话开始，不会留下「同一会话重协商」的旧 DTLS。
   voice_joined_ = false;
   voice_channel_id_.clear();
-  // v2.9：断线重连 / 换会话时，服务端会**新建一个 PeerConnection**（新 DTLS/ICE 凭据）。
-  // 旧 PC 如果不拆，下一个 offer 会被 SignalIn 判成「同一会话的重协商」，两套 DTLS
-  // 会话拼在一起 → ICE 能 connected 但 SRTP 双向不通（客户端 tracks=0、服务端 publishers=0）。
-  // 所以没在跑屏幕共享时把 PC 一并拆掉，让下次 VoiceJoin 从干净会话开始。
-  // 正在共享时不动 PC（视频轨还在用），由客户端按
-  // pu_screen_stop → pu_voice_leave → 重连 → join → 重新 start 的顺序处理。
-  if (!running_) {
-    ReleaseStreamObjects();
-    Log(3, "voice: left (pc released — next join creates a fresh session)");
-  } else {
-    Log(3, "voice: left (screen sharing still active, pc kept)");
-  }
+  ReleaseVoiceSession();
+  Log(3, "voice: left (voice session released)");
   return PU_OK;
 }
 

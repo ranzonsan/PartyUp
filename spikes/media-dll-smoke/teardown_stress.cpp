@@ -55,6 +55,9 @@ char g_log_dir[MAX_PATH] = ".";
 char g_phase[192] = "startup";
 std::atomic<int> g_iteration{0};
 volatile LONG g_crashing = 0;
+// v2.10：--voice 时每轮在屏幕共享之外再建一条语音会话（两个 PeerConnection），
+// 让收尾路径同时拆两条 PC —— 这是「两倍析构路径」的复现入口。
+bool g_voice = false;
 
 int64_t NowUs() {
   return std::chrono::duration_cast<std::chrono::microseconds>(
@@ -340,6 +343,47 @@ bool ExchangeUntilConnected(pu_engine* a, pu_engine* b, Tally* tally_a, Tally* t
   return false;
 }
 
+// v2.10：给一轮压测装上语音会话（A = offerer，B = 被动 answerer），再跑屏幕共享。
+// 这样每条引擎同时持有两条 PeerConnection，收尾时两条析构路径会同时暴露。
+// 等语音 connected 有上限（3 s）：连不上不算 teardown 失败，但要记日志——它可能是
+// 「语音 PC 建不起来」的信号。
+bool JoinVoiceForStress(pu_engine* a, pu_engine* b) {
+  pu_voice_params params;
+  std::memset(&params, 0, sizeof(params));
+  params.struct_size = sizeof(params);
+  params.channel_id = "stress-voice";
+  params.mode = PU_MODE_DIRECT;
+  if (pu_voice_join(a, &params) != PU_OK) {
+    LogLine("FAIL: pu_voice_join(A) rc=%d (%s)", pu_last_error(a));
+    return false;
+  }
+  pu_voice_params passive = params;
+  passive.flags = 1u;
+  if (pu_voice_join(b, &passive) != PU_OK) {
+    LogLine("FAIL: pu_voice_join(B passive) rc=%d (%s)", pu_last_error(b));
+    return false;
+  }
+  Tally tally_a;
+  Tally tally_b;
+  const int64_t deadline = NowUs() + static_cast<int64_t>(3000) * 1000;
+  while (NowUs() < deadline) {
+    if (!PumpEngine(a, "A", b, &tally_a)) return false;
+    if (!PumpEngine(b, "B", a, &tally_b)) return false;
+    pu_stats stats_a;
+    pu_stats stats_b;
+    // 此时还没有屏幕 PC，pu_peer_stats 报的就是语音会话的状态。
+    if (ReadStats(a, &stats_a) && ReadStats(b, &stats_b) &&
+        stats_a.peer_state == PU_PEER_CONNECTED && stats_b.peer_state == PU_PEER_CONNECTED) {
+      Phase("voice connected (A.signals=%d B.signals=%d)", tally_a.signals, tally_b.signals);
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  LogLine("WARN: voice did not reach connected within 3 s (A.signals=%d B.signals=%d)",
+          tally_a.signals, tally_b.signals);
+  return true;  // 收尾路径照样压：语音没连上也要能干净拆掉
+}
+
 // ---- 收尾顺序：每种顺序暴露不同的「谁先死」窗口 ----
 
 // 观看方先走：B 被销毁时 A 还在推流（历史上报的崩溃位置就在这一类）。
@@ -400,9 +444,10 @@ void PrintUsage() {
   std::printf(
       "usage: teardown_stress.exe [--iterations N] [--order NAME] [--logs DIR]\n"
       "                           [--min-frames N] [--connect-timeout-ms N]\n"
-      "                           [--jitter-ms N]\n"
+      "                           [--jitter-ms N] [--voice]\n"
       "  --order: viewer-first (default) | media | signaling | abrupt | sharer-first |\n"
-      "           alternate\n");
+      "           alternate\n"
+      "  --voice: 每轮额外建一条语音会话（两个 PeerConnection），压两倍析构路径\n");
 }
 
 }  // namespace
@@ -443,6 +488,8 @@ int main(int argc, char** argv) {
       connect_timeout_ms = std::atoi(next("--connect-timeout-ms"));
     } else if (arg == "--jitter-ms") {
       jitter_ms = std::atoi(next("--jitter-ms"));
+    } else if (arg == "--voice") {
+      g_voice = true;
     } else if (arg == "--help" || arg == "-h") {
       PrintUsage();
       return 0;
@@ -467,8 +514,8 @@ int main(int argc, char** argv) {
   }
   SetUnhandledExceptionFilter(CrashFilter);
 
-  std::printf("partyup teardown stress: iterations=%d order=%s min_frames=%d jitter_ms=%d\n",
-              iterations, order.c_str(), min_frames, jitter_ms);
+  std::printf("partyup teardown stress: iterations=%d order=%s min_frames=%d jitter_ms=%d voice=%d\n",
+              iterations, order.c_str(), min_frames, jitter_ms, g_voice ? 1 : 0);
   std::printf("logs: %s\n", g_log_dir);
   {
     char symbol_check[512] = {0};
@@ -555,6 +602,15 @@ int main(int argc, char** argv) {
     }
     Phase("engines created");
 
+    // v2.10：先建语音会话（与真实 UI 的「先进语音、再点共享」顺序一致），
+    // 再起屏幕共享 —— 两条 PeerConnection 同时在，收尾才是两倍路径。
+    if (g_voice) {
+      if (!JoinVoiceForStress(a, b)) {
+        // 连接失败不计入 failures（这轮的屏幕部分仍然要压收尾），但要留痕。
+        LogLine("WARN: voice join/exchange failed this round");
+      }
+    }
+
     const int start_rc = pu_screen_start(a, source.c_str());
     if (start_rc != PU_OK) {
       LogLine("FAIL: pu_screen_start(A) rc=%d (%s)", start_rc, pu_last_error(a));
@@ -586,6 +642,15 @@ int main(int argc, char** argv) {
     if (mode == "alternate") {
       mode = orders[(iteration - 1) % (sizeof(orders) / sizeof(orders[0]))];
       Phase("alternate -> %s", mode.c_str());
+    }
+    // v2.10：奇偶轮走两条不同的语音收尾路径 ——
+    //   奇数轮：先显式 pu_voice_leave（VoiceLeave → ReleaseVoiceSession），
+    //           再走屏幕收尾；
+    //   偶数轮：语音留到收尾里，由 pu_screen_stop / pu_engine_destroy 一并拆掉。
+    if (g_voice && (iteration % 2 == 1)) {
+      Phase("voice leave x2 before screen teardown");
+      pu_voice_leave(a);
+      pu_voice_leave(b);
     }
     Phase("teardown begin (%s)", mode.c_str());
     const int64_t teardown_begin = NowUs();

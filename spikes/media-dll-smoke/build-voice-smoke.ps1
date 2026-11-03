@@ -8,6 +8,7 @@
 #>
 param(
   [string]$Root,
+  [string]$Name = 'voice_smoke',
   [switch]$BuildOnly
 )
 
@@ -28,8 +29,8 @@ $include = Join-Path $Root 'third_party\libwebrtc\include'
 $hdrDir = Join-Path $Root 'src\media-core\include'
 $dllLib = Join-Path $Root 'src\media-core\out\partyup_media.lib'
 $dllDll = Join-Path $Root 'src\media-core\out\partyup_media.dll'
-$src = Join-Path $Root 'spikes\media-dll-smoke\voice_smoke.cpp'
-$outExe = Join-Path $Root 'spikes\media-dll-smoke\out\voice_smoke.exe'
+$src = Join-Path $Root "spikes\media-dll-smoke\$Name.cpp"
+$outExe = Join-Path $Root "spikes\media-dll-smoke\out\$Name.exe"
 $outDir = Split-Path $outExe
 foreach ($p in @($vcvars, $include, $hdrDir, $dllLib, $dllDll, $src)) {
   if (-not (Test-Path $p)) { throw "missing required path: $p" }
@@ -54,7 +55,7 @@ $cl = @(
 Push-Location $objDir
 try {
   cmd /c "call `"$vcvars`" >nul 2>&1 && $cl"
-  if ($LASTEXITCODE -ne 0) { throw "cl failed building voice_smoke.exe (exit $LASTEXITCODE)" }
+  if ($LASTEXITCODE -ne 0) { throw "cl failed building $Name.exe (exit $LASTEXITCODE)" }
 } finally {
   Pop-Location
 }
@@ -67,6 +68,6 @@ if (-not $BuildOnly) {
   Copy-Item -Force $outExe $stage
   Copy-Item -Force $dllDll $stage
   Push-Location $stage
-  try { & (Join-Path $stage 'voice_smoke.exe') } finally { Pop-Location }
+  try { & (Join-Path $stage "$Name.exe") } finally { Pop-Location }
   Write-Host ("== exit=" + $LASTEXITCODE)
 }

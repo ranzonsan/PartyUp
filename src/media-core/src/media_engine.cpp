@@ -587,11 +587,6 @@ class AudioCountSink : public webrtc::AudioTrackSinkInterface {
               std::optional<int64_t> absolute_capture_timestamp_ms) override {
     static_cast<void>(sample_rate);
     static_cast<void>(absolute_capture_timestamp_ms);
-    static std::atomic<bool> logged_format{false};
-    if (!logged_format.exchange(true, std::memory_order_relaxed)) {
-      std::printf("[voice-sink] first frame: bps=%d rate=%d ch=%zu frames=%zu\n",
-                  bits_per_sample, sample_rate, number_of_channels, number_of_frames);
-    }
     frames_->fetch_add(1, std::memory_order_relaxed);
     if (audio_data != nullptr && bits_per_sample == 16) {
       const int16_t* pcm = static_cast<const int16_t*>(audio_data);
@@ -1618,6 +1613,22 @@ bool ApplyRemoteDescription(webrtc::Thread* signaling,
 
 bool MediaEngine::EnsurePeerConnection(bool for_sending, std::string* error) {
   if (pc_ != nullptr) {
+    // v2.6：PC 已存在时走到这里有两种情况——
+    //   * 语音先起，屏幕共享后加入：必须把视频轨补挂到现有 PC 上，否则重协商的
+    //     offer 里没有 m=video，画面永远不来（addtrack 之后 libwebrtc 会置
+    //     negotiation-needed，由 start 里的 CreateOffer 带出去）。
+    //   * 别的路径：沿用既有 PC。
+    if (for_sending && track_ != nullptr) {
+      std::string add_error;
+      signaling_->BlockingCall([&] {
+        auto added = pc_->AddTrack(track_, {"partyup-screen"});
+        if (!added.ok()) add_error = std::string("AddTrack(video) failed: ") + added.error().message();
+      });
+      if (!add_error.empty()) {
+        *error = add_error;
+        return false;
+      }
+    }
     return true;  // 已有 PC：offerer 在 start 里建，answerer 在首个 offer 时建
   }
   if (signaling_ == nullptr || pc_factory_ == nullptr || pc_observer_ == nullptr) {
@@ -1883,9 +1894,16 @@ int MediaEngine::SignalIn(const char* payload, size_t len, std::string* error) {
     // 残留。共享方「停止 → 再开始」在 ABI v2 里是**一个新的共享会话**，不是重协商，
     // 所以这里必须把旧 answerer 会话整个拆掉，再按新 offer 建一个新的。
     // 仍然不做 renegotiation —— 同一个会话里不会出现第二个 offer 走这条路。
-    if (pc_ != nullptr) {
+    // 本端是观看方（不是共享方）却还留着一个 PC：那是上一轮共享会话的 answerer
+    // 残留。共享方「停止 → 再开始」在 ABI v2 里是**一个新的共享会话**，不是重协商，
+    // 所以这里必须把旧 answerer 会话整个拆掉，再按新 offer 建一个新的。
+    // v2.6 例外：语音正在通话时收到第二个 offer = 屏幕共享加入的**重协商**，
+    // 不能拆 PC（拆了音频轨一起没了），直接走下面的 SetRemoteDescription 重协商。
+    if (pc_ != nullptr && !voice_joined_) {
       Log(3, "offer: dropping stale answerer session (pc exists, local is viewer)");
       ReleaseStreamObjects();
+    } else if (pc_ != nullptr) {
+      Log(3, "offer: renegotiation on the existing session (voice call is active)");
     }
     std::string local_error;
     if (!EnsurePeerConnection(/*for_sending=*/false, &local_error)) {
@@ -2749,6 +2767,28 @@ int MediaEngine::VoiceJoin(const pu_voice_params* params, std::string* error) {
   if (voice_remote_sink_ == nullptr) {
     voice_remote_sink_.reset(new AudioCountSink(&stat_audio_frames_, &stat_audio_peak_));
   }
+  // v2.6：显式选一个**物理**录音设备。默认设备可能是 NVIDIA Broadcast 这类虚拟麦，
+  // 无输入时输出数字静音，mute 的音频效果就没法验证。
+  signaling_->BlockingCall([&] {
+    if (voice_adm_ == nullptr) return;
+    const int16_t count = voice_adm_->RecordingDevices();
+    for (int16_t i = 0; i < count; ++i) {
+      char name[webrtc::kAdmMaxDeviceNameSize] = {0};
+      char guid[webrtc::kAdmMaxGuidSize] = {0};
+      if (voice_adm_->RecordingDeviceName(i, name, guid) != 0) continue;
+      const std::string n(name);
+      if (n.find("NVIDIA") != std::string::npos ||
+          n.find("Broadcast") != std::string::npos) {
+        continue;
+      }
+      if (voice_adm_->SetRecordingDevice(i) == 0) {
+        Log(3, "voice: recording device -> [%d] %s", static_cast<int>(i), name);
+        return;
+      }
+    }
+    Log(2, "voice: no physical recording device found (count=%d), keeping default",
+        static_cast<int>(count));
+  });
   voice_channel_id_ = params->channel_id != nullptr ? params->channel_id : "";
   voice_mode_ = params->mode;
   voice_muted_ = false;
@@ -2814,6 +2854,7 @@ int MediaEngine::VoiceSetMute(bool muted) {
     return PU_ERR_STATE;
   }
   int rc = PU_OK;
+  bool adm_muted = false;
   // ADM 有线程归属：所有调用都投 signaling 线程（创建/Terminate 也在这条线程）。
   signaling_->BlockingCall([&] {
     if (voice_adm_ == nullptr) {
@@ -2821,9 +2862,10 @@ int MediaEngine::VoiceSetMute(bool muted) {
       return;
     }
     rc = voice_adm_->SetMicrophoneMute(muted) == 0 ? PU_OK : PU_ERR_STATE;
+    voice_adm_->MicrophoneMute(&adm_muted);
   });
   if (rc == PU_OK) voice_muted_ = muted;
-  Log(3, "voice: mute=%d rc=%d", muted ? 1 : 0, rc);
+  Log(3, "voice: mute=%d rc=%d adm_muted=%d", muted ? 1 : 0, rc, adm_muted ? 1 : 0);
   return rc;
 }
 

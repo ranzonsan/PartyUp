@@ -575,6 +575,41 @@ class NullAudioDeviceModule
 // ---------------------------------------------------------------------------
 // 引擎实现
 // ---------------------------------------------------------------------------
+// 语音接收侧计数器：每收到一个 10 ms 音频帧 +1，并记录峰值振幅（mute 验收用）。
+// 由 ADM 播放线程调用，只碰原子量。
+class AudioCountSink : public webrtc::AudioTrackSinkInterface {
+ public:
+  AudioCountSink(std::atomic<uint32_t>* frames, std::atomic<uint32_t>* peak)
+      : frames_(frames), peak_(peak) {}
+
+  void OnData(const void* audio_data, int bits_per_sample, int sample_rate,
+              size_t number_of_channels, size_t number_of_frames,
+              std::optional<int64_t> absolute_capture_timestamp_ms) override {
+    static_cast<void>(sample_rate);
+    static_cast<void>(absolute_capture_timestamp_ms);
+    static std::atomic<bool> logged_format{false};
+    if (!logged_format.exchange(true, std::memory_order_relaxed)) {
+      std::printf("[voice-sink] first frame: bps=%d rate=%d ch=%zu frames=%zu\n",
+                  bits_per_sample, sample_rate, number_of_channels, number_of_frames);
+    }
+    frames_->fetch_add(1, std::memory_order_relaxed);
+    if (audio_data != nullptr && bits_per_sample == 16) {
+      const int16_t* pcm = static_cast<const int16_t*>(audio_data);
+      const size_t count = number_of_channels * number_of_frames;
+      uint32_t peak = 0;
+      for (size_t i = 0; i < count; ++i) {
+        const int32_t v = pcm[i] < 0 ? -static_cast<int32_t>(pcm[i]) : pcm[i];
+        if (static_cast<uint32_t>(v) > peak) peak = static_cast<uint32_t>(v);
+      }
+      peak_->store(peak, std::memory_order_relaxed);
+    }
+  }
+
+ private:
+  std::atomic<uint32_t>* frames_;
+  std::atomic<uint32_t>* peak_;
+};
+
 class MediaEngine {
  public:
   // 两个辅助类在类外定义（需要 MediaEngine 完整类型），这里只前置声明。
@@ -589,6 +624,12 @@ class MediaEngine {
 
   bool Init(const pu_config* cfg, std::string* error);
   int Start(const char* screen_id, std::string* error);
+  // v2.6：语音（1:1 直连）。全部在控制线程调用，内部把 PC/ADM 操作投 signaling 线程。
+  int VoiceJoin(const pu_voice_params* params, std::string* error);
+  int VoiceLeave();
+  int VoiceSetMode(pu_mode mode);
+  int VoiceSetMute(bool muted);
+  int VoiceSetDeafen(bool deafened);
   int Stop();
   // v2.3：枚举可共享的源（真实显示器 + "synthetic"），结果缓存在成员里。
   int Sources(pu_source_list* out);
@@ -685,6 +726,20 @@ class MediaEngine {
   // 且 ~MediaEngine 里「Terminate → 释放本引用 → 释放工厂」也在 signaling 线程上，
   // 那时三条线程都还活着（见 dtor）。
   webrtc::scoped_refptr<webrtc::AudioDeviceModule> voice_adm_;
+
+  // ---- v2.6：语音（1:1 直连）----
+  bool voice_joined_ = false;            // 只在控制线程读写
+  pu_mode voice_mode_ = PU_MODE_DIRECT;
+  bool voice_muted_ = false;
+  bool voice_deafened_ = false;
+  std::string voice_channel_id_;
+  webrtc::scoped_refptr<webrtc::AudioSourceInterface> voice_source_;
+  webrtc::scoped_refptr<webrtc::AudioTrackInterface> voice_track_;
+  webrtc::scoped_refptr<webrtc::RtpSenderInterface> voice_sender_;
+  std::unique_ptr<AudioCountSink> voice_remote_sink_;  // 接收侧计数，随引擎活
+  std::atomic<uint32_t> stat_audio_frames_{0};        // 远端解出的 PCM 帧数
+  std::atomic<uint32_t> stat_audio_peak_{0};          // 最近一帧峰值振幅
+  std::atomic<bool> stat_audio_sink_attached_{false}; // 防 OnTrack/OnAddTrack 重复挂载
 
   // 一路共享流的对象
   webrtc::scoped_refptr<ScreenVideoSource> source_;
@@ -858,13 +913,17 @@ class MediaEngine::PcObserver : public webrtc::PeerConnectionObserver {
   // 回调，两个都挂一遍最保险（重复挂同一个 sink 对 VideoBroadcaster 是幂等的）。
   void OnTrack(webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver) override {
     if (transceiver == nullptr) return;
-    AttachVideoSink(transceiver->receiver());
+    webrtc::scoped_refptr<webrtc::RtpReceiverInterface> receiver = transceiver->receiver();
+    AttachVideoSink(receiver);
+    AttachAudioSink(receiver);
   }
 
   void OnAddTrack(
       webrtc::scoped_refptr<webrtc::RtpReceiverInterface> receiver,
       const std::vector<webrtc::scoped_refptr<webrtc::MediaStreamInterface>>&) override {
+    webrtc::scoped_refptr<webrtc::RtpReceiverInterface> keep = receiver;
     AttachVideoSink(std::move(receiver));
+    AttachAudioSink(keep);
   }
 
   bool gathered() const { return gathered_.load(std::memory_order_relaxed); }
@@ -885,6 +944,24 @@ class MediaEngine::PcObserver : public webrtc::PeerConnectionObserver {
     engine_->remote_track_ = video_track;
     engine_->Log(3, "remote video track -> sink: id=%s kind=%s", track->id().c_str(),
                  track->kind().c_str());
+  }
+
+  // 语音接收侧：把远端音频轨挂到计数 sink（mute 验收靠它看峰值振幅）。
+  // OnTrack 和 OnAddTrack 都会走到这里，AddSink 不幂等 → 用 attached 位防重复挂载
+  // （重复挂会让帧数翻倍）。
+  void AttachAudioSink(webrtc::scoped_refptr<webrtc::RtpReceiverInterface> receiver) {
+    if (engine_->voice_remote_sink_ == nullptr || receiver == nullptr) return;
+    if (receiver->media_type() != webrtc::MediaType::AUDIO) return;
+    if (engine_->stat_audio_sink_attached_.exchange(true)) return;
+    webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track = receiver->track();
+    if (track == nullptr ||
+        track->kind() != webrtc::MediaStreamTrackInterface::kAudioKind) {
+      engine_->stat_audio_sink_attached_.store(false);
+      return;
+    }
+    auto* audio_track = static_cast<webrtc::AudioTrackInterface*>(track.get());
+    audio_track->AddSink(engine_->voice_remote_sink_.get());
+    engine_->Log(3, "remote audio track -> sink: id=%s", track->id().c_str());
   }
 
   MediaEngine* const engine_;
@@ -1913,6 +1990,15 @@ int MediaEngine::PeerStats(pu_stats* out) {
       std::min<uint64_t>(pc_stats_->frames_encoded.load(std::memory_order_relaxed), 0xFFFFFFFFu));
   out->frames_dropped = stat_frames_dropped_.load(std::memory_order_relaxed);
   out->frames_received = stat_frames_received_.load(std::memory_order_relaxed);
+  // v2.6：语音模式下 frames_received 表示「远端解出的音频 PCM 帧数」（每帧 10 ms），
+  // 因为语音没有视频帧可数；两者互斥，不会同时有值。峰值振幅靠日志观察（mute 验收）。
+  if (voice_joined_) {
+    out->frames_received = stat_audio_frames_.load(std::memory_order_relaxed);
+    // mute 验收：A 静音后峰值应掉到 0（帧数照常涨）。PeerStats 由调用方按秒轮询，
+    // 一行日志正好是采样节拍，不用另起线程。
+    Log(3, "voice stats: pcmFrames=%u peak=%u", out->frames_received,
+        stat_audio_peak_.load(std::memory_order_relaxed));
+  }
   out->signal_out_count = stat_signal_out_.load(std::memory_order_relaxed);
   {
     std::lock_guard<std::mutex> lock(queue_mu_);
@@ -2328,6 +2414,13 @@ void MediaEngine::StatsSampleLoop(webrtc::scoped_refptr<webrtc::PeerConnectionIn
     const uint64_t keys = pc_stats_->key_frames_encoded.load(std::memory_order_relaxed);
     const int64_t now_us = NowUsSteady();
 
+    if (voice_joined_) {
+      // mute 验收：A 端静音后，B 端解出的 PCM 峰值应掉到 0（帧数照常涨）。
+      Log(3, "voice stats: pcmFrames=%u peak=%u",
+          stat_audio_frames_.load(std::memory_order_relaxed),
+          stat_audio_peak_.load(std::memory_order_relaxed));
+    }
+
     if (reports > 0) {
       // 计数器只会在「换了一个新 PC」时倒退；这时把当前值整个当成一轮增量。
       const uint64_t d_bytes = bytes >= prev_bytes ? bytes - prev_bytes : bytes;
@@ -2609,38 +2702,181 @@ PU_API int pu_peer_stats(pu_engine* e, pu_stats* out) {
 
 /* ---- 以下为下一版实现：签名冻结，当前只回 PU_NOT_IMPLEMENTED ---- */
 
+namespace partyup {
+namespace {
+
+int MediaEngine::VoiceJoin(const pu_voice_params* params, std::string* error) {
+  if (params == nullptr || params->struct_size < sizeof(pu_voice_params)) {
+    if (error != nullptr) *error = "pu_voice_params.struct_size too small";
+    return PU_ERR_INVALID_ARG;
+  }
+  if (params->mode == PU_MODE_RELAY) {
+    if (error != nullptr) *error = "voice relay mode not implemented: SFU 未接";
+    return PU_NOT_IMPLEMENTED;
+  }
+  if (voice_joined_) return PU_OK;
+  // v2.6：flags bit0 = 1 表示「被动加入」——只接不发 offer，等对方 offer 后回 answer。
+  // 1:1 场景里后加入的一方走这条路（双方都发 offer 会 glare，SignalIn 会直接报角色冲突）。
+  // 字段本身是预留 u32，不涉及 ABI 布局变更。
+  const bool passive = (params->flags & 1u) != 0;
+
+  // for_sending=false：视频轨的 AddTrack 由 pu_screen_start 负责，语音自己加音频轨
+  // （EnsurePeerConnection(true) 会要求 track_ != nullptr，那是视频专用路径）。
+  if (!EnsurePeerConnection(/*for_sending=*/false, error)) return PU_ERR_STATE;
+  std::string add_error;
+  signaling_->BlockingCall([&] {
+    voice_source_ = pc_factory_->CreateAudioSource(webrtc::AudioOptions());
+    if (voice_source_ == nullptr) {
+      add_error = "CreateAudioSource returned null";
+      return;
+    }
+    voice_track_ = pc_factory_->CreateAudioTrack("audio0", voice_source_.get());
+    if (voice_track_ == nullptr) {
+      add_error = "CreateAudioTrack returned null";
+      return;
+    }
+    auto added = pc_->AddTrack(voice_track_, {"voice"});
+    if (!added.ok()) {
+      add_error = added.error().message();
+      return;
+    }
+    voice_sender_ = added.value();
+  });
+  if (!add_error.empty()) {
+    if (error != nullptr) *error = add_error;
+    return PU_ERR_STATE;
+  }
+  if (voice_remote_sink_ == nullptr) {
+    voice_remote_sink_.reset(new AudioCountSink(&stat_audio_frames_, &stat_audio_peak_));
+  }
+  voice_channel_id_ = params->channel_id != nullptr ? params->channel_id : "";
+  voice_mode_ = params->mode;
+  voice_muted_ = false;
+  voice_deafened_ = false;
+  voice_joined_ = true;
+  if (passive) {
+    Log(3, "voice: joined passive (waiting for the peer's offer)");
+    return PU_OK;
+  }
+  // 和 pu_screen_start 一样：先 CreateOffer + SetLocalDescription，再起信令发射线程
+  // （NegotiationEmitLoop 要读 pc->local_description()，没 SetLocal 的话 SDP 是空的）。
+  // sharing_ 是引擎里「我是 offerer」的角色位（SignalIn 用它做 glare/角色校验），
+  // 语音发起方也必须置 true，否则收到 answer 会被判成 role mismatch。
+  sharing_ = true;
+  {
+    std::string sdp_error;
+    if (!CreateOfferAndSetLocal(&sdp_error)) {
+      voice_joined_ = false;
+      if (error != nullptr) *error = sdp_error;
+      return PU_ERR_MEDIA;
+    }
+  }
+  StartNegotiationEmit("offer");
+  Log(3, "voice: joined channel=%s mode=direct", voice_channel_id_.c_str());
+  return PU_OK;
+}
+
+int MediaEngine::VoiceLeave() {
+  if (!voice_joined_) return PU_OK;
+  signaling_->BlockingCall([this] {
+    if (voice_track_ != nullptr && voice_remote_sink_ != nullptr) {
+      voice_track_->RemoveSink(voice_remote_sink_.get());
+    }
+    if (pc_ != nullptr && voice_sender_ != nullptr) {
+      (void)pc_->RemoveTrackOrError(voice_sender_);
+    }
+    voice_sender_ = nullptr;
+    voice_track_ = nullptr;
+    voice_source_ = nullptr;
+  });
+  voice_joined_ = false;
+  voice_channel_id_.clear();
+  Log(3, "voice: left");
+  return PU_OK;
+}
+
+int MediaEngine::VoiceSetMode(pu_mode mode) {
+  if (mode == PU_MODE_RELAY) {
+    SetLastError("pu_voice_set_mode: relay not implemented (SFU 未接)");
+    return PU_NOT_IMPLEMENTED;
+  }
+  if (mode != PU_MODE_DIRECT) {
+    SetLastError("pu_voice_set_mode: unknown mode");
+    return PU_ERR_INVALID_ARG;
+  }
+  voice_mode_ = mode;
+  return PU_OK;
+}
+
+int MediaEngine::VoiceSetMute(bool muted) {
+  if (!voice_joined_) {
+    SetLastError("pu_voice_set_mute: not in voice");
+    return PU_ERR_STATE;
+  }
+  int rc = PU_OK;
+  // ADM 有线程归属：所有调用都投 signaling 线程（创建/Terminate 也在这条线程）。
+  signaling_->BlockingCall([&] {
+    if (voice_adm_ == nullptr) {
+      rc = PU_ERR_STATE;
+      return;
+    }
+    rc = voice_adm_->SetMicrophoneMute(muted) == 0 ? PU_OK : PU_ERR_STATE;
+  });
+  if (rc == PU_OK) voice_muted_ = muted;
+  Log(3, "voice: mute=%d rc=%d", muted ? 1 : 0, rc);
+  return rc;
+}
+
+int MediaEngine::VoiceSetDeafen(bool deafened) {
+  if (!voice_joined_) {
+    SetLastError("pu_voice_set_deafen: not in voice");
+    return PU_ERR_STATE;
+  }
+  int rc = PU_OK;
+  signaling_->BlockingCall([&] {
+    if (voice_adm_ == nullptr) {
+      rc = PU_ERR_STATE;
+      return;
+    }
+    rc = voice_adm_->SetSpeakerMute(deafened) == 0 ? PU_OK : PU_ERR_STATE;
+  });
+  if (rc == PU_OK) voice_deafened_ = deafened;
+  Log(3, "voice: deafen=%d rc=%d", deafened ? 1 : 0, rc);
+  return rc;
+}
+
+}  // namespace
+}  // namespace partyup
+
 PU_API int pu_voice_join(pu_engine* e, const pu_voice_params* p) {
-  static_cast<void>(p);
   if (e == nullptr) return PU_ERR_INVALID_ARG;
-  e->core.SetLastError("pu_voice_join: not implemented in ABI v2");
-  return PU_NOT_IMPLEMENTED;
+  try {
+    std::string error;
+    return e->core.VoiceJoin(p, &error);
+  } catch (const std::exception& ex) {
+    e->core.SetLastError(std::string("pu_voice_join exception: ") + ex.what());
+    return PU_ERR_INTERNAL;
+  }
 }
 
 PU_API int pu_voice_leave(pu_engine* e) {
   if (e == nullptr) return PU_ERR_INVALID_ARG;
-  e->core.SetLastError("pu_voice_leave: not implemented in ABI v2");
-  return PU_NOT_IMPLEMENTED;
+  return e->core.VoiceLeave();
 }
 
 PU_API int pu_voice_set_mode(pu_engine* e, pu_mode mode) {
-  static_cast<void>(mode);
   if (e == nullptr) return PU_ERR_INVALID_ARG;
-  e->core.SetLastError("pu_voice_set_mode: not implemented in ABI v2");
-  return PU_NOT_IMPLEMENTED;
+  return e->core.VoiceSetMode(mode);
 }
 
 PU_API int pu_voice_set_mute(pu_engine* e, int muted) {
-  static_cast<void>(muted);
   if (e == nullptr) return PU_ERR_INVALID_ARG;
-  e->core.SetLastError("pu_voice_set_mute: not implemented in ABI v2");
-  return PU_NOT_IMPLEMENTED;
+  return e->core.VoiceSetMute(muted != 0);
 }
 
 PU_API int pu_voice_set_deafen(pu_engine* e, int deafened) {
-  static_cast<void>(deafened);
   if (e == nullptr) return PU_ERR_INVALID_ARG;
-  e->core.SetLastError("pu_voice_set_deafen: not implemented in ABI v2");
-  return PU_NOT_IMPLEMENTED;
+  return e->core.VoiceSetDeafen(deafened != 0);
 }
 
 PU_API int pu_screen_sources(pu_engine* e, pu_source_list* out) {

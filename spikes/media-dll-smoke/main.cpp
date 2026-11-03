@@ -75,28 +75,32 @@ int CheckUnimplementedSurface(pu_engine* engine) {
   std::memset(&frame, 0, sizeof(frame));
   frame.struct_size = sizeof(frame);
 
+// v2.6：语音的 5 个函数已经是真实现，这里断言它们的行为契约：
+//   * 未加入语音时 leave 是 no-op（PU_OK）、mute/deafen 是状态错误；
+//   * join(null) 是参数错误；set_mode(relay) 明确未实现（SFU 未接）。
   struct {
     const char* name;
     int rc;
+    int want;
   } calls[] = {
-      {"pu_voice_join", pu_voice_join(engine, &voice)},
-      {"pu_voice_leave", pu_voice_leave(engine)},
-      {"pu_voice_set_mode", pu_voice_set_mode(engine, PU_MODE_DIRECT)},
-      {"pu_voice_set_mute", pu_voice_set_mute(engine, 1)},
-      {"pu_voice_set_deafen", pu_voice_set_deafen(engine, 1)},
-      {"pu_screen_watch", pu_screen_watch(engine, "peer-1")},
-      {"pu_screen_unwatch", pu_screen_unwatch(engine, "peer-1")},
+      {"pu_voice_join(null)", pu_voice_join(engine, nullptr), PU_ERR_INVALID_ARG},
+      {"pu_voice_leave(idle)", pu_voice_leave(engine), PU_OK},
+      {"pu_voice_set_mode(relay)", pu_voice_set_mode(engine, PU_MODE_RELAY),
+       PU_NOT_IMPLEMENTED},
+      {"pu_voice_set_mute(idle)", pu_voice_set_mute(engine, 1), PU_ERR_STATE},
+      {"pu_voice_set_deafen(idle)", pu_voice_set_deafen(engine, 1), PU_ERR_STATE},
+      {"pu_screen_watch", pu_screen_watch(engine, "peer-1"), PU_NOT_IMPLEMENTED},
+      {"pu_screen_unwatch", pu_screen_unwatch(engine, "peer-1"), PU_NOT_IMPLEMENTED},
   };
 
   int failures = 0;
   for (const auto& call : calls) {
-    if (call.rc != PU_NOT_IMPLEMENTED) {
-      std::printf("FAIL: %s returned %d, expected PU_NOT_IMPLEMENTED (%d)\n", call.name, call.rc,
-                  PU_NOT_IMPLEMENTED);
+    if (call.rc != call.want) {
+      std::printf("FAIL: %s returned %d, expected %d\n", call.name, call.rc, call.want);
       ++failures;
     }
   }
-  std::printf("unimplemented surface: %zu int call(s) checked, %d unexpected\n",
+  std::printf("voice/screen surface: %zu int call(s) checked, %d unexpected\n",
               sizeof(calls) / sizeof(calls[0]), failures);
   return failures;
 }

@@ -58,6 +58,12 @@ volatile LONG g_crashing = 0;
 // v2.10：--voice 时每轮在屏幕共享之外再建一条语音会话（两个 PeerConnection），
 // 让收尾路径同时拆两条 PC —— 这是「两倍析构路径」的复现入口。
 bool g_voice = false;
+// v2.11：--passive-screen 时每轮的 B 走「被动共享方」路径：
+//   pu_screen_prepare(b) 预建 answerer 会话 + pu_screen_start_ex(b, source, PASSIVE)
+//   （采屏但不发 offer，视频轨等 A 的 offer 到了才挂上）。
+// 这条路径的析构比普通共享多三种状态要收：screen_passive_ / screen_prepared_ /
+// video_sender_（answerer PC 上那个后挂的 sender），是 screen 侧唯一没被 --voice 覆盖到的。
+bool g_passive_screen = false;
 
 int64_t NowUs() {
   return std::chrono::duration_cast<std::chrono::microseconds>(
@@ -447,7 +453,9 @@ void PrintUsage() {
       "                           [--jitter-ms N] [--voice]\n"
       "  --order: viewer-first (default) | media | signaling | abrupt | sharer-first |\n"
       "           alternate\n"
-      "  --voice: 每轮额外建一条语音会话（两个 PeerConnection），压两倍析构路径\n");
+      "  --voice: 每轮额外建一条语音会话（两个 PeerConnection），压两倍析构路径\n"
+      "  --passive-screen: 每轮的 B 走被动共享方路径（pu_screen_prepare +\n"
+      "      pu_screen_start_ex(passive)），压 answerer PC + 后挂 video sender 的析构\n");
 }
 
 }  // namespace
@@ -490,6 +498,8 @@ int main(int argc, char** argv) {
       jitter_ms = std::atoi(next("--jitter-ms"));
     } else if (arg == "--voice") {
       g_voice = true;
+    } else if (arg == "--passive-screen") {
+      g_passive_screen = true;
     } else if (arg == "--help" || arg == "-h") {
       PrintUsage();
       return 0;
@@ -514,8 +524,11 @@ int main(int argc, char** argv) {
   }
   SetUnhandledExceptionFilter(CrashFilter);
 
-  std::printf("partyup teardown stress: iterations=%d order=%s min_frames=%d jitter_ms=%d voice=%d\n",
-              iterations, order.c_str(), min_frames, jitter_ms, g_voice ? 1 : 0);
+  std::printf(
+      "partyup teardown stress: iterations=%d order=%s min_frames=%d jitter_ms=%d voice=%d "
+      "passive_screen=%d\n",
+      iterations, order.c_str(), min_frames, jitter_ms, g_voice ? 1 : 0,
+      g_passive_screen ? 1 : 0);
   std::printf("logs: %s\n", g_log_dir);
   {
     char symbol_check[512] = {0};
@@ -611,6 +624,23 @@ int main(int argc, char** argv) {
       }
     }
 
+    // v2.11：--passive-screen 让 B 走「被动共享方」路径。B 仍然要收到 A 的画面
+    // （A 的 offer 里 video 段对 B 是接收方向），所以这一轮的连接/帧数判据不变，
+    // 但收尾时要多拆：answerer PC + 预建标记 + offer 到达后挂上的 video sender。
+    if (g_passive_screen) {
+      const int prep_rc = pu_screen_prepare(b);
+      const int passive_rc = pu_screen_start_ex(b, source.c_str(), PU_SCREEN_START_PASSIVE);
+      Phase("B passive screen: prepare=%d start_ex(passive)=%d", prep_rc, passive_rc);
+      if (prep_rc != PU_OK || passive_rc != PU_OK) {
+        LogLine("FAIL: passive screen start failed (prepare=%d start_ex=%d: %s)", prep_rc,
+                passive_rc, pu_last_error(b));
+        pu_engine_destroy(a);
+        pu_engine_destroy(b);
+        ++failures;
+        break;
+      }
+    }
+
     const int start_rc = pu_screen_start(a, source.c_str());
     if (start_rc != PU_OK) {
       LogLine("FAIL: pu_screen_start(A) rc=%d (%s)", start_rc, pu_last_error(a));
@@ -625,11 +655,19 @@ int main(int argc, char** argv) {
     Tally tally_b;
     const bool connected =
         ExchangeUntilConnected(a, b, &tally_a, &tally_b, min_frames, connect_timeout_ms);
-    Phase("exchange done: connected=%d A.frames=%d B.remote=%d A.signals=%d",
-          connected ? 1 : 0, tally_a.frames, tally_b.remote_frames, tally_a.signals);
+    Phase("exchange done: connected=%d A.frames=%d B.remote=%d B.frames=%d A.signals=%d",
+          connected ? 1 : 0, tally_a.frames, tally_b.remote_frames, tally_b.frames,
+          tally_a.signals);
     if (!connected) {
       ++failures;
       // 仍然走一次收尾：连接失败时的 teardown 同样要干净，不能把进程留在坏状态。
+    }
+    // v2.11：被动共享方自己也在采屏——如果它一帧都没产生，说明 start_ex(passive)
+      // 只把状态设了但采集没起来，那这一轮的「被动会话析构」就没真正被压到。
+    if (g_passive_screen && tally_b.frames < min_frames) {
+      LogLine("FAIL: passive sharer B emitted only %d frame event(s) (capture not running?)",
+              tally_b.frames);
+      ++failures;
     }
 
     if (jitter_ms > 0) {

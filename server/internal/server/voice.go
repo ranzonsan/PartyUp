@@ -507,6 +507,20 @@ func (h *Hub) handleScreenSignal(memberID, channelID, kind, payload string) erro
 	return room.HandleSignal(memberID, kind, []byte(payload))
 }
 
+// RefreshVideoPeer 在共享者开始共享时重建它的视频 PC 并重发 offer：
+// 客户端要先把带视频轨的被动会话建好、answer 时才能把轨挂上（ABI v2.11 无重协商）。
+func (h *Hub) RefreshVideoPeer(channelID, memberID string) {
+	h.mu.RLock()
+	room := h.videoRooms[channelID]
+	h.mu.RUnlock()
+	if room == nil {
+		return
+	}
+	if err := room.Refresh(memberID); err != nil {
+		h.log.Error("refresh video peer", "channel", channelID, "member", memberID, "err", err)
+	}
+}
+
 // StopVideoShare 在 screen.stop 时摘掉视频房间里的共享槽位并清空，
 // 否则观看者会一直收到最后一帧（看起来像画面卡死）。
 func (h *Hub) StopVideoShare(channelID, memberID string) {

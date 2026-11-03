@@ -65,6 +65,14 @@ internal static class NativeMethods
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
     public static extern int pu_screen_start(IntPtr engine, [MarshalAs(UnmanagedType.LPUTF8Str)] string? screenId);
 
+    /// <summary>v2.11：开始屏幕共享并可指定角色。flags bit0 = 被动（answerer：只采屏+挂轨，不发 offer）。</summary>
+    [DllImport(Library, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    public static extern int pu_screen_start_ex(IntPtr engine, [MarshalAs(UnmanagedType.LPUTF8Str)] string? screenId, uint flags);
+
+    /// <summary>v2.11：观看者预建屏幕会话（answerer），不采屏、不建轨；幂等。</summary>
+    [DllImport(Library, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    public static extern int pu_screen_prepare(IntPtr engine);
+
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
     public static extern int pu_screen_stop(IntPtr engine);
 

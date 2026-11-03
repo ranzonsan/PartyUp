@@ -484,3 +484,32 @@ func (r *VideoRoom) removePeer(memberID string) {
 		_ = p.pc.Close()
 	}
 }
+
+// Refresh 重建某成员的视频 PC 并重新发 offer。
+//
+// 为什么需要它：客户端媒体核心的被动屏幕会话**必须在本端 answer 之前**把视频轨挂到
+// recvonly m-line 上（ABI v2.11 不支持事后重新协商）。而观看者为了能随时看到画面，
+// 在订阅时就已经把视频 PC 答完了——等到它真要共享时，那条 m-line 早已协商成「本端不发」。
+// 所以共享开始时由服务端重建这个成员的视频 PC 并发新 offer，客户端在收到 offer 前
+// 已用 pu_screen_start_ex(passive) 建好带轨的新会话，answer 时轨就挂上了。
+//
+// 代价：该成员自己正在收的其它共享会短暂中断（v1 同时最多 1 路共享，可接受）。
+func (r *VideoRoom) Refresh(memberID string) error {
+	r.mu.Lock()
+	p := r.peers[memberID]
+	delete(r.peers, memberID)
+	if _, ok := r.pubs[memberID]; ok {
+		delete(r.pubs, memberID)
+		r.releaseSlotLocked(memberID)
+	}
+	for _, other := range r.peers {
+		r.unbindLocked(other, memberID)
+	}
+	r.mu.Unlock()
+
+	if p != nil && p.pc != nil {
+		_ = p.pc.Close()
+	}
+	r.log.Info("video pc refreshed for screen share", "member", memberID)
+	return r.Join(memberID)
+}

@@ -825,6 +825,12 @@ func (c *conn) handleScreenStart(env protocol.Envelope) {
 
 	c.hub.log.Info("screen share started", "channel", channelID, "member", c.member.Name,
 		"source", source.Title, "width", source.Width, "height", source.Height, "mode", mode)
+	// relay：共享者的视频 PC 里那条 recvonly m-line 在它「当观看者」时就已经答成「不发」，
+	// 而客户端只有本端 answer 之前才能挂上视频轨（ABI v2.11 无重协商）。
+	// 所以这里重建它的视频 PC 并重发 offer——客户端此时已用被动模式建好带轨的新会话。
+	if mode == "relay" && sfuVideo {
+		c.hub.RefreshVideoPeer(channelID, c.member.ID)
+	}
 	c.replyOK(env, protocol.ScreenStartOK{ChannelID: channelID})
 	c.hub.broadcastScreenState(channelID)
 }

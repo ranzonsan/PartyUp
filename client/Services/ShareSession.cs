@@ -185,6 +185,70 @@ public sealed class ShareSession : IAsyncDisposable
     // ------------------------------------------------------------------
 
     /// <summary>开始共享一个源：先让媒体核心开机，再向服务端登记 screen.start。</summary>
+    /// <summary>
+    /// 中继模式共享：原生以 passive（answerer）开屏——采屏、建视频轨、等对端 offer。
+    /// 顺序按 ABI 约定：先 start_ex(passive) 建好会话，再让服务端广播 screen.state；
+    /// 服务端的视频 offer 随后到达并在引擎里被应答。失败时回滚本地采集。
+    /// </summary>
+    private async Task StartSharingRelayAsync(MediaSource source, CancellationToken ct)
+    {
+        if (!_engine.HasScreenRelaySupport)
+        {
+            LastError = "媒体核心缺少 SFU 屏幕共享能力（需要 ABI v2.11 的 DLL：pu_screen_start_ex / pu_screen_prepare）";
+            AppLog.Fail("share: " + LastError);
+            Changed?.Invoke();
+            throw new InvalidOperationException(LastError);
+        }
+
+        AppLog.Info($"share: start relay id=\"{source.Id}\" title=\"{source.Title}\" " +
+                    $"size={source.Width}x{source.Height} kind={source.Kind}");
+        try
+        {
+            // 关键顺序：先丢掉「当观看者时」建好的旧答案会话（那条 recvonly m-line 早已答成
+            // 「本端不发」），再以被动模式新建带视频轨的会话。服务端随后会重建我们的视频 PC
+            // 并发新 offer，answer 时轨才能挂上（ABI v2.11 不支持事后重新协商）。
+            try { _engine.StopScreen(); } catch { /* 之前没开共享时是幂等的 */ }
+            _engine.StartScreenPassive(source.Id);
+        }
+        catch (Exception ex)
+        {
+            LastError = "本地采集启动失败：" + ex.Message;
+            _sharingSource = null;
+            IsSharing = false;
+            AppLog.Fail("share: " + LastError);
+            Changed?.Invoke();
+            throw new InvalidOperationException(LastError, ex);
+        }
+
+        try
+        {
+            await _connection.StartScreenAsync(
+                _channelId,
+                new ScreenSourceDto(source.Id, source.Title, (int)source.Width, (int)source.Height, KindName(source.Kind)),
+                "relay",
+                ct);
+        }
+        catch (Exception ex)
+        {
+            // 服务端不认：把本地采集撤掉，避免留下一个没人能看的共享。
+            try { _engine.StopScreen(); } catch { /* 尽力而为 */ }
+            LastError = ex.Message;
+            _sharingSource = null;
+            IsSharing = false;
+            SharingSourceTitle = string.Empty;
+            AppLog.Fail("share: server rejected — " + ex.Message);
+            Changed?.Invoke();
+            throw new InvalidOperationException(ex.Message, ex);
+        }
+
+        _sharingSource = source;
+        IsSharing = true;
+        SharingSourceTitle = source.Title;
+        AppLog.Pass($"share: started relay source=\"{source.Title}\" id={source.Id} " +
+                    $"size={source.Width}x{source.Height} role=answerer");
+        Changed?.Invoke();
+    }
+
     public async Task StartSharingAsync(MediaSource source, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(source.Id))
@@ -194,14 +258,13 @@ public sealed class ShareSession : IAsyncDisposable
         }
         LastError = null;
 
-        // 兜底：屏幕共享中继通道（SFU 视频）还没实现。这里在**碰本地采集和信令之前**就干净失败，
-        // 避免「点了个共享按钮，语音就没了」。服务端也会拒（权威），这里是快速失败 + 明确文案。
+        // SFU 屏幕共享（screen_mode=relay）：本端是**被动共享方**（answerer）。
+        // 只采屏 + 建视频轨，不发 offer；服务端 offer 到了由信令路径回 answer。
+        // 这条路径与 direct 完全分开，绝不会碰语音的 PeerConnection。
         if (_screenMode == "relay")
         {
-            LastError = "当前服务器为纯 SFU 中继模式，暂不支持屏幕共享（视频通道开发中）";
-            AppLog.Fail("share: " + LastError);
-            Changed?.Invoke();
-            throw new InvalidOperationException(LastError);
+            await StartSharingRelayAsync(source, ct);
+            return;
         }
 
         // 通过策略检查后才记录「真正要传给 native 的值」：上面的 relay 拒绝不会走到 native，
@@ -360,6 +423,13 @@ public sealed class ShareSession : IAsyncDisposable
         if (signal.Target == "sfu")
         {
             SignalsIn++;
+            // 观看者可能在屏幕会话建好之前就收到服务端视频 offer（订阅即发 offer）。
+            // 先把 answerer 会话准备好，否则原生没有可灌 offer 的 PC。幂等。
+            if (signal.Media == "screen" && signal.Kind == "offer")
+            {
+                try { _engine.PrepareScreenSession(); }
+                catch (Exception ex) { AppLog.Warn("screen: prepare before sfu offer failed: " + ex.Message); }
+            }
             AppLog.Info($"media: sfu signal in kind={signal.Kind} bytes={signal.Payload.Length}");
             _inbound.Writer.TryWrite(new InboundSignal(signal.Media, signal.Payload));
             Changed?.Invoke();

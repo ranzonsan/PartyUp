@@ -34,6 +34,10 @@
 
 #include "partyup_media.h"
 
+// 信令 payload 是 JSON 信封（{"type":"offer","sdp":"v=0..."}），改写 SDP 必须走一次
+// JSON 解包/打包。用仓库 vendored 的 nlohmann（与 DLL 内部同一份）。
+#include "../../src/media-core/vendor/nlohmann/json.hpp"
+
 namespace {
 
 struct Counters {
@@ -455,9 +459,30 @@ int main() {
       pu_engine_destroy(d);
       return 1;
     }
-    const std::string rewritten = ForceVideoRecvOnly(offer);
-    std::printf("  offer: %zu bytes -> recvonly rewrite: %zu bytes (video mid=%s)\n",
-                offer.size(), rewritten.size(), VideoMid(offer).c_str());
+    // payload 是 JSON 信封，先解出裸 SDP。
+    std::string raw_sdp;
+    std::string rewritten;
+    {
+      try {
+        nlohmann::json envelope = nlohmann::json::parse(offer);
+        raw_sdp = envelope.value("sdp", std::string());
+        const std::string rewritten_sdp = ForceVideoRecvOnly(raw_sdp);
+        if (!rewritten_sdp.empty()) {
+          envelope["sdp"] = rewritten_sdp;
+          rewritten = envelope.dump();
+        }
+      } catch (const std::exception& ex) {
+        std::printf("FAIL: offer envelope is not JSON: %s\n", ex.what());
+      }
+    }
+    if (raw_sdp.empty()) {
+      std::printf("FAIL: offer envelope has no \"sdp\" field (payload starts with: %.60s)\n",
+                  offer.c_str());
+      ++failures;
+    }
+    std::printf("  offer: %zu bytes envelope -> raw sdp %zu bytes -> recvonly %zu bytes "
+                "(video mid=%s)\n",
+                offer.size(), raw_sdp.size(), rewritten.size(), VideoMid(raw_sdp).c_str());
     if (rewritten.empty()) {
       std::printf("FAIL: could not rewrite the offer to recvonly (no m=video)\n");
       ++failures;
@@ -488,11 +513,19 @@ int main() {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
       }
       const uint32_t d_sent_after = FramesSent(d);
-      const std::string d_video = VideoSection(cd.answer_sdp);
+      // answer 同样是 JSON 信封，取视频段前先解包。
+      std::string d_answer_sdp;
+      try {
+        d_answer_sdp = nlohmann::json::parse(cd.answer_sdp).value("sdp", std::string());
+      } catch (const std::exception& ex) {
+        std::printf("FAIL: answer envelope is not JSON: %s\n", ex.what());
+        ++failures;
+      }
+      const std::string d_video = VideoSection(d_answer_sdp);
       const bool answer_sendonly =
           d_video.find("a=sendonly") != std::string::npos ||
           d_video.find("a=ssrc:") != std::string::npos;
-      const std::string offer_mid = VideoMid(offer);
+      const std::string offer_mid = VideoMid(raw_sdp);
       const bool mid_matches =
           !offer_mid.empty() && cd.answer_sdp.find("a=mid:" + offer_mid) != std::string::npos;
       std::printf("  D signals: offers=%d answers=%d (want 0/1)\n", cd.offers, cd.answers);
@@ -563,6 +596,135 @@ int main() {
     }
     pu_screen_stop(e);
     pu_engine_destroy(e);
+  }
+
+  // ============ Phase 2b：服务端重建 PC 后**再发一个 offer**（Refresh 流程）============
+  // 真实场景：服务端 screen-relay 里，观看者订阅时已把视频 PC 答完；它后面要共享时，
+  // 那条 recvonly m-line 早已协商成「本端不发」，服务端只能重建 PC 并发新 offer
+  // （server/internal/sfu/video_room.go 的 Refresh）。客户端这边收到的就是「本端已经有
+  // 远端描述的会话上再来一个 offer」。要验证：不重复挂轨、不自己发 offer、照常回 answer。
+  std::printf("\n---- Phase 2b: a second (refreshed) offer on the answered passive session ----\n");
+  {
+    pu_engine* f = CreateEngine("screen-F-refresh-offerer");
+    pu_engine* g = CreateEngine("screen-G-passive-refresh");
+    Counters cf, cg;
+    if (f == nullptr || g == nullptr) {
+      std::printf("FAIL: pu_engine_create returned null\n");
+      return 1;
+    }
+    if (pu_screen_start(f, "synthetic") != PU_OK) {
+      std::printf("FAIL: pu_screen_start(F) failed: %s\n", pu_last_error(f));
+      pu_engine_destroy(f);
+      pu_engine_destroy(g);
+      return 1;
+    }
+    // 第一轮：拿到 F 的 offer → recvonly 改写 → 灌给 G（G 先 prepare + passive start）。
+    std::string first_offer;
+    {
+      const int64_t deadline = NowMs() + 15000;
+      while (NowMs() < deadline && first_offer.empty()) {
+        pu_event event;
+        std::memset(&event, 0, sizeof(event));
+        event.struct_size = static_cast<uint32_t>(sizeof(event));
+        const int rc = pu_poll_event(f, &event, 20);
+        if (rc == PU_ERR_TIMEOUT) continue;
+        if (rc != PU_OK) break;
+        if (event.type == PU_EVENT_SIGNAL_OUT && event.data.signal.kind == PU_SIGNAL_OFFER) {
+          first_offer.assign(event.data.signal.payload, event.data.signal.payload_len);
+        }
+      }
+    }
+    auto recvonly_envelope = [](const std::string& envelope) -> std::string {
+      try {
+        nlohmann::json j = nlohmann::json::parse(envelope);
+        const std::string raw = j.value("sdp", std::string());
+        const std::string rewritten = ForceVideoRecvOnly(raw);
+        if (rewritten.empty()) return {};
+        j["sdp"] = rewritten;
+        return j.dump();
+      } catch (...) {
+        return {};
+      }
+    };
+    const std::string first = recvonly_envelope(first_offer);
+    if (first.empty()) {
+      std::printf("FAIL: could not prepare the first refresh offer\n");
+      ++failures;
+    } else {
+      pu_screen_prepare(g);
+      pu_screen_start_ex(g, "synthetic", PU_SCREEN_START_PASSIVE);
+      const int in1 = pu_signal_in_media(g, "screen", first.data(), first.size());
+      int64_t deadline = NowMs() + 2000;
+      while (NowMs() < deadline && cg.answers == 0) {
+        if (PumpDiscard(g, "G", &cg) < 0) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      }
+      std::printf("  first offer -> rc=%d, G answers=%d (want 1)\n", in1, cg.answers);
+      if (in1 != PU_OK || cg.answers != 1) ++failures;
+
+      // 服务端 Refresh：重建 PC（新 ufrag/新指纹）→ 再发一个 offer。
+      pu_screen_stop(f);
+      pu_engine_destroy(f);
+      f = CreateEngine("screen-F-refresh-offerer2");
+      std::string second_offer;
+      if (f != nullptr && pu_screen_start(f, "synthetic") == PU_OK) {
+        deadline = NowMs() + 15000;
+        while (NowMs() < deadline && second_offer.empty()) {
+          pu_event event;
+          std::memset(&event, 0, sizeof(event));
+          event.struct_size = static_cast<uint32_t>(sizeof(event));
+          const int rc = pu_poll_event(f, &event, 20);
+          if (rc == PU_ERR_TIMEOUT) continue;
+          if (rc != PU_OK) break;
+          if (event.type == PU_EVENT_SIGNAL_OUT && event.data.signal.kind == PU_SIGNAL_OFFER) {
+            second_offer.assign(event.data.signal.payload, event.data.signal.payload_len);
+          }
+        }
+      }
+      const std::string second = recvonly_envelope(second_offer);
+      if (second.empty()) {
+        std::printf("FAIL: could not produce the refreshed offer\n");
+        ++failures;
+      } else {
+        const int in2 = pu_signal_in_media(g, "screen", second.data(), second.size());
+        deadline = NowMs() + 2000;
+        while (NowMs() < deadline && cg.answers < 2) {
+          if (PumpDiscard(g, "G", &cg) < 0) break;
+          std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        std::string second_answer_sdp;
+        try {
+          second_answer_sdp = nlohmann::json::parse(cg.answer_sdp).value("sdp", std::string());
+        } catch (...) {
+        }
+        const std::string second_video = VideoSection(second_answer_sdp);
+        const bool second_sendonly =
+            second_video.find("a=sendonly") != std::string::npos ||
+            second_video.find("a=ssrc:") != std::string::npos;
+        std::printf("  refreshed offer -> rc=%d, G answers=%d (want 2), "
+                    "second answer video=%s, G offers=%d (want 0)\n",
+                    in2, cg.answers, second_sendonly ? "sendonly" : "NOT-sendonly", cg.offers);
+        if (in2 != PU_OK) ++failures;
+        if (cg.answers != 2) {
+          std::printf("  FAIL: G did not re-answer the refreshed offer\n");
+          ++failures;
+        }
+        if (!second_sendonly) {
+          std::printf("  FAIL: refreshed answer lost the sending video section\n");
+          ++failures;
+        }
+        if (cg.offers != 0) {
+          std::printf("  FAIL: G emitted %d offer(s) during the refresh\n", cg.offers);
+          ++failures;
+        }
+      }
+    }
+    pu_screen_stop(g);
+    if (f != nullptr) {
+      pu_screen_stop(f);
+      pu_engine_destroy(f);
+    }
+    pu_engine_destroy(g);
   }
 
   if (failures != 0) {

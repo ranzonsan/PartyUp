@@ -98,12 +98,14 @@ public sealed class MediaEngine : IDisposable
     private IntPtr _handle;
     private bool _disposed;
 
-    private MediaEngine(string libraryPath, IntPtr handle, IReadOnlyList<string> missingExports, bool hasMediaSignal)
+    private MediaEngine(string libraryPath, IntPtr handle, IReadOnlyList<string> missingExports,
+        bool hasMediaSignal, bool hasScreenRelay)
     {
         LibraryPath = libraryPath;
         _handle = handle;
         MissingExports = missingExports;
         HasMediaSignalSupport = hasMediaSignal;
+        HasScreenRelaySupport = hasScreenRelay;
     }
 
     /// <summary>
@@ -169,7 +171,15 @@ public sealed class MediaEngine : IDisposable
             AppLog.Fail("media: DLL 缺少 pu_signal_in_media（ABI v2 第 20 个导出）——" +
                         "语音/屏幕共享信令无法按会话路由，需要新 DLL");
         }
-        return new MediaEngine(path, handle, missing, hasMediaSignal);
+        // 可选导出（SFU 屏幕共享，ABI v2.11）：两个都要有才认为可用。
+        var hasScreenRelay = NativeLibrary.TryGetExport(handle, "pu_screen_start_ex", out _) &&
+                             NativeLibrary.TryGetExport(handle, "pu_screen_prepare", out _);
+        if (!hasScreenRelay)
+        {
+            AppLog.Warn("media: DLL 缺少 pu_screen_start_ex / pu_screen_prepare（ABI v2.11）——" +
+                        "screen_mode=relay 的屏幕共享不可用");
+        }
+        return new MediaEngine(path, handle, missing, hasMediaSignal, hasScreenRelay);
     }
 
     /// <summary>DllImport 解析器：只接管 partyup_media，其余交给默认逻辑。</summary>
@@ -255,6 +265,38 @@ public sealed class MediaEngine : IDisposable
         ThrowIfDisposed();
         EnsureCreated();
         Check(NativeMethods.pu_screen_start(_engine, screenId), "pu_screen_start");
+    }
+
+    /// <summary>媒体核心是否支持被动屏幕会话（SFU 屏幕共享，ABI v2.11）。</summary>
+    public bool HasScreenRelaySupport { get; private set; }
+
+    /// <summary>
+    /// 开始共享，可指定角色。<paramref name="passive"/>=true 时（SFU 中继）：只采屏 + 建视频轨，
+    /// **不生成 offer**，等对端 offer 经 <see cref="SignalIn(string, byte[])"/> 灌进来。 
+    /// </summary>
+    public void StartScreenPassive(string screenId)
+    {
+        ThrowIfDisposed();
+        EnsureCreated();
+        if (!HasScreenRelaySupport)
+        {
+            throw new InvalidOperationException(
+                "媒体核心缺少 pu_screen_start_ex：需要 ABI v2.11 的 DLL（SFU 屏幕共享）");
+        }
+        Check(NativeMethods.pu_screen_start_ex(_engine, screenId, 0x1u), "pu_screen_start_ex(passive)");
+    }
+
+    /// <summary>观看者预建屏幕会话（answerer），不采屏、不建轨；幂等。</summary>
+    public void PrepareScreenSession()
+    {
+        ThrowIfDisposed();
+        EnsureCreated();
+        if (!HasScreenRelaySupport)
+        {
+            throw new InvalidOperationException(
+                "媒体核心缺少 pu_screen_prepare：需要 ABI v2.11 的 DLL（SFU 屏幕共享）");
+        }
+        Check(NativeMethods.pu_screen_prepare(_engine), "pu_screen_prepare");
     }
 
     /// <summary>停止共享（幂等）。</summary>

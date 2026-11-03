@@ -52,9 +52,35 @@ func (p *videoTestPeer) subscribeWithVideoOffer(channelID string) protocol.Media
 	}
 }
 
+// waitVideoOffer 等通道上下一条视频 offer（用于 screen.start 触发服务端 Refresh 后重新协商）。
+func (p *videoTestPeer) waitVideoOffer() protocol.MediaSignalPush {
+	p.t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		msg, err := p.ws.recv(deadline)
+		if err != nil {
+			p.t.Fatalf("%s: waiting refreshed video offer: %v", p.name, err)
+		}
+		if msg.Type != protocol.TypeMediaSignal {
+			continue
+		}
+		var push protocol.MediaSignalPush
+		if err := msg.DecodePayload(&push); err != nil {
+			continue
+		}
+		if push.Media == "screen" && push.Kind == "offer" && push.Target == "sfu" {
+			return push
+		}
+	}
+}
+
 // setupVideoSession 吃服务端视频 offer，建 PC、回 answer；sharer=true 时挂上假视频轨。
 func (p *videoTestPeer) setupVideoSession(offer protocol.MediaSignalPush, sharer bool) {
 	p.t.Helper()
+	if p.pc != nil {
+		_ = p.pc.Close()
+		p.pc = nil
+	}
 	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
 		p.t.Fatalf("%s: new pc: %v", p.name, err)
@@ -241,12 +267,18 @@ func TestScreenRelayForwardsVideoToViewers(t *testing.T) {
 	}
 
 	// alice 开始共享（服务端需要在 screen.state 里记录，媒体由假 RTP 驱动）。
-	aliceP.ws.request(protocol.TypeScreenStart, protocol.ScreenStartRequest{
+	// 注意不能用 wsClient.request：它会在等 .ok 时把服务端同时推来的**重建 offer** 吞掉。
+	aliceP.ws.sendRaw(protocol.MustNew(protocol.TypeScreenStart, protocol.ScreenStartRequest{
 		ChannelID: ch.ID,
 		Source: protocol.ScreenSource{
 			ID: "synthetic", Title: "1280x720 synthetic", Width: 1280, Height: 720, Kind: "synthetic",
 		},
-	})
+	}))
+	// screen.start 会服务端重建共享者的视频 PC（客户端只有在 answer 前才能挂轨，
+	// ABI v2.11 无重协商）——所以共享者要重新吃一条 offer 并带轨应答。
+	aliceP.setupVideoSession(aliceP.waitVideoOffer(), true)
+	aliceP.waitConnected()
+
 	// 等房间把 alice 的 recvonly 视频轨识别为发布者（OnTrack 在 RTP 到达后才触发）。
 	firstStream := make(chan struct{})
 	go func() { aliceP.sendScreenFrames(40); close(firstStream) }() // ~1.3s @30fps

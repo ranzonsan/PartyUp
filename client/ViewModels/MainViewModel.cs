@@ -511,7 +511,8 @@ public sealed partial class MainViewModel : ObservableObject
             // 这个频道的共享会话：负责信令转发与远端帧统计。
             if (_media is { IsCreated: true })
             {
-                _share = new ShareSession(_media, _connection, channel.Id, Program.Options.VoicePassive);
+                _share = new ShareSession(_media, _connection, channel.Id,
+                    Program.Options.VoicePassive, Program.Options.VoiceActive);
                 _share.Changed += OnShareChanged;
 
                 // 自动化验收用：进频道后自动加入语音（--voice-join --voice-mode relay|direct）。

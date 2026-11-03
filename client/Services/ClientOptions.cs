@@ -72,6 +72,10 @@ public sealed record ClientOptions
     /// </summary>
     public bool VoicePassive { get; init; }
 
+    /// <summary>`--voice-active`：自动加入时强制做 offerer（direct 验收用，与 --voice-passive 对称）。
+    /// 仅影响 direct 模式；relay 下服务端才是 offerer，此开关被忽略。</summary>
+    public bool VoiceActive { get; init; }
+
     /// <summary>
     /// 「谁在说话」的峰值阈值（16 bit 采样绝对值）。默认 500；
     /// 环境变量 PARTYUP_SPEAK_THRESHOLD 或 --speak-threshold 可调。
@@ -170,6 +174,9 @@ public sealed record ClientOptions
                     break;
                 case "--voice-passive":
                     options = options with { VoicePassive = true };
+                    break;
+                case "--voice-active":
+                    options = options with { VoiceActive = true };
                     break;
                 case "--speak-threshold":
                     var raw = TakeValue(args, ref i, arg);

@@ -76,14 +76,16 @@ public sealed class ShareSession : IAsyncDisposable
     private CancellationTokenSource? _voiceStatsCts;
     /// <summary>direct 模式下强制被动（仅测试/调试用；relay 本来就恒被动）。</summary>
     private readonly bool _forcePassive;
+    private readonly bool _forceActive;
 
     /// <summary>最近一次收到 offer 的对方成员 id：answer/candidate 都要定向回到这个人。</summary>
     private string? _signalPeerId;
 
     public ShareSession(MediaEngine engine, PartyUpConnection connection, string channelId,
-        bool forcePassive = false)
+        bool forcePassive = false, bool forceActive = false)
     {
         _forcePassive = forcePassive;
+        _forceActive = forceActive;
         _speakThreshold = Program.Options.SpeakThreshold;
         _engine = engine;
         _connection = connection;
@@ -179,9 +181,6 @@ public sealed class ShareSession : IAsyncDisposable
     /// <summary>开始共享一个源：先让媒体核心开机，再向服务端登记 screen.start。</summary>
     public async Task StartSharingAsync(MediaSource source, CancellationToken ct = default)
     {
-        // 记录真正传给 native 的值：空 id 会被 native 当成合成源，绝不允许静默降级。
-        AppLog.Info($"share: start id=\"{source.Id}\" title=\"{source.Title}\" " +
-                    $"size={source.Width}x{source.Height} kind={source.Kind}");
         if (string.IsNullOrWhiteSpace(source.Id))
         {
             throw new InvalidOperationException(
@@ -198,6 +197,11 @@ public sealed class ShareSession : IAsyncDisposable
             Changed?.Invoke();
             throw new InvalidOperationException(LastError);
         }
+
+        // 通过策略检查后才记录「真正要传给 native 的值」：上面的 relay 拒绝不会走到 native，
+        // 提前打这行会让人误以为采集已经启动。空 id 会被 native 当成合成源，绝不允许静默降级。
+        AppLog.Info($"share: start id=\"{source.Id}\" title=\"{source.Title}\" " +
+                    $"size={source.Width}x{source.Height} kind={source.Kind}");
 
         // 顺序很重要：**先让服务端批准，再开本地采集**。
         // 纯 SFU 中继模式（视频通道未就绪）下服务端会回 NOT_IMPLEMENTED；如果先 StartScreen，
@@ -689,6 +693,7 @@ public sealed class ShareSession : IAsyncDisposable
     private bool ShouldBePassive()
     {
         if (_voiceMode == "relay") return true; // 服务端 SFU 才是 offerer
+        if (_forceActive) return false;         // 验收/调试：强制做 offerer（direct 才有效）
         if (_forcePassive) return true;
         if (!HasOtherVoiceMembers) return false;
         var first = _voiceMembers.Keys.OrderBy(id => id, StringComparer.Ordinal).FirstOrDefault();

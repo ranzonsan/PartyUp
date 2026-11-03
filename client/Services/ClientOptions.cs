@@ -63,6 +63,12 @@ public sealed record ClientOptions
     /// <summary>测试用频道名（不存在时由 A 创建）。</summary>
     public string Channel { get; init; } = "interop";
 
+    /// <summary>`--voice-join`：登录并进入频道后自动加入语音（自动化验收用）。</summary>
+    public bool VoiceAutoJoin { get; init; }
+
+    /// <summary>`--voice-passive`：自动加入时用被动模式（flags bit0=1，等对端 offer）。</summary>
+    public bool VoicePassive { get; init; }
+
     /// <summary>--role send 要发送的正文。</summary>
     public string? Text { get; init; }
 
@@ -147,6 +153,12 @@ public sealed record ClientOptions
                     break;
                 case "--share-no-child":
                     options = options with { ShareNoChild = true };
+                    break;
+                case "--voice-join":
+                    options = options with { VoiceAutoJoin = true };
+                    break;
+                case "--voice-passive":
+                    options = options with { VoicePassive = true };
                     break;
                 case "--sources":
                     options = options with { Mode = ClientMode.Sources };

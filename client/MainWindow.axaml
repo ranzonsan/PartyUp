@@ -136,16 +136,44 @@
                        FontWeight="SemiBold" Foreground="#FF9AA4B8" />
             <ItemsControl ItemsSource="{Binding Members}">
               <ItemsControl.ItemTemplate>
-                <DataTemplate x:DataType="models:PresenceMemberDto">
-                  <StackPanel Orientation="Horizontal" Spacing="6" Margin="0,2">
+                <DataTemplate x:DataType="vm:MemberRow">
+                  <StackPanel Orientation="Horizontal" Spacing="5" Margin="0,2">
                     <Ellipse Width="7" Height="7" Fill="#FF6FCF87" VerticalAlignment="Center" />
                     <TextBlock Text="{Binding Name}" FontSize="12" Foreground="#FFD5DAE4" />
+                    <TextBlock Text="🔊" FontSize="11" VerticalAlignment="Center"
+                               IsVisible="{Binding IsInVoice}" />
+                    <TextBlock Text="🔇" FontSize="11" VerticalAlignment="Center"
+                               IsVisible="{Binding IsMuted}" />
                   </StackPanel>
                 </DataTemplate>
               </ItemsControl.ItemTemplate>
             </ItemsControl>
 
             <Border Height="1" Background="#FF232936" Margin="0,6" />
+
+            <!-- 语音：加入/离开 + 麦克风静音 / 关闭扬声器（v1 只有 direct，relay 需后端 SFU） -->
+            <TextBlock Text="语音" FontSize="12"
+                       FontWeight="SemiBold" Foreground="#FF9AA4B8" />
+            <Button x:Name="VoiceToggleButton" Content="{Binding VoiceJoinButtonText}"
+                    HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+                    Background="#FF1F4D3B" Foreground="White" Padding="0,7" FontSize="12" />
+            <Grid ColumnDefinitions="*,*">
+              <Button x:Name="VoiceMuteButton" Content="麦克风静音"
+                      HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+                      Padding="0,6" FontSize="11" IsEnabled="{Binding IsInVoice}" />
+              <Button x:Name="VoiceDeafenButton" Grid.Column="1" Content="关闭扬声器"
+                      Margin="6,0,0,0" HorizontalAlignment="Stretch"
+                      HorizontalContentAlignment="Center" Padding="0,6" FontSize="11"
+                      IsEnabled="{Binding IsInVoice}" />
+            </Grid>
+            <TextBlock Text="{Binding VoiceStatusText}" FontSize="11"
+                       Foreground="#FF9AA4B8" TextWrapping="Wrap" />
+            <TextBlock Text="{Binding VoiceModeText}" FontSize="11" Foreground="#FF7C8698" />
+            <TextBlock Text="{Binding RelayUnavailableNote}" FontSize="10"
+                       Foreground="#FF6E7A8E" TextWrapping="Wrap"
+                       IsVisible="{Binding !IsRelayAvailable}" />
+
+            <Border Height="1" Background="#FF232936" Margin="0,4" />
 
             <!-- 屏幕共享：选源 → 开始/停止；观看方显示共享者与远端帧计数 -->
             <TextBlock Text="共享屏幕" FontSize="12"

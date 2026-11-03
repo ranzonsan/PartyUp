@@ -18,7 +18,10 @@ param(
     [string]$ActivateTitle = '',
 
     # 推荐用法：按进程名找到主窗口，最大化并提到前台。
-    [string]$ProcessName = ''
+    [string]$ProcessName = '',
+
+    # 两个同 exe 的客户端同时开时，按 pid 指定要截的那个窗口（优先于 -ProcessName）。
+    [int]$ProcessId = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -43,7 +46,7 @@ public static extern bool SetProcessDPIAware();
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-if ($ProcessName) {
+if ($ProcessId -ne 0 -or $ProcessName) {
     Add-Type -Namespace PartyUpEvidence -Name Win32 -MemberDefinition @'
 [System.Runtime.InteropServices.DllImport("user32.dll")]
 public static extern bool SetForegroundWindow(System.IntPtr hWnd);
@@ -52,11 +55,16 @@ public static extern bool SetForegroundWindow(System.IntPtr hWnd);
 public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);
 '@
 
-    $process = Get-Process -Name $ProcessName -ErrorAction SilentlyContinue |
-        Where-Object { $_.MainWindowHandle -ne 0 } |
-        Select-Object -First 1
+    $process = if ($ProcessId -ne 0) {
+        Get-Process -Id $ProcessId -ErrorAction SilentlyContinue |
+            Where-Object { $_.MainWindowHandle -ne 0 }
+    } else {
+        Get-Process -Name $ProcessName -ErrorAction SilentlyContinue |
+            Where-Object { $_.MainWindowHandle -ne 0 } |
+            Select-Object -First 1
+    }
     if (-not $process) {
-        Write-Output "process '$ProcessName' not found (or has no window)"
+        Write-Output "process not found (pid=$ProcessId name='$ProcessName') or has no window"
         exit 3
     }
 

@@ -54,7 +54,9 @@ public sealed partial class MainViewModel : ObservableObject
 
     public ObservableCollection<MessageItem> Messages { get; } = new();
 
-    public ObservableCollection<PresenceMemberDto> Members { get; } = new();
+    public ObservableCollection<MemberRow> Members { get; } = new();
+
+    private IReadOnlyList<PresenceMemberDto> _membersSnapshot = Array.Empty<PresenceMemberDto>();
 
     /// <summary>可共享的源（本机显示器 + 内置合成源），来自 pu_screen_sources。</summary>
     public ObservableCollection<MediaSource> Sources { get; } = new();
@@ -93,6 +95,33 @@ public sealed partial class MainViewModel : ObservableObject
 
     [ObservableProperty]
     private string _mediaStatusText = "媒体引擎：初始化中…";
+
+    // ---- 语音（docs/PROTOCOL.md §4.1；v1 只支持 direct）----
+
+    [ObservableProperty]
+    private bool _isInVoice;
+
+    [ObservableProperty]
+    private bool _isVoiceMuted;
+
+    [ObservableProperty]
+    private bool _isVoiceDeafened;
+
+    [ObservableProperty]
+    private string _voiceStatusText = "语音：未加入";
+
+    [ObservableProperty]
+    private string _voiceModeText = "模式：—";
+
+    public string VoiceJoinButtonText => IsInVoice ? "离开语音" : "加入语音";
+
+    /// <summary>relay 中继需要后端 SFU 中继，尚未实现——UI 置灰并给说明，不静默假装可用。</summary>
+    public bool IsRelayAvailable => false;
+
+    public string RelayUnavailableNote { get; } =
+        "中继模式（relay）暂不可用：需要后端 SFU 中继，v1 只支持 direct 直连。";
+
+    partial void OnIsInVoiceChanged(bool value) => OnPropertyChanged(nameof(VoiceJoinButtonText));
 
     [ObservableProperty]
     private string _footerText = string.Empty;
@@ -426,13 +455,21 @@ public sealed partial class MainViewModel : ObservableObject
                 Shares.Clear();
                 IsSharing = false;
                 ShareStatusText = "共享：未开始";
+                // 语音会话随频道一起收尾，UI 状态复位。
+                IsInVoice = false;
+                IsVoiceMuted = false;
+                IsVoiceDeafened = false;
+                VoiceStatusText = "语音：未加入";
+                VoiceModeText = "模式：—";
             }
             if (_subscribedChannelId is not null && _subscribedChannelId != channel.Id)
             {
                 await _connection.UnsubscribeAsync(_subscribedChannelId);
             }
-            await _connection.SubscribeAsync(channel.Id);
+            // 服务端在 subscribe 的响应之后立刻推 presence；先把频道 id 记下来，
+            // 否则这条推送会在 _subscribedChannelId 还没赋值时被守卫丢掉（成员列表就空着）。
             _subscribedChannelId = channel.Id;
+            await _connection.SubscribeAsync(channel.Id);
             SelectedChannel = channel;
 
             // 这个频道的共享会话：负责信令转发与远端帧统计。
@@ -440,6 +477,15 @@ public sealed partial class MainViewModel : ObservableObject
             {
                 _share = new ShareSession(_media, _connection, channel.Id);
                 _share.Changed += OnShareChanged;
+
+                // 自动化验收用：进频道后自动加入语音（--voice-join / --voice-passive）。
+                if (Program.Options.VoiceAutoJoin)
+                {
+                    var passive = Program.Options.VoicePassive;
+                    await _share.JoinVoiceAsync(passive);
+                    SyncVoiceFromShare();
+                    AppLog.Pass($"gui: voice auto-join passive={passive} ok={_share.IsInVoice}");
+                }
             }
 
             Messages.Clear();
@@ -453,6 +499,8 @@ public sealed partial class MainViewModel : ObservableObject
             AppLog.Pass($"gui: opened #{channel.Name} (history={history.Count})");
             StatusText = $"频道 #{channel.Name}（{history.Count} 条历史消息）";
             FooterText = $"已进入 #{channel.Name}；输入消息回车发送";
+            // 成员列表按最新快照重建（presence 可能在上面的 await 之前就到了）。
+            RebuildMemberRows();
         }
         catch (Exception ex)
         {
@@ -503,6 +551,9 @@ public sealed partial class MainViewModel : ObservableObject
 
     private void OnPresenceChanged(PresenceDto presence)
     {
+        // 先同步留一份快照：subscribe 之后 presence 可能早于成员列表初始化完成到达，
+        // OpenChannelAsync 末尾会用这份快照重建，避免被随后的 Clear() 清空。
+        _membersSnapshot = presence.Members;
         Dispatcher.UIThread.Post(() =>
         {
             if (presence.ChannelId != _subscribedChannelId)
@@ -513,10 +564,17 @@ public sealed partial class MainViewModel : ObservableObject
             {
                 _memberNames[member.MemberId] = member.Name;
             }
+            _membersSnapshot = presence.Members;
             Members.Clear();
             foreach (var member in presence.Members)
             {
-                Members.Add(member);
+                var inVoice = _share?.VoiceMembers.ContainsKey(member.MemberId) == true;
+                var selfMuted = _share is { IsVoiceMuted: true } && member.MemberId == _connection?.Member.Id;
+                Members.Add(new MemberRow(member.MemberId, member.Name)
+                {
+                    IsInVoice = inVoice,
+                    IsMuted = selfMuted,
+                });
             }
             AppLog.Info($"gui: presence {presence.Members.Count} member(s): {string.Join(", ", presence.Members.Select(m => m.Name))}");
             FooterText = $"频道内 {presence.Members.Count} 人在线";
@@ -608,6 +666,102 @@ public sealed partial class MainViewModel : ObservableObject
         }
     }
 
+    // ------------------------------------------------------------------
+    // 语音
+    // ------------------------------------------------------------------
+
+    /// <summary>加入/离开语音。后加入的一方自动走 passive（避免双方并发 offer 的 glare）。</summary>
+    public async Task ToggleVoiceAsync()
+    {
+        if (_share is not { } share)
+        {
+            VoiceStatusText = "语音：请先进入频道";
+            return;
+        }
+        if (share.IsInVoice)
+        {
+            await share.LeaveVoiceAsync();
+            AppLog.Info("gui: voice left");
+        }
+        else
+        {
+            var passive = share.HasOtherVoiceMembers;
+            await share.JoinVoiceAsync(passive);
+            if (share.IsInVoice)
+            {
+                AppLog.Pass($"gui: voice joined passive={passive}");
+            }
+            else
+            {
+                VoiceStatusText = "语音：加入失败（" + (share.LastError ?? "未知错误") + "）";
+            }
+        }
+        SyncVoiceFromShare();
+    }
+
+    public void ToggleVoiceMute()
+    {
+        if (_share is not { } share || !share.IsInVoice)
+        {
+            VoiceStatusText = "语音：未加入语音，无法静音";
+            return;
+        }
+        var rc = share.ToggleVoiceMute();
+        VoiceStatusText = rc == 0
+            ? (share.IsVoiceMuted ? "语音：麦克风已静音" : "语音：麦克风已打开")
+            : $"语音：静音失败 rc={rc}";
+        SyncVoiceFromShare();
+    }
+
+    public void ToggleVoiceDeafen()
+    {
+        if (_share is not { } share || !share.IsInVoice)
+        {
+            VoiceStatusText = "语音：未加入语音，无法关闭扬声器";
+            return;
+        }
+        var rc = share.ToggleVoiceDeafen();
+        VoiceStatusText = rc == 0
+            ? (share.IsVoiceDeafened ? "语音：扬声器已关闭" : "语音：扬声器已打开")
+            : $"语音：关闭扬声器失败 rc={rc}";
+        SyncVoiceFromShare();
+    }
+
+    /// <summary>把 ShareSession 的语音状态同步到可绑定属性（UI 线程调用）。</summary>
+    private void SyncVoiceFromShare()
+    {
+        if (_share is not { } share)
+        {
+            return;
+        }
+        IsInVoice = share.IsInVoice;
+        IsVoiceMuted = share.IsVoiceMuted;
+        IsVoiceDeafened = share.IsVoiceDeafened;
+        VoiceModeText = "模式：" + share.VoiceModeText;
+        VoiceStatusText = !share.IsInVoice
+            ? "语音：未加入"
+            : $"语音：已加入（{share.VoiceMembers.Count} 人）" +
+              (share.IsVoiceMuted ? "，麦克风静音" : string.Empty) +
+              (share.IsVoiceDeafened ? "，扬声器关闭" : string.Empty);
+        RebuildMemberRows();
+    }
+
+    /// <summary>按最近一次 presence 快照 + 语音状态重建成员行（语音/静音图标绑在这些属性上）。</summary>
+    private void RebuildMemberRows()
+    {
+        var selfId = _connection?.Member.Id;
+        var voice = _share?.VoiceMembers;
+        Members.Clear();
+        foreach (var member in _membersSnapshot)
+        {
+            Members.Add(new MemberRow(member.MemberId, member.Name)
+            {
+                IsInVoice = voice?.ContainsKey(member.MemberId) == true,
+                IsMuted = _share is { IsVoiceMuted: true } && member.MemberId == selfId,
+            });
+        }
+    }
+
     private void OnShareChanged()
     {
         Dispatcher.UIThread.Post(() =>
@@ -624,6 +778,8 @@ public sealed partial class MainViewModel : ObservableObject
             WatchStatusText = share.IsWatching ? $"观看：{share.WatchingName} 正在共享" : "观看：—";
             RemoteFramesText = $"远端帧：{share.RemoteFrames}" +
                                (share.RemoteWidth > 0 ? $"（{share.RemoteWidth}x{share.RemoteHeight}）" : string.Empty);
+            // 语音状态也挂在同一个 Changed 事件上：成员语音标识、静音图标、按钮文案一起刷新。
+            SyncVoiceFromShare();
             if (!share.IsWatching)
             {
                 // 对方停止共享：清掉画面并让画面区收起（位图保留待复用，不重建）。

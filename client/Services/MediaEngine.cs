@@ -292,9 +292,15 @@ public sealed class MediaEngine : IDisposable
         return ptr == IntPtr.Zero ? string.Empty : Marshal.PtrToStringUTF8(ptr) ?? string.Empty;
     }
 
-    // ---- 以下导出为 ABI 完整性保留：骨架不调用，但签名与头文件对齐 ----
+    // ---- 语音（ABI v2 的 pu_voice_* 五个导出）----
 
-    public int VoiceJoin(string channelId, int mode)
+    /// <summary>
+    /// 加入语音。<paramref name="mode"/>：0=relay、1=direct。
+    /// <paramref name="passive"/>=true 时置 <c>pu_voice_params.flags</c> bit0=1：只加音频轨、
+    /// 不主动发 offer，等对方 offer 后回 answer。1:1 里后加入的一方必须走这条，否则双方并发
+    /// offer 会 glare（引擎 SignalIn 会直接报角色冲突）。
+    /// </summary>
+    public int VoiceJoin(string channelId, int mode, bool passive = false)
     {
         ThrowIfDisposed();
         EnsureCreated();
@@ -306,6 +312,7 @@ public sealed class MediaEngine : IDisposable
                 StructSize = (uint)Marshal.SizeOf<PuVoiceParams>(),
                 ChannelId = idPtr,
                 Mode = mode,
+                Flags = passive ? 1u : 0u,
             };
             return NativeMethods.pu_voice_join(_engine, in parameters);
         }

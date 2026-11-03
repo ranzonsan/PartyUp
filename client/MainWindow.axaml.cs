@@ -32,6 +32,9 @@ public partial class MainWindow : Window
         SendButton.Click += OnSendClicked;
         StartShareButton.Click += OnStartShareClicked;
         StopShareButton.Click += OnStopShareClicked;
+        VoiceToggleButton.Click += OnVoiceToggleClicked;
+        VoiceMuteButton.Click += OnVoiceMuteClicked;
+        VoiceDeafenButton.Click += OnVoiceDeafenClicked;
         MessageInput.KeyDown += OnMessageInputKeyDown;
         ChannelList.SelectionChanged += OnChannelSelectionChanged;
         _viewModel.Messages.CollectionChanged += (_, _) => MessageScroll.ScrollToEnd();
@@ -81,6 +84,13 @@ public partial class MainWindow : Window
     private async void OnStartShareClicked(object? sender, RoutedEventArgs e) => await _viewModel.StartSharingAsync();
 
     private async void OnStopShareClicked(object? sender, RoutedEventArgs e) => await _viewModel.StopSharingAsync();
+
+    private async void OnVoiceToggleClicked(object? sender, RoutedEventArgs e) =>
+        await _viewModel.ToggleVoiceAsync();
+
+    private void OnVoiceMuteClicked(object? sender, RoutedEventArgs e) => _viewModel.ToggleVoiceMute();
+
+    private void OnVoiceDeafenClicked(object? sender, RoutedEventArgs e) => _viewModel.ToggleVoiceDeafen();
 
     private async void OnMessageInputKeyDown(object? sender, KeyEventArgs e)
     {

@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.Json;
 using System.Threading.Channels;
 using PartyUp.Client.Models;
 
@@ -31,12 +32,22 @@ public sealed class ShareSession : IAsyncDisposable
     private string? _remoteSharerId;
     private string _remoteSharerName = string.Empty;
 
+    // 语音（docs/PROTOCOL.md §4.1；信令复用同一条 media.signal，media=voice）。
+    private bool _voiceJoined;
+    private bool _voiceMuted;
+    private bool _voiceDeafened;
+    private readonly Dictionary<string, string> _voiceMembers = new(StringComparer.Ordinal);
+
+    /// <summary>最近一次收到 offer 的对方成员 id：answer/candidate 都要定向回到这个人。</summary>
+    private string? _signalPeerId;
+
     public ShareSession(MediaEngine engine, PartyUpConnection connection, string channelId)
     {
         _engine = engine;
         _connection = connection;
         _channelId = channelId;
         _thisMemberId = connection.Member.Id;
+        _thisMemberName = connection.Member.Name;
 
         connection.MediaSignalReceived += OnMediaSignal;
         connection.ScreenStateChanged += OnScreenState;
@@ -44,6 +55,7 @@ public sealed class ShareSession : IAsyncDisposable
     }
 
     private readonly string _thisMemberId;
+    private readonly string _thisMemberName;
 
     /// <summary>本端是否正在共享。</summary>
     public bool IsSharing { get; private set; }
@@ -65,6 +77,29 @@ public sealed class ShareSession : IAsyncDisposable
     public string WatchingName => _remoteSharerName;
 
     public bool IsWatching => _remoteSharerId is not null;
+
+    // ------------------------------------------------------------------
+    // 语音状态（UI 绑定；信令走 media.signal 的 voice 通道）
+    // ------------------------------------------------------------------
+
+    /// <summary>本端是否已加入语音。</summary>
+    public bool IsInVoice => _voiceJoined;
+
+    public bool IsVoiceMuted => _voiceMuted;
+
+    public bool IsVoiceDeafened => _voiceDeafened;
+
+    /// <summary>语音模式展示文本：v1 只实现了 direct（relay 需要 SFU）。</summary>
+    public string VoiceModeText => _voiceJoined ? "direct（P2P 直连）" : "模式：—";
+
+    /// <summary>频道里正在语音的成员（成员 id → 名字），含自己。</summary>
+    public IReadOnlyDictionary<string, string> VoiceMembers => _voiceMembers;
+
+    /// <summary>除自己以外是否已有人在语音——后加入者据此改走被动加入，避免双方并发 offer 的 glare。</summary>
+    public bool HasOtherVoiceMembers => _voiceMembers.Keys.Any(id => id != _thisMemberId);
+
+    /// <summary>语音成员状态捎带包的类型标记（服务端 v1 没有 voice.state，先走 media.signal 的 voice 通道）。</summary>
+    public const string VoicePresenceType = "partyup.voice.presence";
 
     /// <summary>频道内当前共享列表（screen.state 的最新快照，UI 直接绑定）。</summary>
     public IReadOnlyList<ShareDto> Shares { get; private set; } = Array.Empty<ShareDto>();
@@ -145,9 +180,14 @@ public sealed class ShareSession : IAsyncDisposable
                     return;
                 }
                 SignalsOut++;
-                // offer 广播给频道（观看方据此应答）；answer/candidate 只回给共享方。
-                var to = kind == PuSignalKind.Offer ? null : _remoteSharerId;
-                ForwardAsync(kindName, ev.SignalPayload, to);
+                // 语音与屏幕共享共用同一条 media.signal、也共用同一个 PeerConnection，
+                // 所以不能用「当前是否在语音」来猜 media：语音时开始共享，第一个 offer 里已经带 video。
+                // 直接看 SDP：带 m=video 的 offer/answer 就是屏幕共享的协商，纯音频才是语音。
+                var hasVideo = ev.SignalPayload.Contains("m=video", StringComparison.Ordinal);
+                var media = hasVideo ? "screen" : (_voiceJoined || IsSharing ? "voice" : "screen");
+                // offer 广播给频道；answer/candidate 定向回最后一个给我们发 offer 的人。
+                var to = kind == PuSignalKind.Offer ? null : _signalPeerId;
+                ForwardAsync(media, kindName, ev.SignalPayload, to);
                 break;
             }
             case MediaEventKind.RemoteFrame:
@@ -168,14 +208,14 @@ public sealed class ShareSession : IAsyncDisposable
         }
     }
 
-    private void ForwardAsync(string kind, string payload, string? to)
+    private void ForwardAsync(string media, string kind, string payload, string? to)
     {
         _ = Task.Run(async () =>
         {
             try
             {
-                await _connection.SendMediaSignalAsync(_channelId, "screen", kind, payload, to);
-                AppLog.Info($"share: signal out kind={kind} to={to ?? "(broadcast)"} bytes={payload.Length}");
+                await _connection.SendMediaSignalAsync(_channelId, media, kind, payload, to);
+                AppLog.Info($"media: signal out media={media} kind={kind} to={to ?? "(broadcast)"} bytes={payload.Length}");
             }
             catch (Exception ex)
             {
@@ -188,16 +228,166 @@ public sealed class ShareSession : IAsyncDisposable
 
     private void OnMediaSignal(MediaSignalDto signal)
     {
+        // 语音成员状态捎带包：本地处理，不喂媒体核心（服务端 v1 没有 voice.state）。
+        if (signal.Media == "voice" && TryHandleVoicePresence(signal))
+        {
+            Changed?.Invoke();
+            return;
+        }
+        if (signal.Media == "voice")
+        {
+            MarkVoiceMember(signal);
+        }
         if (signal.Kind == "offer")
         {
-            // 谁是共享方由服务端信封里的 from 决定；应答要回到这个人。
-            _remoteSharerId = signal.From;
-            _remoteSharerName = string.IsNullOrEmpty(signal.FromName) ? signal.From ?? "?" : signal.FromName;
-            AppLog.Info($"share: offer from {_remoteSharerName} ({signal.From}), hand to media core");
+            // 应答要回到「给我们发 offer 的人」——语音与共享共用这一条。
+            _signalPeerId = signal.From;
+            // SDP 里带 m=video 才是屏幕共享的协商（语音 offer 只有 audio）；不能靠 media 标签，
+            // 因为语音中再开始共享时，同一 PC 的重协商 offer 也会被标成 voice。
+            var isVideoOffer = signal.Payload.Contains("m=video", StringComparison.Ordinal);
+            if (isVideoOffer)
+            {
+                _remoteSharerId = signal.From;
+                _remoteSharerName = string.IsNullOrEmpty(signal.FromName) ? signal.From ?? "?" : signal.FromName;
+                RemoteFrames = 0;
+            }
+            AppLog.Info($"media: offer from {signal.FromName} ({signal.From}) media={signal.Media} " +
+                        $"video={isVideoOffer}, hand to media core");
         }
         SignalsIn++;
         _inbound.Writer.TryWrite(signal.Payload);
         Changed?.Invoke();
+    }
+
+    // ------------------------------------------------------------------
+    // 语音
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// 加入语音。<paramref name="passive"/>=true 时只加音频轨、等对方 offer（后加入的一方必须这样，
+    /// 见 <see cref="HasOtherVoiceMembers"/>）。
+    /// </summary>
+    public async Task JoinVoiceAsync(bool passive, CancellationToken ct = default)
+    {
+        if (_voiceJoined) return;
+        LastError = null;
+        var rc = _engine.VoiceJoin(_channelId, mode: 1 /* direct */, passive);
+        if (rc != 0)
+        {
+            LastError = $"pu_voice_join 返回 {rc}：{_engine.LastErrorText()}";
+            AppLog.Fail("voice: " + LastError);
+            Changed?.Invoke();
+            return;
+        }
+        _voiceJoined = true;
+        _voiceMuted = false;
+        _voiceDeafened = false;
+        _voiceMembers[_thisMemberId] = _thisMemberName;
+        AppLog.Pass($"voice: joined channel={_channelId} mode=direct passive={passive}");
+        ForwardAsync("voice", "candidate", BuildVoicePresence("join", passive), null);
+        Changed?.Invoke();
+        await Task.CompletedTask;
+    }
+
+    public async Task LeaveVoiceAsync(CancellationToken ct = default)
+    {
+        if (!_voiceJoined) return;
+        try
+        {
+            _engine.VoiceLeave();
+        }
+        finally
+        {
+            _voiceJoined = false;
+            _voiceMuted = false;
+            _voiceDeafened = false;
+            _voiceMembers.Remove(_thisMemberId);
+            AppLog.Info("voice: left");
+            ForwardAsync("voice", "candidate", BuildVoicePresence("leave", false), null);
+            Changed?.Invoke();
+        }
+        await Task.CompletedTask;
+    }
+
+    /// <summary>切换麦克风静音，返回 pu_voice_set_mute 原始返回码（验收要看 OK=0）。</summary>
+    public int ToggleVoiceMute()
+    {
+        if (!_voiceJoined) return (int)PuStatus.State;
+        var next = !_voiceMuted;
+        var rc = _engine.VoiceSetMute(next);
+        if (rc == 0) _voiceMuted = next;
+        AppLog.Pass($"voice: set_mute({(next ? 1 : 0)}) rc={rc}");
+        Changed?.Invoke();
+        return rc;
+    }
+
+    /// <summary>切换扬声器静音（deafen），返回 pu_voice_set_deafen 原始返回码。</summary>
+    public int ToggleVoiceDeafen()
+    {
+        if (!_voiceJoined) return (int)PuStatus.State;
+        var next = !_voiceDeafened;
+        var rc = _engine.VoiceSetDeafen(next);
+        if (rc == 0) _voiceDeafened = next;
+        AppLog.Pass($"voice: set_deafen({(next ? 1 : 0)}) rc={rc}");
+        Changed?.Invoke();
+        return rc;
+    }
+
+    /// <summary>
+    /// 语音成员状态捎带包。服务端 v1 的 presence 只有 online、也没有 voice.state，
+    /// 所以先复用 media.signal（media=voice, kind=candidate）传一小段 JSON；
+    /// 收端识别到 <see cref="VoicePresenceType"/> 就本地处理、不喂媒体核心。
+    /// 服务端实现 voice.state 后应删掉这条路径。
+    /// </summary>
+    private static string BuildVoicePresence(string action, bool passive) =>
+        JsonSerializer.Serialize(new
+        {
+            type = VoicePresenceType,
+            action,
+            passive,
+        });
+
+    /// <summary>收到语音成员状态包时更新成员表；返回 true 表示这条 payload 不该再喂媒体核心。</summary>
+    private bool TryHandleVoicePresence(MediaSignalDto signal)
+    {
+        if (string.IsNullOrEmpty(signal.Payload) ||
+            !signal.Payload.Contains(VoicePresenceType, StringComparison.Ordinal))
+        {
+            return false;
+        }
+        try
+        {
+            using var doc = JsonDocument.Parse(signal.Payload);
+            var root = doc.RootElement;
+            if (!root.TryGetProperty("type", out var type) ||
+                type.GetString() != VoicePresenceType)
+            {
+                return false;
+            }
+            var action = root.TryGetProperty("action", out var a) ? a.GetString() : "join";
+            var name = string.IsNullOrEmpty(signal.FromName) ? signal.From ?? "?" : signal.FromName;
+            if (string.Equals(action, "leave", StringComparison.Ordinal))
+            {
+                _voiceMembers.Remove(signal.From!);
+            }
+            else
+            {
+                _voiceMembers[signal.From!] = name;
+            }
+            AppLog.Info($"voice: peer presence {action} member={name} ({signal.From})");
+            return true;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    private void MarkVoiceMember(MediaSignalDto signal)
+    {
+        if (string.IsNullOrEmpty(signal.From)) return;
+        var name = string.IsNullOrEmpty(signal.FromName) ? signal.From : signal.FromName;
+        _voiceMembers[signal.From] = name;
     }
 
     private void OnScreenState(ScreenStateDto state)
@@ -251,6 +441,11 @@ public sealed class ShareSession : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        if (_voiceJoined)
+        {
+            try { _engine.VoiceLeave(); } catch { /* 收尾尽力而为 */ }
+            _voiceJoined = false;
+        }
         _connection.MediaSignalReceived -= OnMediaSignal;
         _connection.ScreenStateChanged -= OnScreenState;
         _inbound.Writer.TryComplete();

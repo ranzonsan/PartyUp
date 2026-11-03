@@ -1743,10 +1743,13 @@ int MediaEngine::SignalIn(const char* payload, size_t len, std::string* error) {
       return reject(PU_ERR_STATE,
                     "received an offer while sharing (glare): ABI v2 has no perfect negotiation");
     }
+    // 本端是观看方（不是共享方）却还留着一个 PC：那是上一轮共享会话的 answerer
+    // 残留。共享方「停止 → 再开始」在 ABI v2 里是**一个新的共享会话**，不是重协商，
+    // 所以这里必须把旧 answerer 会话整个拆掉，再按新 offer 建一个新的。
+    // 仍然不做 renegotiation —— 同一个会话里不会出现第二个 offer 走这条路。
     if (pc_ != nullptr) {
-      return reject(PU_ERR_STATE,
-                    "received a second offer on an answerer connection "
-                    "(renegotiation is not supported in ABI v2)");
+      Log(3, "offer: dropping stale answerer session (pc exists, local is viewer)");
+      ReleaseStreamObjects();
     }
     std::string local_error;
     if (!EnsurePeerConnection(/*for_sending=*/false, &local_error)) {

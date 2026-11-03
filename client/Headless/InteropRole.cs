@@ -322,14 +322,10 @@ internal static class InteropRole
                     firstFrameAt ??= DateTime.UtcNow;
                     lastFrameAt = DateTime.UtcNow;
                 }
-                var runningFor = (DateTime.UtcNow - startedAt).TotalSeconds;
-                // 共享方停推 4 秒以上视为共享结束；否则至少看满 18 秒，帧率/CPU 统计才稳定。
+                // 共享方停推超过 8 秒才认为共享彻底结束（留出「停止→再开始」的间隔）；
+                // 不按「收到 N 帧就退」，否则观看方会在共享方重启前提前退出，测不出重启后的链路。
                 if (session.RemoteFrames >= 10 && lastFrameAt is { } idleSince &&
-                    (DateTime.UtcNow - idleSince).TotalSeconds > 4)
-                {
-                    break;
-                }
-                if (session.RemoteFrames >= 30 && runningFor >= 18)
+                    (DateTime.UtcNow - idleSince).TotalSeconds > 8)
                 {
                     break;
                 }

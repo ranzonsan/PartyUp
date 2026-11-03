@@ -84,6 +84,14 @@ public sealed class ShareSession : IAsyncDisposable
     /// <summary>开始共享一个源：先让媒体核心开机，再向服务端登记 screen.start。</summary>
     public async Task StartSharingAsync(MediaSource source, CancellationToken ct = default)
     {
+        // 记录真正传给 native 的值：空 id 会被 native 当成合成源，绝不允许静默降级。
+        AppLog.Info($"share: start id=\"{source.Id}\" title=\"{source.Title}\" " +
+                    $"size={source.Width}x{source.Height} kind={source.Kind}");
+        if (string.IsNullOrWhiteSpace(source.Id))
+        {
+            throw new InvalidOperationException(
+                "共享源 id 为空：native 会把空 id 当成合成源，已拒绝启动（请重新选择显示器）");
+        }
         LastError = null;
         _engine.StartScreen(source.Id);
         await _connection.StartScreenAsync(

@@ -491,6 +491,8 @@ public sealed partial class MainViewModel : ObservableObject
         {
             return;
         }
+        // 记录停止时下拉框还选着什么：第二次点开始若 id 变空，就是这里之后被清掉的。
+        AppLog.Info($"share: stop, selected={SelectedSource?.Id ?? "(null)"}");
         try
         {
             await _share.StopSharingAsync();

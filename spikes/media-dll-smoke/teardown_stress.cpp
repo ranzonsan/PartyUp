@@ -491,6 +491,50 @@ int main(int argc, char** argv) {
   const char* orders[] = {"viewer-first", "media", "signaling", "abrupt", "sharer-first"};
   int failures = 0;
 
+  // ---- 专用模式：共享方「停止 → 再开始」，观看方引擎全程存活 ----
+  // 这是「停止共享后再开始、对端零帧」的回归入口：观看方的 answerer PC 会跨轮
+  // 残留，第二轮 offer 必须能把旧会话拆掉重建（否则 pu_signal_in 返回 -2）。
+  if (order == "restart") {
+    pu_engine* host = CreateEngine("restart-host");
+    pu_engine* viewer = CreateEngine("restart-viewer");
+    if (host == nullptr || viewer == nullptr) {
+      LogLine("FAIL: create engine returned null: %s", pu_last_error(nullptr));
+      if (host != nullptr) pu_engine_destroy(host);
+      if (viewer != nullptr) pu_engine_destroy(viewer);
+      return 1;
+    }
+    int round_failures = 0;
+    for (int round = 1; round <= iterations; ++round) {
+      Phase("restart round %d: start", round);
+      const int start_rc = pu_screen_start(host, source.c_str());
+      if (start_rc != PU_OK) {
+        LogLine("FAIL: round %d pu_screen_start rc=%d (%s)", round, start_rc,
+                pu_last_error(host));
+        ++round_failures;
+        break;
+      }
+      Tally tally_host;
+      Tally tally_viewer;
+      const bool connected = ExchangeUntilConnected(host, viewer, &tally_host,
+                                                    &tally_viewer, min_frames,
+                                                    connect_timeout_ms);
+      LogLine(
+          "round %d: connected=%d host.frames=%d viewer.remote=%d "
+          "host.signals=%d viewer.signals=%d",
+          round, connected ? 1 : 0, tally_host.frames, tally_viewer.remote_frames,
+          tally_host.signals, tally_viewer.signals);
+      if (!connected || tally_viewer.remote_frames < min_frames) ++round_failures;
+      const int stop_rc = pu_screen_stop(host);
+      LogLine("round %d: pu_screen_stop rc=%d", round, stop_rc);
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    pu_engine_destroy(viewer);
+    pu_engine_destroy(host);
+    std::printf("\nRESULT: %s (%d restart round(s), failures=%d)\n",
+                round_failures == 0 ? "PASS" : "FAIL", iterations, round_failures);
+    return round_failures == 0 ? 0 : 2;
+  }
+
   for (int iteration = 1; iteration <= iterations; ++iteration) {
     g_iteration.store(iteration);
     BeginIterationLog(iteration);

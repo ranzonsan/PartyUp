@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -44,7 +45,12 @@ func newTestEnv(t *testing.T) *testEnv {
 		t.Fatalf("open store: %v", err)
 	}
 
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	logHandler := io.Discard
+	var logOut io.Writer = logHandler
+	if os.Getenv("PARTYUP_TEST_LOG") != "" {
+		logOut = os.Stderr
+	}
+	logger := slog.New(slog.NewTextHandler(logOut, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	srv := server.New(st, server.Options{Name: "test-server", Version: "0.0.0-test", Logger: logger})
 
 	info, err := srv.EnsureFirstRun(context.Background())

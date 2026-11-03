@@ -60,6 +60,14 @@ const (
 	TypeScreenStop  = "screen.stop"
 	TypeScreenState = "screen.state"
 	TypeMediaSignal = "media.signal"
+
+	// 语音（PROTOCOL.md §4）。relay 模式由服务端 SFU 中继，direct 模式走 media.signal 直连。
+	TypeVoiceJoin      = "voice.join"
+	TypeVoiceLeave     = "voice.leave"
+	TypeVoiceSetMode   = "voice.set_mode"
+	TypeVoiceSetMute   = "voice.set_mute"
+	TypeVoiceSetDeafen = "voice.set_deafen"
+	TypeVoiceState     = "voice.state"
 )
 
 // TypeOK 返回请求类型对应的成功响应类型：`text.send` → `text.send.ok`。
@@ -327,20 +335,27 @@ type ScreenStatePayload struct {
 type MediaSignalRequest struct {
 	ChannelID string `json:"channel_id"`
 	To        string `json:"to,omitempty"`
-	Media     string `json:"media"` // screen | voice
-	Kind      string `json:"kind"`  // offer | answer | candidate
-	Payload   string `json:"payload"`
+	// Target 明确指定接收方：省略 = 按 To/广播处理（direct 模式，发给成员）；
+	// "sfu" = 交给服务端 SFU（relay 模式，offer/answer/candidate 的对象都是服务端）。
+	// 不靠猜：relay 与 direct 的信令信封长得一样，只有这个字段能区分。
+	Target  string `json:"target,omitempty"`
+	Media   string `json:"media"` // screen | voice
+	Kind    string `json:"kind"`  // offer | answer | candidate
+	Payload string `json:"payload"`
 }
 
 // MediaSignalPush 是服务端下发的媒体信令（media.signal），字段与上行一致，
 // 另加发送方身份，接收方据此决定把 answer/candidate 发给谁。
 type MediaSignalPush struct {
 	ChannelID string `json:"channel_id"`
-	From      string `json:"from"`
-	FromName  string `json:"from_name"`
-	Media     string `json:"media"`
-	Kind      string `json:"kind"`
-	Payload   string `json:"payload"`
+	// Target 与上行一致："sfu" 表示这条信令的对象是服务端 SFU（relay 模式），
+	// 空表示对象是频道内成员（direct 模式）。
+	Target   string `json:"target,omitempty"`
+	From     string `json:"from"`
+	FromName string `json:"from_name"`
+	Media    string `json:"media"`
+	Kind     string `json:"kind"`
+	Payload  string `json:"payload"`
 }
 
 // ScreenStartOK / ScreenStopOK / MediaSignalOK 是三类共享信令的成功响应载荷。
@@ -355,4 +370,60 @@ type ScreenStopOK struct {
 
 type MediaSignalOK struct {
 	ChannelID string `json:"channel_id"`
+}
+
+// ------------------------------------------------------------------
+// 语音（PROTOCOL.md §4）与 SFU 中继（§4.1）
+// ------------------------------------------------------------------
+
+// VoiceJoinRequest 是 voice.join 的上行载荷。mode ∈ {relay, direct}：
+// relay 由服务端 SFU 中继（每成员一个 PeerConnection），direct 走 1:1 直连信令。
+type VoiceJoinRequest struct {
+	ChannelID string `json:"channel_id"`
+	Mode      string `json:"mode"`
+}
+
+// VoiceLeaveRequest 是 voice.leave 的上行载荷。
+type VoiceLeaveRequest struct {
+	ChannelID string `json:"channel_id"`
+}
+
+// VoiceSetModeRequest 是 voice.set_mode 的上行载荷：整频道切换中继/直连。
+type VoiceSetModeRequest struct {
+	ChannelID string `json:"channel_id"`
+	Mode      string `json:"mode"`
+}
+
+// VoiceSetMuteRequest / VoiceSetDeafenRequest 上报本端静音状态，供 voice.state 广播。
+// v1 的静音只作用于本地 ADM，但别人需要看到「谁静音了」，所以必须上报。
+type VoiceSetMuteRequest struct {
+	ChannelID string `json:"channel_id"`
+	Muted     bool   `json:"muted"`
+}
+
+type VoiceSetDeafenRequest struct {
+	ChannelID string `json:"channel_id"`
+	Deafened  bool   `json:"deafened"`
+}
+
+// VoiceMemberState 是 voice.state 里的一个成员条目。
+type VoiceMemberState struct {
+	MemberID string `json:"member_id"`
+	Muted    bool   `json:"muted"`
+	Deafened bool   `json:"deafened"`
+}
+
+// VoiceStatePayload 是 voice.state 推送的载荷（频道内语音成员快照）。
+type VoiceStatePayload struct {
+	ChannelID string             `json:"channel_id"`
+	Mode      string             `json:"mode"` // relay | direct
+	Members   []VoiceMemberState `json:"members"`
+}
+
+// VoiceJoinOK 是 voice.join 的响应：把服务端选定的传输方式回给客户端，
+// 客户端据此决定是「等 media.signal offer（relay）」还是「自己发 offer（direct）」。
+type VoiceJoinOK struct {
+	ChannelID string `json:"channel_id"`
+	Mode      string `json:"mode"`
+	Transport string `json:"transport"` // relay | direct
 }

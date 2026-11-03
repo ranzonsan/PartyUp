@@ -1,8 +1,8 @@
 // WebSocket 会话中心。
 //
 // 一条 WS 连接对应一个成员（PROTOCOL.md §0）。消息分两类：
-//   * 请求/响应：客户端发 <type>，服务端回 <type>.ok / <type>.err，响应 id 与请求 id 相同（配对用）；
-//   * 推送：text.new / presence / ping，带服务端自己生成的 id。
+//   - 请求/响应：客户端发 <type>，服务端回 <type>.ok / <type>.err，响应 id 与请求 id 相同（配对用）；
+//   - 推送：text.new / presence / ping，带服务端自己生成的 id。
 //
 // 会话状态（订阅集合、成员身份）全在内存里；重启即断开，客户端重连重订阅。
 // 这正是 v1 的语义（PROTOCOL.md §8 的断线重连细节仍是待定项）。
@@ -21,6 +21,7 @@ import (
 
 	"partyup/internal/auth"
 	"partyup/internal/protocol"
+	"partyup/internal/sfu"
 	"partyup/internal/store"
 )
 
@@ -51,18 +52,27 @@ type Hub struct {
 	shares map[string]map[string]protocol.ShareState
 
 	upgrader websocket.Upgrader
+
+	// 语音（PROTOCOL.md §4）。这三张表都受 h.mu 保护，与 subs 共用一把锁，
+	// 避免出现「持 A 锁等 B 锁」的嵌套死锁；房间自身另有锁，调用房间方法时不持 h.mu。
+	voice     map[string]map[string]protocol.VoiceMemberState // channel_id → member_id → 状态
+	voiceMode map[string]string                               // channel_id → relay | direct
+	rooms     map[string]*sfu.Room                            // channel_id → 中继房间（仅 relay）
 }
 
 // NewHub 构造会话中心。
 func NewHub(st *store.Store, log *slog.Logger, name, version string) *Hub {
 	return &Hub{
-		store:   st,
-		log:     log,
-		name:    name,
-		version: version,
-		conns:   make(map[*conn]struct{}, 8),
-		subs:    make(map[string]map[*conn]struct{}, 8),
-		shares:  make(map[string]map[string]protocol.ShareState, 4),
+		store:     st,
+		log:       log,
+		name:      name,
+		version:   version,
+		conns:     make(map[*conn]struct{}, 8),
+		subs:      make(map[string]map[*conn]struct{}, 8),
+		shares:    make(map[string]map[string]protocol.ShareState, 4),
+		voice:     make(map[string]map[string]protocol.VoiceMemberState, 4),
+		voiceMode: make(map[string]string, 4),
+		rooms:     make(map[string]*sfu.Room, 4),
 		upgrader: websocket.Upgrader{
 			HandshakeTimeout: 10 * time.Second,
 			// 桌面客户端不是浏览器，没有同源概念；放开 Origin 检查。
@@ -145,6 +155,8 @@ func (h *Hub) remove(c *conn) {
 	for _, ch := range sharesChanged {
 		h.broadcastScreenState(ch)
 	}
+	// 语音同理：断线即视为离开语音（连接是成员存在的唯一凭据）。
+	h.leaveVoiceEverywhere(c.member.ID)
 }
 
 // subscribe 把连接加入频道订阅，并广播一次 presence。
@@ -171,6 +183,8 @@ func (h *Hub) unsubscribe(c *conn, channelID string) {
 	h.mu.Unlock()
 	if existed {
 		h.broadcastPresence(channelID)
+		// 退订频道等同离开该频道的语音：否则频道里会挂着「幽灵语音成员」。
+		h.leaveVoiceChannel(c.member.ID, channelID)
 	}
 }
 
@@ -397,6 +411,16 @@ func (c *conn) handle(env protocol.Envelope) {
 		c.handleScreenStop(env)
 	case protocol.TypeMediaSignal:
 		c.handleMediaSignal(env)
+	case protocol.TypeVoiceJoin:
+		c.handleVoiceJoin(env)
+	case protocol.TypeVoiceLeave:
+		c.handleVoiceLeave(env)
+	case protocol.TypeVoiceSetMode:
+		c.handleVoiceSetMode(env)
+	case protocol.TypeVoiceSetMute:
+		c.handleVoiceSetMute(env)
+	case protocol.TypeVoiceSetDeafen:
+		c.handleVoiceSetDeafen(env)
 	default:
 		c.replyError(env.Type, protocol.CodeInvalidArgument, "unknown message type "+env.Type, env.ID)
 	}
@@ -854,6 +878,26 @@ func (c *conn) handleMediaSignal(env protocol.Envelope) {
 	}
 	if len(req.Payload) > protocol.MaxSignalPayload {
 		c.replyError(env.Type, protocol.CodeInvalidArgument, "payload too large", env.ID)
+		return
+	}
+
+	// relay 模式：这条信令的对象是服务端 SFU（offer 由服务端发，客户端只回 answer/candidate）。
+	// 用显式 target 区分 relay 与 direct，绝不靠 media/kind 猜——两条路径的信封长得一样。
+	if target := strings.TrimSpace(req.Target); target == "sfu" {
+		if media != "voice" {
+			c.replyError(env.Type, protocol.CodeInvalidArgument,
+				"target=sfu is only valid for media=voice", env.ID)
+			return
+		}
+		if err := c.hub.handleVoiceSignal(c.member.ID, channelID, kind, req.Payload); err != nil {
+			code := protocol.CodeInvalidArgument
+			if errors.Is(err, sfu.ErrNotInRoom) {
+				code = protocol.CodeConflict
+			}
+			c.replyError(env.Type, code, err.Error(), env.ID)
+			return
+		}
+		c.replyOK(env, protocol.MediaSignalOK{ChannelID: channelID})
 		return
 	}
 

@@ -78,27 +78,72 @@ HTTP 请求/响应体形状（2026-11-02 落地，此前文档未定义）：
 
 ## 4. 语音
 
-- `voice.join { channel_id, mode }`，`mode ∈ { relay, direct }`
+- `voice.join { channel_id, mode }`，`mode ∈ { relay, direct }`（缺省 `direct`）。
+  响应 `voice.join.ok { channel_id, mode, transport }`。
+  **频道模式由第一个加入者决定**；后续加入者传不同的 `mode` 会拿到 `CONFLICT`，要整频道切换用 `voice.set_mode`。
 - `voice.leave { channel_id }`
-- `voice.set_mode { channel_id, mode }` —— 只允许整频道切换
+- `voice.set_mode { channel_id, mode }` —— 只允许整频道切换。切换时服务端关掉旧的中继房间，
+  并在 relay 侧按当前成员表重建（每个成员会收到新的 `media.signal` offer）。
+- `voice.set_mute { channel_id, muted }` / `voice.set_deafen { channel_id, deafened }`
+  —— 上报本端静音/闭音状态。本地 ADM 状态仍由客户端自己控制；上报是为了让别人看见（`voice.state`）。
 - 广播 `voice.state { channel_id, mode, members: [{ member_id, muted, deafened }] }`
+  —— `members` 按 `member_id` 排序，稳定可比对。
+  这取代了 2026-11-03 客户端临时代码：当时服务端还没有语音状态，客户端只能借
+  `media.signal`（`media=voice, kind=candidate`）捎带 `{"type":"partyup.voice.presence",...}`。
+  客户端接上本节的 `voice.state` 后应删除那条 stopgap。
 
-### 4.1 中继
+### 4.1 中继（服务端 SFU，`mode=relay`）
 
-成员加入后服务端下发：
+**服务端是 offerer**：`voice.join` 成功后，服务端为该成员单独建一个 `PeerConnection`，并下发：
 
 ```json
-{ "type": "media.offer", "payload": { "channel_id": "...", "media": "voice",
-  "transport": "relay", "session_id": "...", "sdp": "v=0..." } }
+{ "type": "media.signal", "payload": {
+  "channel_id": "...", "target": "sfu", "from": "sfu", "from_name": "sfu",
+  "media": "voice", "kind": "offer",
+  "payload": "{\"type\":\"offer\",\"sdp\":\"v=0...\",\"session_id\":\"relay/<member_id>\"}" } }
 ```
 
-客户端媒体核心 `setRemoteDescription` 后回 `media.answer { session_id, sdp }`。ICE 候选随 SDP 一起（trickle 后续再加）。
+客户端把 `payload`（不透明字符串）交给媒体核心 `setRemoteDescription`，再回：
+
+```json
+{ "type": "media.signal", "payload": {
+  "channel_id": "...", "target": "sfu", "media": "voice", "kind": "answer",
+  "payload": "{\"type\":\"answer\",\"sdp\":\"v=0...\"}" } }
+```
+
+服务端 `SetRemoteDescription(answer)` 之后媒体通路建立。ICE 候选随 SDP 一起下发（非 trickle）；
+`kind=candidate` 也接受，留作将来 trickle 兼容。
+
+**相对本文件 2026-11-03 之前的草案改了两处**（原草案是 `media.offer { transport, session_id, sdp }`
++ 客户端回 `media.answer { session_id, sdp }`）：
+
+1. 合并成一条 `media.signal`，用显式 `target: "sfu"` 区分「对象是服务端」还是「对象是频道成员」。
+   两条路径的 payload 长得一模一样（都是媒体核心的信封字符串），只靠 `media`/`kind` 猜一定会错；
+   显式 `target` 让服务端与客户端都能一眼分流。`to`（成员 id）在 `target="sfu"` 时被忽略。
+2. 明确「服务端是 offerer」。SFU 需要在成员进出时改变「收谁的音」；如果客户端是 offerer，
+   每次成员变化都要服务端反向发起重协商，而 ABI v2 的媒体核心在 answerer 侧遇到第二个 offer
+   会丢弃旧会话重建（见提交 `00501b1`），代价是重新 ICE。改成服务端 offerer 之后，配合
+   **预协商槽位**，一次 offer/answer 就够：
+
+- 每个成员的 SDP 固定包含 1 条 `recvonly` 音频 m-line（服务端收他的麦克风）+
+  `MaxRemoteSlots = 12` 条 `sendonly` 音频 m-line（服务端往这些槽里填别人的声音）。
+- 成员进出只在空槽上 `ReplaceTrack`，**不产生重协商**；客户端一辈子只处理一次 offer/answer。
+- 服务端 `OnTrack` 收到某成员音频后，写进一条 `TrackLocalStaticRTP`，再挂到其他每个成员的
+  空闲槽上 —— 这就是「A 的声音同时转给 B 和 C」。
+- 槽位 12 ⇒ 中继语音每频道最多 **13 人**（12 个远端 + 自己）。超过时新发布者分配槽位失败
+  会打 warn 并跳过那一路（该成员对那部分人不可闻），不会崩。
+- 中继模式下**客户端不要给服务端发 offer**；收到 `kind=offer` 应理解成「服务端在协商」，只回 answer。
+
+服务端实现见 `server/internal/sfu/room.go`（房间）与 `server/internal/server/voice.go`（协议接线），
+端到端测试见 `server/internal/server/voice_relay_test.go`（2 人 / 3 人中继 + voice.state）。
 
 ### 4.2 直连
 
 服务端只做中转与定向投递，不解析也不改写 SDP：
 
-- `media.signal { channel_id, to?, media, kind, payload }`
+- `media.signal { channel_id, target?, to?, media, kind, payload }`
+  - `target` 省略 = 投递给频道成员（本节，direct 模式）；`target: "sfu"` = 交给服务端 SFU（§4.1，relay 模式）。
+    relay 下 `to` 被忽略；direct 下 `target` 必须为空。
   - `media ∈ { screen, voice }`；`kind ∈ { offer, answer, candidate }`
   - `payload` 是**媒体核心产出的原始信令信封字符串**（`{"type":"offer","sdp":"…"}` /
     `{"type":"answer","sdp":"…"}` / `{"type":"candidate","mid":"0","mline":0,"candidate":"…"}`）。

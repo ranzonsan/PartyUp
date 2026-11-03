@@ -192,6 +192,18 @@ func (p *relayPeer) readLoop() {
 	}
 }
 
+// failf 是 applyOffer 内部的断言出口：测试收尾时 cleanup 会先 close(p.closed)，
+// 此时还在飞的 offer 里任何失败都属预期噪声。若直接 p.t.Errorf，会在测试结束后
+// 触发 "Fail in goroutine after test has completed" panic（历史偶发，约 1/5）。
+func (p *relayPeer) failf(format string, args ...any) {
+	select {
+	case <-p.closed:
+		return
+	default:
+	}
+	p.t.Errorf(format, args...)
+}
+
 // applyOffer 把服务端 offer 吃进 pion，挂上麦克风，回 answer（target=sfu）。
 func (p *relayPeer) applyOffer(push protocol.MediaSignalPush) {
 	// 测试收尾会关连接/关 PC，此时还在飞的 offer 直接忽略，不要往已经关闭的 PC 上塞。
@@ -204,7 +216,7 @@ func (p *relayPeer) applyOffer(push protocol.MediaSignalPush) {
 		SDP string `json:"sdp"`
 	}
 	if err := json.Unmarshal([]byte(push.Payload), &msg); err != nil || msg.SDP == "" {
-		p.t.Errorf("%s: bad offer payload: %v", p.name, err)
+		p.failf("%s: bad offer payload: %v", p.name, err)
 		return
 	}
 	offer := webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: msg.SDP}
@@ -218,7 +230,7 @@ func (p *relayPeer) applyOffer(push protocol.MediaSignalPush) {
 		if p.pc.ConnectionState() == webrtc.PeerConnectionStateClosed {
 			return
 		}
-		p.t.Errorf("%s: set remote offer: %v", p.name, err)
+		p.failf("%s: set remote offer: %v", p.name, err)
 		return
 	}
 	// 服务端第一条 m-line 是它收我们麦克风的 recvonly；把已有 sendonly transceiver 的
@@ -234,18 +246,18 @@ func (p *relayPeer) applyOffer(push protocol.MediaSignalPush) {
 
 	answer, err := p.pc.CreateAnswer(nil)
 	if err != nil {
-		p.t.Errorf("%s: create answer: %v", p.name, err)
+		p.failf("%s: create answer: %v", p.name, err)
 		return
 	}
 	gathered := webrtc.GatheringCompletePromise(p.pc)
 	if err := p.pc.SetLocalDescription(answer); err != nil {
-		p.t.Errorf("%s: set local answer: %v", p.name, err)
+		p.failf("%s: set local answer: %v", p.name, err)
 		return
 	}
 	<-gathered
 	local := p.pc.LocalDescription()
 	if local == nil {
-		p.t.Errorf("%s: local description nil", p.name)
+		p.failf("%s: local description nil", p.name)
 		return
 	}
 	payload, _ := json.Marshal(map[string]string{"type": "answer", "sdp": local.SDP})
@@ -257,7 +269,7 @@ func (p *relayPeer) applyOffer(push protocol.MediaSignalPush) {
 		Payload:   string(payload),
 	})
 	if resp.Type != protocol.TypeOK(protocol.TypeMediaSignal) {
-		p.t.Errorf("%s: answer rejected: %s %s", p.name, resp.Type, resp.Payload)
+		p.failf("%s: answer rejected: %s %s", p.name, resp.Type, resp.Payload)
 	}
 }
 

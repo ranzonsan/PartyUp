@@ -56,6 +56,8 @@ type Hub struct {
 	// 语音（PROTOCOL.md §4）。这三张表都受 h.mu 保护，与 subs 共用一把锁，
 	// 避免出现「持 A 锁等 B 锁」的嵌套死锁；房间自身另有锁，调用房间方法时不持 h.mu。
 	voice map[string]map[string]protocol.VoiceMemberState // channel_id → member_id → 状态
+	// voiceSeq 是每频道的加入序号计数器：角色分配只依赖「加入顺序」，不看客户端自报。
+	voiceSeq map[string]int
 	// voiceMode 是**服务端级**策略（启动参数 --voice-mode），不是每频道可变量：
 	// 客户端无权选择传输方式，语音/共享走中继还是直连由运维配置决定。
 	voiceMode string
@@ -80,6 +82,7 @@ func NewHub(st *store.Store, log *slog.Logger, name, version, voiceMode, screenM
 		subs:       make(map[string]map[*conn]struct{}, 8),
 		shares:     make(map[string]map[string]protocol.ShareState, 4),
 		voice:      make(map[string]map[string]protocol.VoiceMemberState, 4),
+		voiceSeq:   make(map[string]int, 4),
 		voiceMode:  NormalizeVoiceMode(voiceMode),
 		screenMode: NormalizeScreenMode(screenMode),
 		sfuVideo:   false, // 视频通道待实现；实现后置 true

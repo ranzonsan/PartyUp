@@ -413,6 +413,15 @@ type VoiceMemberState struct {
 	MemberID string `json:"member_id"`
 	Muted    bool   `json:"muted"`
 	Deafened bool   `json:"deafened"`
+	// Role 是该成员在**直连（direct）协商中的角色，由服务端裁决**：
+	//   offerer  = 负责向频道内其他成员发 offer
+	//   answerer = 等待 offer 并应答
+	// 客户端不得再按「谁先来」自行推断——两端各自推断会在同时加入时得出
+	// 「双方都是 answerer」（都只看到对方、没看到自己），结果是没人发 offer、完全没声音。
+	// relay 模式下恒为 answerer（服务端 SFU 才是 offerer）。
+	Role string `json:"role"`
+	// JoinedSeq 是同一频道内单调递增的加入序号（仅用于诊断与稳定排序，不承诺跨会话语义）。
+	JoinedSeq int `json:"joined_seq,omitempty"`
 }
 
 // VoiceSlotState 是「第几个远端音频槽位 → 哪个成员」的映射项（仅 relay 模式有）。
@@ -446,4 +455,8 @@ type VoiceJoinOK struct {
 	// Transport 是服务端策略决定的传输方式：relay（服务端 SFU 中继）或 direct（P2P 直连）。
 	// 客户端必须按它走对应路径，不能自己选。
 	Transport string `json:"transport"`
+	// Role 是服务端给自己分配的直连协商角色（offerer / answerer）：
+	// 客户端在**创建 PeerConnection 之前**就要用它决定 passive，不能再靠本地推断。
+	// relay 模式下恒为 answerer（服务端 SFU 是 offerer）。
+	Role string `json:"role"`
 }

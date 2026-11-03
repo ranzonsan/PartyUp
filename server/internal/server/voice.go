@@ -184,6 +184,7 @@ func (h *Hub) detachVoiceMemberLocked(channelID, memberID string) (leave, close 
 		return nil, nil
 	}
 	delete(h.voice, channelID)
+	delete(h.voiceSeq, channelID) // 频道空了：加入序号从头开始，避免序号无限增长
 	room := h.rooms[channelID]
 	delete(h.rooms, channelID)
 	if room != nil {
@@ -272,7 +273,35 @@ func (c *conn) handleVoiceJoin(env protocol.Envelope) {
 	}
 	_, already := members[memberID]
 	if !already {
-		members[memberID] = protocol.VoiceMemberState{MemberID: memberID}
+		// 角色由服务端单一来源裁决（客户端只消费，不自行推断）：
+		//   - relay：服务端 SFU 是 offerer，所有成员都是 answerer；
+		//   - direct：频道里还没人 → answerer（先等着，别对着空气发 offer）；
+		//     只有一人且他还不是 offerer → 新来者当 offerer（两人一进一退，确定）；
+		//     已有一对在通话 → 新来者 answerer（三人及以上的 mesh 暂不支持，
+		//     但绝不能因为第三个人进来就把已在通话的两人的 PC 拆了）。
+		role := "answerer"
+		if h.voiceMode == "direct" {
+			others := 0
+			hasOfferer := false
+			for id, m := range members {
+				if id == memberID {
+					continue
+				}
+				others++
+				if m.Role == "offerer" {
+					hasOfferer = true
+				}
+			}
+			if others == 1 && !hasOfferer {
+				role = "offerer"
+			}
+		}
+		h.voiceSeq[channelID]++
+		members[memberID] = protocol.VoiceMemberState{
+			MemberID:  memberID,
+			Role:      role,
+			JoinedSeq: h.voiceSeq[channelID],
+		}
 	}
 	h.mu.Unlock()
 
@@ -291,11 +320,27 @@ func (c *conn) handleVoiceJoin(env protocol.Envelope) {
 		}
 	}
 
-	c.replyOK(env, protocol.VoiceJoinOK{ChannelID: channelID, Transport: h.voiceMode})
+	// 在 voice.join.ok 里直接回自己的角色：客户端在「建 PC 之前」就要知道 passive 与否，
+	// 不能等 voice.state 广播（那会晚一步，先建错 PC 再拆）。
+	c.replyOK(env, protocol.VoiceJoinOK{
+		ChannelID: channelID,
+		Transport: h.voiceMode,
+		Role:      h.memberRole(channelID, memberID),
+	})
 	if !already {
 		h.log.Info("voice: joined", "channel", channelID, "member", memberID, "transport", h.voiceMode)
 		h.broadcastVoiceState(channelID)
 	}
+}
+
+// memberRole 读取某成员在当前频道的服务端角色（不在语音里返回空）。
+func (h *Hub) memberRole(channelID, memberID string) string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if m, ok := h.voice[channelID][memberID]; ok {
+		return m.Role
+	}
+	return ""
 }
 
 func (c *conn) handleVoiceLeave(env protocol.Envelope) {

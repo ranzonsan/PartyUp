@@ -59,7 +59,11 @@ public sealed record MediaSignalDto(
     string Payload);
 
 /// <summary>voice.state 里的一个语音成员（PROTOCOL.md §4）。</summary>
-public sealed record VoiceMemberDto(string MemberId, bool Muted, bool Deafened);
+/// <summary>
+/// voice.state.members 的一项。Role 是**服务端裁决的直连协商角色**（offerer / answerer）：
+/// 客户端不再按「谁先来」推断，否则两端同时加入会都判 answerer、没人发 offer。
+/// </summary>
+public sealed record VoiceMemberDto(string MemberId, bool Muted, bool Deafened, string? Role);
 
 /// <summary>
 /// voice.state.slots 的一项：第 <paramref name="Index"/> 个远端音频槽位转发的是哪个成员。
@@ -75,8 +79,11 @@ public sealed record VoiceStateDto(
     IReadOnlyList<VoiceMemberDto> Members,
     IReadOnlyList<VoiceSlotDto>? Slots);
 
-/// <summary>voice.join / voice.leave / voice.set_mode / set_mute / set_deafen 的响应。</summary>
-public sealed record VoiceAckDto(string ChannelId, string? Mode, string? Transport);
+/// <summary>
+/// voice.join / voice.leave / voice.set_mode / set_mute / set_deafen 的响应。
+/// Role 只有 voice.join.ok 会填（offerer / answerer）：客户端在建 PC 之前/之后都用它对齐。
+/// </summary>
+public sealed record VoiceAckDto(string ChannelId, string? Mode, string? Transport, string? Role);
 
 /// <summary>通用信封。v=1 由协议固定；Payload 原样保留，按消息类型再反序列化。</summary>
 public sealed record EnvelopeDto(int V, string Id, string Type, long Ts, JsonElement? Payload);

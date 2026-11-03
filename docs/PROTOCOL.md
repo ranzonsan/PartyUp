@@ -93,16 +93,33 @@ HTTP 请求/响应体形状（2026-11-02 落地，此前文档未定义）：
 
 - `voice.join { channel_id }` —— 上行载荷**只有** `channel_id`。
   客户端即使多传一个 `mode` 字段也会被服务端忽略（协议不再定义该字段）。
-  响应 `voice.join.ok { channel_id, transport }`，`transport ∈ { relay, direct }`
-  是服务端实际策略值。
+  响应 `voice.join.ok { channel_id, transport, role }`，`transport ∈ { relay, direct }`
+  是服务端实际策略值；`role ∈ { offerer, answerer }` 是**服务端给自己分配的直连协商角色**
+  （见下条「角色由服务端裁决」），relay 下恒为 `answerer`。
 - `voice.leave { channel_id }`
 - `voice.set_mute { channel_id, muted }` / `voice.set_deafen { channel_id, deafened }`
   —— 上报本端静音/闭音状态。本地 ADM 状态仍由客户端自己控制；上报是为了让别人看见（`voice.state`）。
 - 广播 `voice.state { channel_id, voice_mode, screen_mode,
-  members: [{ member_id, muted, deafened }], slots?: [{ index, member_id, muted }] }`
+  members: [{ member_id, muted, deafened, role, joined_seq? }],
+  slots?: [{ index, member_id, muted }] }`
   —— `voice_mode` / `screen_mode` 是两条独立策略的服务端实际值（`relay|direct`）；
   旧字段 `mode` **已删除**（v1 客户端同版本发布，无兼容负担）。
+  `joined_seq` 是同一频道内单调递增的加入序号（仅诊断/排序用，不跨会话）。
   `members` 按 `member_id` 排序，稳定可比对。
+
+  **角色由服务端裁决（2026-11-03 定）**：`members[].role` 是每个成员在直连协商里的角色，
+  客户端**不得**再按「谁先来/谁 id 小」自行推断——两端各自推断会在同时加入时都得出
+  `answerer`（各自只看到对方、没看到自己），结果是**没人发 offer、完全没声音**。
+  规则（服务端实现，`--voice-mode=direct` 时）：
+  - 频道里只有自己 → `answerer`（先等着，不对着空气发 offer）；
+  - 第二个人加入 → 新来者 `offerer`，先来的保持 `answerer`（两人里恰好一个 offerer）；
+  - 第三人及以后 → `answerer`，且**不改动已在通话的两人的角色**
+    （P2P mesh 暂不支持，但绝不能因为第三个人进来就把两人的 PC 拆了）。
+  relay 模式下全员 `answerer`（服务端 SFU 才是 offerer）。
+
+  客户端拿到 `role` 后若发现与本地 PC 的角色不一致（典型：两端同时加入，服务端把
+  offerer 判给了对端），应 `pu_voice_leave` + `pu_voice_join(passive=正确值)` 重建一次
+  本地语音会话即可纠正；不需要新增 ABI。
   `slots` 仅 relay 模式出现：**槽位序号 → 发布者**。它解决两件事：
   （a）客户端能把 native 侧 id 为 `partyup-slot-<index>` 的远端音轨映射到具体成员
   （后绑定的槽不再依赖随机的 msid）；

@@ -60,6 +60,12 @@ public sealed class ShareSession : IAsyncDisposable
     /// <summary>最近一条 offer/answer 属于哪个会话（candidate 没有媒体类型，跟它走）。</summary>
     private string? _lastSignalMedia;
 
+    /// <summary>服务端裁决的本端直连角色（offerer / answerer）；空 = 还不知道。</summary>
+    private string? _serverRole;
+
+    /// <summary>当前语音 PC 是按哪个 passive 值建的：用来发现「服务端角色与本地不一致」。</summary>
+    private bool _enginePassive;
+
     // 路径变化历史（v1 验收第 7 条）：最近 20 条，新的在前。
     private const int PathHistoryCapacity = 20;
     private readonly List<PathHistoryEntry> _pathHistory = new(capacity: PathHistoryCapacity);
@@ -393,6 +399,7 @@ public sealed class ShareSession : IAsyncDisposable
     {
         if (_voiceJoined) return;
         LastError = null;
+        string? ackRole = null;
 
         // 顺序很重要：先让原生把（answerer 角色的）PeerConnection 建好，再向服务端 voice.join。
         // relay 模式下服务端收到 join 会**立刻**下发 offer；如果原生还没 join，
@@ -400,6 +407,7 @@ public sealed class ShareSession : IAsyncDisposable
         var passive = ShouldBePassive();
         // 原生侧只实现 P2P；对媒体核心来说 relay 就是「对面只有一个 peer」，所以 mode 恒传 1。
         var rc = _engine.VoiceJoin(_channelId, mode: 1, passive);
+        _enginePassive = passive;
         if (rc != 0)
         {
             LastError = $"pu_voice_join 返回 {rc}：{_engine.LastErrorText()}";
@@ -412,6 +420,7 @@ public sealed class ShareSession : IAsyncDisposable
         {
             // 传输方式由服务端策略决定：请求里不带 mode，只读取应答。
             var ack = await _connection.VoiceJoinAsync(_channelId, ct);
+            ackRole = ack.Role;
             var transport = IsDirectTransport(ack.Transport) ? "direct" : "relay";
             if (transport != _voiceMode)
             {
@@ -421,6 +430,7 @@ public sealed class ShareSession : IAsyncDisposable
                 _voiceMode = transport;
                 passive = ShouldBePassive();
                 rc = _engine.VoiceJoin(_channelId, mode: 1, passive);
+                _enginePassive = passive;
                 if (rc != 0)
                 {
                     LastError = $"pu_voice_join 返回 {rc}：{_engine.LastErrorText()}";
@@ -447,7 +457,10 @@ public sealed class ShareSession : IAsyncDisposable
         _voiceMuted = false;
         _voiceDeafened = false;
         LastError = null;
-        AppLog.Pass($"voice: joined channel={_channelId} mode={_voiceMode} passive={passive}");
+        AppLog.Pass($"voice: joined channel={_channelId} mode={_voiceMode} passive={passive} " +
+                    $"role={ackRole ?? "?"}");
+        // 服务端在 join.ok 里直接给了角色：如果本地 PC 建错了角色（同时加入的竞态），立刻按它重建。
+        ApplyServerRole(ackRole);
 
         // 路径变化历史：重连重新协商一定记一条（即使两端都是 relay，也要能看到「重连后重新协商」）；
         // 其余情况只在传输方式真的变了时记（目前只有服务端策略变更会触发）。
@@ -690,14 +703,52 @@ public sealed class ShareSession : IAsyncDisposable
     /// direct 模式下谁发 offer：成员 id 最小的当 offerer，其余被动等待（确定性，不靠抢）。
     /// relay 模式恒为被动（服务端 SFU 才是 offerer）。
     /// </summary>
+    /// <summary>
+    /// 本端该不该被动（answerer）。**角色由服务端裁决，本地不推断**：
+    /// 两端各自按「谁先来」推断会在同时加入时都得出 answerer（各自只看到对方、没看到自己），
+    /// 于是没人发 offer → 完全没声音。这里优先用服务端给的 role；只有 role 还没到时
+    /// 才用与服务器一致的规则猜（已有人 → 新来者是 offerer），猜错由 voice.join.ok.role
+    /// 或 voice.state.role 触发的 <see cref="ApplyServerRole"/> 重建纠正。
+    /// </summary>
     private bool ShouldBePassive()
     {
         if (_voiceMode == "relay") return true; // 服务端 SFU 才是 offerer
         if (_forceActive) return false;         // 验收/调试：强制做 offerer（direct 才有效）
         if (_forcePassive) return true;
-        if (!HasOtherVoiceMembers) return false;
-        var first = _voiceMembers.Keys.OrderBy(id => id, StringComparer.Ordinal).FirstOrDefault();
-        return first is not null && first != _thisMemberId;
+        if (_serverRole is "offerer") return false;
+        if (_serverRole is "answerer") return true;
+        return !HasOtherVoiceMembers;
+    }
+
+    /// <summary>
+    /// 应用服务端裁决的角色。若与当前 PC 的角色不一致（典型：两端同时加入，
+    /// 服务端把 offerer 判给了另一端），按服务端结论重建一次语音会话：
+    /// leave → join(正确 passive)；新 PC 会重新生成/等待 offer，不需要扩 ABI。
+    /// </summary>
+    private void ApplyServerRole(string? role)
+    {
+        if (role is not ("offerer" or "answerer") || _voiceMode != "direct") return;
+        if (_serverRole == role) return;
+        _serverRole = role;
+        if (!_voiceJoined) return;
+
+        var wantPassive = role != "offerer";
+        if (_enginePassive == wantPassive) return;
+
+        AppLog.Info($"voice: server role={role} ≠ local passive={_enginePassive}, rebuilding local session");
+        _engine.VoiceLeave();
+        var rc = _engine.VoiceJoin(_channelId, mode: 1, wantPassive);
+        if (rc != 0)
+        {
+            LastError = $"pu_voice_join 返回 {rc}：{_engine.LastErrorText()}";
+            AppLog.Fail("voice: role rebuild failed — " + LastError);
+        }
+        else
+        {
+            _enginePassive = wantPassive;
+            AppLog.Pass($"voice: role applied role={role} passive={wantPassive}");
+        }
+        Changed?.Invoke();
     }
 
     public async Task LeaveVoiceAsync(CancellationToken ct = default)
@@ -715,6 +766,8 @@ public sealed class ShareSession : IAsyncDisposable
             _voiceJoined = false;
             _voiceMuted = false;
             _voiceDeafened = false;
+            _serverRole = null;
+            _enginePassive = false;
             AppLog.Info("voice: left");
             try { await _connection.VoiceLeaveAsync(_channelId, ct); }
             catch (Exception ex) { AppLog.Warn("voice: leave report failed: " + ex.Message); }
@@ -790,6 +843,9 @@ public sealed class ShareSession : IAsyncDisposable
                 AppLog.Info($"voice: slots {_voiceSlots.Count} [{desc}]");
             }
         }
+        var self = state.Members.FirstOrDefault(m => m.MemberId == _thisMemberId);
+        ApplyServerRole(self?.Role);
+
         var serverMode = IsDirectTransport(state.VoiceMode) ? "direct" : "relay";
         if (!_voiceJoined && serverMode != _voiceMode)
         {

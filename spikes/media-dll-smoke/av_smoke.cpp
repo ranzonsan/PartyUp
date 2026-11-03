@@ -174,6 +174,142 @@ Result RunOrder(bool screen_first, int order_index) {
   return r;
 }
 
+// ---------------------------------------------------------------------------
+// 顺序 3（v2.12 / 第 4 步紧急修复的回归点）：语音先起，然后「开始共享」与
+// 「停止共享」两个时刻语音都必须继续走。
+//
+// 曾经的 bug：屏幕停止路径（ReleaseStreamObjects）末尾调 ReleaseVoiceSession()、
+// 并在同一个块里摘掉语音的远端音频 sink，于是共享一开一停就把语音会话拆了
+// （真机现象：pcmRx 7989 → 0，日志 release-voice: enter (pc=1 joined=1)）。
+// 这里把「共享开始」和「共享停止」都各测一个窗口，别只测一个方向。
+// ---------------------------------------------------------------------------
+struct SurviveResult {
+  bool ok = false;
+  double baseline_fps = 0.0;
+  double after_start_fps = 0.0;
+  double after_stop_fps = 0.0;
+  int video_frames = 0;
+  bool session_alive_after_stop = false;
+};
+
+SurviveResult RunVoiceSurvivesScreen() {
+  SurviveResult r;
+  std::printf("\n---- order 3: voice -> screen start -> screen stop (voice must survive) ----\n");
+  pu_engine* a = CreateEngine("survive-A");
+  pu_engine* b = CreateEngine("survive-B");
+  if (a == nullptr || b == nullptr) return r;
+  Counters ca, cb;
+
+  pu_voice_params vp;
+  std::memset(&vp, 0, sizeof(vp));
+  vp.struct_size = sizeof(vp);
+  vp.channel_id = "av-survive";
+  vp.mode = PU_MODE_DIRECT;
+
+  const int join_a_rc = pu_voice_join(a, &vp);
+  if (join_a_rc != PU_OK) {
+    std::printf("FAIL: A voice_join rc=%d (%s)\n", join_a_rc, pu_last_error(a));
+    pu_engine_destroy(a);
+    pu_engine_destroy(b);
+    return r;
+  }
+  pu_voice_params passive = vp;
+  passive.flags = 1u;  // answerer
+  const int join_b_rc = pu_voice_join(b, &passive);
+  if (join_b_rc != PU_OK) {
+    std::printf("FAIL: B voice_join rc=%d (%s)\n", join_b_rc, pu_last_error(b));
+    pu_engine_destroy(a);
+    pu_engine_destroy(b);
+    return r;
+  }
+  if (RunFor(a, b, &ca, &cb, 3000) < 0) {
+    pu_engine_destroy(a);
+    pu_engine_destroy(b);
+    return r;
+  }
+
+  // 基线：纯语音 1.5 s。
+  const uint32_t pcm0 = PcmFrames(b);
+  if (RunFor(a, b, &ca, &cb, 1500) < 0) {
+    pu_engine_destroy(a);
+    pu_engine_destroy(b);
+    return r;
+  }
+  const uint32_t pcm1 = PcmFrames(b);
+  r.baseline_fps = static_cast<double>(pcm1 - pcm0) / 1.5;
+
+  // 开始共享：语音必须不停。窗口给 2.5 s——屏幕会话要等 ICE/SDP/DTLS 建起来才出帧，
+  // 1.5 s 里只能数到个位数帧（本机实测 5 帧），会把「视频刚起来」误判成失败。
+  if (pu_screen_start(a, "synthetic") != PU_OK) {
+    std::printf("FAIL: pu_screen_start rc=%d (%s)\n", pu_last_error(a));
+    pu_engine_destroy(a);
+    pu_engine_destroy(b);
+    return r;
+  }
+  const int video_before = cb.video_frames;
+  if (RunFor(a, b, &ca, &cb, 2500) < 0) {
+    pu_engine_destroy(a);
+    pu_engine_destroy(b);
+    return r;
+  }
+  const uint32_t pcm2 = PcmFrames(b);
+  r.after_start_fps = static_cast<double>(pcm2 - pcm1) / 2.5;
+  r.video_frames = cb.video_frames - video_before;
+
+  // 停止共享：语音仍必须不停，且会话对象还在（不只是计数器侥幸没清零）。
+  if (pu_screen_stop(a) != PU_OK) {
+    std::printf("FAIL: pu_screen_stop rc=%d (%s)\n", pu_last_error(a));
+    pu_engine_destroy(a);
+    pu_engine_destroy(b);
+    return r;
+  }
+  if (RunFor(a, b, &ca, &cb, 2000) < 0) {
+    pu_engine_destroy(a);
+    pu_engine_destroy(b);
+    return r;
+  }
+  const uint32_t pcm3 = PcmFrames(b);
+  r.after_stop_fps = static_cast<double>(pcm3 - pcm2) / 2.0;
+
+  pu_voice_track track;
+  std::memset(&track, 0, sizeof(track));
+  track.struct_size = sizeof(track);
+  const bool track_alive = pu_voice_tracks(b, &track, 1) == 1;
+  pu_stats stats_a;
+  std::memset(&stats_a, 0, sizeof(stats_a));
+  stats_a.struct_size = sizeof(stats_a);
+  const bool a_voice_connected =
+      pu_peer_stats(a, &stats_a) == PU_OK && stats_a.peer_state == PU_PEER_CONNECTED;
+  r.session_alive_after_stop = track_alive && a_voice_connected;
+
+  std::printf("  pcm baseline %.1f/s (%u -> %u) | after screen START %.1f/s (%u -> %u) | "
+              "after screen STOP %.1f/s (%u -> %u)\n",
+              r.baseline_fps, pcm0, pcm1, r.after_start_fps, pcm1, pcm2, r.after_stop_fps, pcm2,
+              pcm3);
+  std::printf("  screen video frames=%d | after stop: B track=%d A peerState=%d (want 1/2)\n",
+              r.video_frames, track_alive ? 1 : 0, stats_a.peer_state);
+
+  const bool rate_ok = r.baseline_fps >= 60.0 && r.after_start_fps >= 0.6 * r.baseline_fps &&
+                       r.after_start_fps >= 30.0 && r.after_stop_fps >= 0.6 * r.baseline_fps &&
+                       r.after_stop_fps >= 30.0;
+  r.ok = rate_ok && r.session_alive_after_stop && r.video_frames >= 15;
+  if (!rate_ok) {
+    std::printf("  FAIL: voice PCM rate dropped across screen start/stop\n");
+  }
+  if (!r.session_alive_after_stop) {
+    std::printf("  FAIL: voice session is gone after pu_screen_stop (track/peerState)\n");
+  }
+  if (r.video_frames < 15) {
+    std::printf("  FAIL: screen video did not flow (%d frames)\n", r.video_frames);
+  }
+
+  pu_voice_leave(a);
+  pu_voice_leave(b);
+  pu_engine_destroy(a);
+  pu_engine_destroy(b);
+  return r;
+}
+
 }  // namespace
 
 int main() {
@@ -185,13 +321,18 @@ int main() {
 
   const Result r1 = RunOrder(/*screen_first=*/true, 1);
   const Result r2 = RunOrder(/*screen_first=*/false, 2);
+  const SurviveResult r3 = RunVoiceSurvivesScreen();
 
   std::printf("\n==== RESULT ====\n");
   std::printf("  order1 screen->voice: pcm=%.1f fps video=%.1f fps -> %s\n", r1.pcm_fps,
               r1.video_fps, r1.ok ? "OK" : "FAIL");
   std::printf("  order2 voice->screen: pcm=%.1f fps video=%.1f fps -> %s\n", r2.pcm_fps,
               r2.video_fps, r2.ok ? "OK" : "FAIL");
-  if (!r1.ok || !r2.ok) {
+  std::printf("  order3 voice across screen start/stop: pcm=%.1f/%.1f/%.1f fps "
+              "(baseline/start/stop) session_alive=%d -> %s\n",
+              r3.baseline_fps, r3.after_start_fps, r3.after_stop_fps,
+              r3.session_alive_after_stop ? 1 : 0, r3.ok ? "OK" : "FAIL");
+  if (!r1.ok || !r2.ok || !r3.ok) {
     std::printf("RESULT: FAIL\n");
     return 1;
   }

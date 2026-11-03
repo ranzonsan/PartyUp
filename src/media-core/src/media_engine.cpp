@@ -1169,6 +1169,13 @@ MediaEngine::~MediaEngine() {
   ReleaseStreamObjects();
   Log(3, "dtor: ReleaseStreamObjects() returned");
 
+  // v2.12（第 4 步紧急修复）：ReleaseStreamObjects() 现在只收屏幕会话，所以语音会话
+  // 必须在这里显式收掉。位置必须在「释放工厂」与 signaling_->Stop() 之前：
+  // ReleaseVoiceSession 要 join 语音协商线程、在 signaling 线程上 Close 语音 PC、
+  // 再删 voice_observer_ —— 任何一步漏在三条线程 Stop() 之后就又是 0xC0000005。
+  ReleaseVoiceSession();
+  Log(3, "dtor: ReleaseVoiceSession() returned");
+
   // 工厂是 PeerConnectionFactoryProxy：它的析构会把内部 PeerConnectionFactory
   // 投递回 signaling 线程（并在控制线程上等待）。这里显式地在 signaling 线程上
   // 释放，把「webrtc 对象的归属线程」写成契约，而不是依赖 proxy 的实现细节；
@@ -1210,9 +1217,10 @@ MediaEngine::~MediaEngine() {
   delete remote_sink_;
   remote_sink_ = nullptr;  delete pc_observer_;
   pc_observer_ = nullptr;
-  // v2.10：语音 observer 的常规回收在 ReleaseVoiceSession()（上面 ReleaseStreamObjects
-  // 里已经跑过一次，这里通常已是 nullptr）。留一行兜底，保证任何提前 return 的收尾路径
-  // 都不会把它带进下一个引擎实例（历史上泄漏的 observer 是 0xC0000005 的来源之一）。
+  // v2.12：语音 observer 的常规回收在 dtor 上方那次 ReleaseVoiceSession()（v2.12 起
+  // ReleaseStreamObjects 不再顺带收语音，所以那次调用是**必需**的，不是「可能已跑过」）。
+  // 留一行兜底，保证任何提前 return 的收尾路径都不会把它带进下一个引擎实例
+  // （历史上泄漏的 observer 是 0xC0000005 的来源之一）。
   delete voice_observer_;
   voice_observer_ = nullptr;
   Log(3, "dtor: sinks/observer deleted");
@@ -1771,8 +1779,10 @@ void MediaEngine::ReleaseStreamObjects() {
           remote_track_->RemoveSink(remote_sink_);
         }
         remote_track_ = nullptr;
-        // 音频计数 sink 也要摘干净，否则重进频道会因为「track id 已在集合里」而不重挂。
-        DetachAllAudioSinks();
+        // v2.12（第 4 步紧急修复）：这里**不再**调 DetachAllAudioSinks()。
+        // 远端音频 sink 属于**语音会话**，和屏幕 PC 没有关系；屏幕停止时摘掉它们会让
+        // 语音 PCM 计数直接归零（UI 上就是「一共享就没声」）。语音侧的摘除统一由
+        // ReleaseVoiceSession() 负责（显式 leave 与引擎析构两条路径）。
         pc_->Close();
       }
       track_ = nullptr;
@@ -1803,17 +1813,14 @@ void MediaEngine::ReleaseStreamObjects() {
   local_sdp_emitted_.store(false, std::memory_order_relaxed);
   stat_peer_state_.store(PU_PEER_NONE, std::memory_order_relaxed);
   stat_ice_state_.store(PU_ICE_NEW, std::memory_order_relaxed);
-  // v2.10 第 1 步：屏幕会话收尾后，把语音会话也收干净。
-  // 两条 PC 虽然独立，但引擎的收尾路径（pu_screen_stop / pu_engine_destroy）都汇到这里：
-  //   * destroy 路径上不跑它对 voice_pc_ / voice_observer_ / voice_negotiator_ 就没机会释放，
-  //     observer 会活到 webrtc 线程 Stop 之后（0xC0000005 的老来源）；
-  //   * 释放顺序：先 join 协商线程（它可能正要推一条 answer），再关 PC，最后删 observer。
-  // TODO(step4): 这里有个已知的过度耦合——pu_screen_stop 会经由本函数把**语音会话也拆掉**
-  //   （实测：停止共享后 PCM 计数归零、日志 release-voice: enter (pc=1 joined=1)）。
-  //   第 4 步应把 ReleaseVoiceSession 挪出屏幕停止路径（放 ~MediaEngine 与显式 voice leave），
-  //   让「停止共享」不影响正在进行的语音。现在保持现状，勿在此单独改。
-  ReleaseVoiceSession();
-  Log(3, "release: done");
+  // v2.12（第 4 步紧急修复）：本函数**只收屏幕会话**，不再碰语音。
+  // 之前这里在末尾调 ReleaseVoiceSession()，于是：
+  //   * pu_screen_start / pu_screen_stop 都会把正在进行的语音拆掉
+  //     （实测 release-voice: enter (pc=1 joined=1)，pcmRx 7989 → 0）；
+  //   * 屏幕 start 失败回滚、屏幕信令报错等路径也会误伤语音。
+  // 语音会话现在只有两条释放路径：显式 pu_voice_leave()/VoiceLeave 与 ~MediaEngine。
+  // 停止共享不影响语音，是「共享与语音两条 PC 独立」（ADR-0002）的直接要求。
+  Log(3, "release: done (voice untouched)");
 }
 
 // ---------------------------------------------------------------------------

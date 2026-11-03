@@ -72,6 +72,13 @@ public sealed record ClientOptions
     /// </summary>
     public bool VoicePassive { get; init; }
 
+    /// <summary>
+    /// 「谁在说话」的峰值阈值（16 bit 采样绝对值）。默认 500；
+    /// 环境变量 PARTYUP_SPEAK_THRESHOLD 或 --speak-threshold 可调。
+    /// 注意原生侧默认阈值 8 只是「非零门控」，不是 VAD（见 partyup_media.h）。
+    /// </summary>
+    public uint SpeakThreshold { get; init; } = ParseSpeakThreshold();
+
     /// <summary>`--voice-passive`：自动加入时用被动模式（flags bit0=1，等对端 offer）。</summary>
     /// <summary>--role send 要发送的正文。</summary>
     public string? Text { get; init; }
@@ -164,6 +171,13 @@ public sealed record ClientOptions
                 case "--voice-passive":
                     options = options with { VoicePassive = true };
                     break;
+                case "--speak-threshold":
+                    var raw = TakeValue(args, ref i, arg);
+                    if (uint.TryParse(raw, out var threshold) && threshold > 0)
+                    {
+                        options = options with { SpeakThreshold = threshold };
+                    }
+                    break;
                 case "--sources":
                     options = options with { Mode = ClientMode.Sources };
                     break;
@@ -173,6 +187,12 @@ public sealed record ClientOptions
             }
         }
         return options;
+    }
+
+    private static uint ParseSpeakThreshold()
+    {
+        var env = Environment.GetEnvironmentVariable("PARTYUP_SPEAK_THRESHOLD");
+        return uint.TryParse(env, out var value) && value > 0 ? value : 500;
     }
 
     private static string TakeValue(string[] args, ref int index, string flag)

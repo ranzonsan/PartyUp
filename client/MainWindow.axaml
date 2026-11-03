@@ -21,9 +21,13 @@
             <TextBlock Text="骨架 · tracer bullet" FontSize="11" Foreground="#FF9AA4B8" />
           </Border>
         </StackPanel>
-        <TextBlock Grid.Column="1" Text="{Binding StatusText}"
-                   HorizontalAlignment="Center" VerticalAlignment="Center"
-                   FontSize="12" Foreground="#FF8E98AB" />
+        <StackPanel Grid.Column="1" HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="1">
+          <TextBlock Text="{Binding StatusText}" HorizontalAlignment="Center"
+                     FontSize="12" Foreground="#FF8E98AB" />
+          <TextBlock Text="{Binding ConnectionStatusText}" HorizontalAlignment="Center"
+                     FontSize="12" FontWeight="SemiBold" Foreground="#FFE6B45B"
+                     IsVisible="{Binding IsConnectionReconnecting}" />
+        </StackPanel>
         <Border x:Name="MediaBadge" Grid.Column="2" Background="#FF15251B" CornerRadius="9" Padding="10,4"
                 VerticalAlignment="Center">
           <TextBlock Text="{Binding MediaStatusText}" FontSize="12" Foreground="#FF8AD9A0" />
@@ -140,6 +144,8 @@
                   <StackPanel Orientation="Horizontal" Spacing="5" Margin="0,2">
                     <Ellipse Width="7" Height="7" Fill="#FF6FCF87" VerticalAlignment="Center" />
                     <TextBlock Text="{Binding Name}" FontSize="12" Foreground="#FFD5DAE4" />
+                    <Ellipse Width="6" Height="6" Fill="#FF5BE67A" VerticalAlignment="Center"
+                             IsVisible="{Binding IsSpeaking}" />
                     <TextBlock Text="🔊" FontSize="11" VerticalAlignment="Center"
                                IsVisible="{Binding IsSpeakingIconVisible}" />
                     <TextBlock Text="🔇" FontSize="11" VerticalAlignment="Center"
@@ -170,6 +176,16 @@
                        Foreground="#FF9AA4B8" TextWrapping="Wrap" />
             <TextBlock Text="{Binding VoiceModeText}" FontSize="11" Foreground="#FF7C8698"
                        TextWrapping="Wrap" />
+            <Expander Header="路径记录" FontSize="11" IsExpanded="False" Foreground="#FF9AA4B8">
+              <ItemsControl ItemsSource="{Binding PathHistoryLines}" Margin="0,2,0,0">
+                <ItemsControl.ItemTemplate>
+                  <DataTemplate>
+                    <TextBlock Text="{Binding}" FontSize="10" Foreground="#FF9AA4B8"
+                               TextWrapping="Wrap" Margin="0,1" />
+                  </DataTemplate>
+                </ItemsControl.ItemTemplate>
+              </ItemsControl>
+            </Expander>
 
             <Border Height="1" Background="#FF232936" Margin="0,4" />
 

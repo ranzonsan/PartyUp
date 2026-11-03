@@ -44,6 +44,20 @@ public sealed class ShareSession : IAsyncDisposable
     // relay 槽位 → 成员（服务端下发；direct 为空）。native 远端音轨 id 形如 "partyup-slot-00"。
     private readonly Dictionary<int, VoiceSlotDto> _voiceSlots = new();
     private string _lastSlotSignature = string.Empty;
+
+    // 路径变化历史（v1 验收第 7 条）：最近 20 条，新的在前。
+    private const int PathHistoryCapacity = 20;
+    private readonly List<PathHistoryEntry> _pathHistory = new(capacity: PathHistoryCapacity);
+    private string? _lastTransport;
+    public event Action? PathHistoryChanged;
+    public IReadOnlyList<PathHistoryEntry> PathHistory => _pathHistory;
+
+    // 「谁在说话」：轮询 pu_voice_tracks，peak 超阈值即认为在说话（带 600ms 保持，避免闪烁）。
+    private static readonly TimeSpan SpeakPollInterval = TimeSpan.FromMilliseconds(200);
+    private static readonly TimeSpan SpeakHoldTime = TimeSpan.FromMilliseconds(600);
+    private readonly Dictionary<string, DateTime> _speakingSince = new(StringComparer.Ordinal);
+    private CancellationTokenSource? _speakCts;
+    private uint _speakThreshold = 500;
     private CancellationTokenSource? _voiceStatsCts;
     /// <summary>direct 模式下强制被动（仅测试/调试用；relay 本来就恒被动）。</summary>
     private readonly bool _forcePassive;
@@ -55,6 +69,7 @@ public sealed class ShareSession : IAsyncDisposable
         bool forcePassive = false)
     {
         _forcePassive = forcePassive;
+        _speakThreshold = Program.Options.SpeakThreshold;
         _engine = engine;
         _connection = connection;
         _channelId = channelId;
@@ -294,7 +309,7 @@ public sealed class ShareSession : IAsyncDisposable
     /// relay 模式服务端是 offerer，**本端必须被动加入（answerer）**；direct 模式沿用老逻辑
     /// （频道里已有人就被动加入，避免双方并发 offer 的 glare）。
     /// </summary>
-    public async Task JoinVoiceAsync(CancellationToken ct = default)
+    public async Task JoinVoiceAsync(bool afterReconnect = false, CancellationToken ct = default)
     {
         if (_voiceJoined) return;
         LastError = null;
@@ -353,14 +368,27 @@ public sealed class ShareSession : IAsyncDisposable
         _voiceDeafened = false;
         LastError = null;
         AppLog.Pass($"voice: joined channel={_channelId} mode={_voiceMode} passive={passive}");
+
+        // 路径变化历史：重连重新协商一定记一条（即使两端都是 relay，也要能看到「重连后重新协商」）；
+        // 其余情况只在传输方式真的变了时记（目前只有服务端策略变更会触发）。
+        if (afterReconnect)
+        {
+            RecordPathChange(_lastTransport ?? _voiceMode, _voiceMode, "重连后重新协商");
+        }
+        else if (_lastTransport is not null && _lastTransport != _voiceMode)
+        {
+            RecordPathChange(_lastTransport, _voiceMode, "服务端策略变更");
+        }
+        _lastTransport = _voiceMode;
+
         StartVoiceStatsLoop();
+        StartSpeakingLoop();
         Changed?.Invoke();
     }
 
     /// <summary>
-    /// 每 2 秒打一条语音统计：远端解出的 PCM 帧数（验收要看它涨）。
-    /// 注意：原生侧音频接收计数是**单 sink 全局位**，relay 多路时只统计第一条收到的远端轨；
-    /// 多路都计数需要媒体核心改成按轨挂 sink（已报给 lead / encoder-dev）。
+    /// 每 2 秒打一条语音统计 + 每条活跃轨的明细（v2.7 按轨统计，relay 多路各算各的）。
+    /// 静音帧已被原生侧门控掉，所以这里的帧数能反映「真的收到声音」。
     /// </summary>
     private void StartVoiceStatsLoop()
     {
@@ -375,6 +403,10 @@ public sealed class ShareSession : IAsyncDisposable
                 {
                     var stats = _engine.GetStats();
                     AppLog.Info($"voice: stats pcmRx={stats.FramesReceived} peerState={stats.PeerState} mode={_voiceMode}");
+                    foreach (var track in _engine.GetVoiceTracks())
+                    {
+                        AppLog.Info($"voice: track id={track.Id} pcmFrames={track.PcmFrames} peak={track.Peak} slotOwner={SlotOwnerOf(track.Id)}");
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -391,6 +423,150 @@ public sealed class ShareSession : IAsyncDisposable
     {
         _voiceStatsCts?.Cancel();
         _voiceStatsCts = null;
+    }
+
+    // ------------------------------------------------------------------
+    // 路径变化历史（v1 验收第 7 条）
+    // ------------------------------------------------------------------
+
+    /// <summary>记一条路径变化（新的在前，最多保留 20 条）。</summary>
+    public void RecordPathChange(string from, string to, string reason)
+    {
+        var entry = new PathHistoryEntry(DateTimeOffset.Now, TransportLabel(from), TransportLabel(to), reason);
+        _pathHistory.Insert(0, entry);
+        if (_pathHistory.Count > PathHistoryCapacity)
+        {
+            _pathHistory.RemoveRange(PathHistoryCapacity, _pathHistory.Count - PathHistoryCapacity);
+        }
+        AppLog.Pass($"voice: path {entry.From} → {entry.To}（{reason}）");
+        PathHistoryChanged?.Invoke();
+    }
+
+    /// <summary>传输方式的中文展示名。</summary>
+    public static string TransportLabel(string? transport) =>
+        string.Equals(transport, "direct", StringComparison.OrdinalIgnoreCase) ? "直连" : "中继";
+
+    // ------------------------------------------------------------------
+    // 谁在说话（v2.7：pu_voice_tracks 按轨统计 + voice.state.slots 槽位映射）
+    // ------------------------------------------------------------------
+
+    /// <summary>当前正在说话的成员 id 集合（UI 用来点亮成员行）。</summary>
+    public IReadOnlyCollection<string> SpeakingMemberIds => _speakingSince.Keys;
+
+    public bool IsSpeaking(string memberId) => _speakingSince.ContainsKey(memberId);
+
+    /// <summary>把 "partyup-slot-<n>" 翻译成成员 id；不是槽位轨或没有映射时返回 null。</summary>
+    public string? SlotOwnerOf(string trackId)
+    {
+        if (!trackId.StartsWith("partyup-slot-", StringComparison.Ordinal)) return null;
+        if (!int.TryParse(trackId.AsSpan("partyup-slot-".Length), out var index)) return null;
+        return _voiceSlots.TryGetValue(index, out var slot) ? slot.MemberId : null;
+    }
+
+    private void StartSpeakingLoop()
+    {
+        StopSpeakingLoop();
+        var cts = new CancellationTokenSource();
+        _speakCts = cts;
+        _ = Task.Run(async () =>
+        {
+            while (!cts.IsCancellationRequested)
+            {
+                try
+                {
+                    PollSpeaking();
+                }
+                catch (Exception ex)
+                {
+                    AppLog.Warn("voice: speaking poll failed: " + ex.Message);
+                    return;
+                }
+                try { await Task.Delay(SpeakPollInterval, cts.Token); }
+                catch { return; }
+            }
+        }, cts.Token);
+    }
+
+    private void StopSpeakingLoop()
+    {
+        _speakCts?.Cancel();
+        _speakCts = null;
+    }
+
+    /// <summary>
+    /// 轮询远端音频轨：peak 超阈值（默认 500，可用 --speak-threshold 或
+    /// PARTYUP_SPEAK_THRESHOLD 调）就认为该轨在说话；保持 600ms 避免闪烁。
+    /// relay 下轨道 id 是 "partyup-slot-&lt;n&gt;"，查 voice.state.slots 得到成员；
+    /// direct 下只有一路对端，直接算到「唯一的其他成员」。
+    /// </summary>
+    private void PollSpeaking()
+    {
+        if (!_voiceJoined) return;
+        var tracks = _engine.GetVoiceTracks();
+        var now = DateTime.UtcNow;
+        var active = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var track in tracks)
+        {
+            if (track.Peak < _speakThreshold) continue;
+            var member = SlotOwnerOf(track.Id);
+            if (member is null && _voiceMode != "relay")
+            {
+                member = _voiceMembers.Keys.FirstOrDefault(id => id != _thisMemberId);
+            }
+            if (member is not null) active.Add(member);
+        }
+
+        var changed = false;
+        foreach (var member in active)
+        {
+            if (!_speakingSince.ContainsKey(member))
+            {
+                _speakingSince[member] = now;
+                changed = true;
+                AppLog.Info($"voice: speaking {member} peak>={_speakThreshold}");
+            }
+            else
+            {
+                _speakingSince[member] = now;
+            }
+        }
+        // 保持窗口：最后一次「超阈值」超过 SpeakHoldTime 才熄灭。
+        foreach (var member in _speakingSince.Keys.ToList())
+        {
+            if (now - _speakingSince[member] > SpeakHoldTime)
+            {
+                _speakingSince.Remove(member);
+                changed = true;
+            }
+        }
+        if (changed)
+        {
+            Changed?.Invoke();
+        }
+    }
+
+    /// <summary>
+    /// 控制连接恢复后的语音重入：不断开频道、不重建媒体引擎，只重建 PC/信令并重新协商。
+    /// </summary>
+    public async Task HandleConnectionRestoredAsync(CancellationToken ct = default)
+    {
+        if (!_voiceJoined) return;
+        AppLog.Info("voice: connection restored, re-negotiating media session");
+        try
+        {
+            StopVoiceStatsLoop();
+            StopSpeakingLoop();
+            _speakingSince.Clear();
+            try { _engine.VoiceLeave(); } catch (Exception ex) { AppLog.Warn("voice: leave before rejoin failed: " + ex.Message); }
+            _voiceJoined = false;
+            await JoinVoiceAsync(afterReconnect: true, ct);
+        }
+        catch (Exception ex)
+        {
+            LastError = "重连后重入语音失败：" + ex.Message;
+            AppLog.Fail("voice: " + LastError);
+            Changed?.Invoke();
+        }
     }
 
     /// <summary>
@@ -416,6 +592,8 @@ public sealed class ShareSession : IAsyncDisposable
         finally
         {
             StopVoiceStatsLoop();
+            StopSpeakingLoop();
+            _speakingSince.Clear();
             _voiceJoined = false;
             _voiceMuted = false;
             _voiceDeafened = false;
@@ -589,4 +767,11 @@ public sealed class ShareSession : IAsyncDisposable
         }
         _cts.Dispose();
     }
+}
+
+
+/// <summary>一条路径变化记录（v1 验收第 7 条：时间 / 从 / 到 / 原因）。</summary>
+public sealed record PathHistoryEntry(DateTimeOffset At, string From, string To, string Reason)
+{
+    public override string ToString() => $"{At:HH:mm:ss} {From} → {To}（{Reason}）";
 }

@@ -90,8 +90,14 @@ HTTP 请求/响应体形状（2026-11-02 落地，此前文档未定义）：
 - `voice.leave { channel_id }`
 - `voice.set_mute { channel_id, muted }` / `voice.set_deafen { channel_id, deafened }`
   —— 上报本端静音/闭音状态。本地 ADM 状态仍由客户端自己控制；上报是为了让别人看见（`voice.state`）。
-- 广播 `voice.state { channel_id, mode, members: [{ member_id, muted, deafened }] }`
+- 广播 `voice.state { channel_id, mode, members: [{ member_id, muted, deafened }],
+  slots?: [{ index, member_id, muted }] }`
   —— `mode` 就是服务端策略值；`members` 按 `member_id` 排序，稳定可比对。
+  `slots` 仅 relay 模式出现：**槽位序号 → 发布者**。它解决两件事：
+  （a）客户端能把 native 侧 id 为 `partyup-slot-<index>` 的远端音轨映射到具体成员
+  （后绑定的槽不再依赖随机的 msid）；
+  （b）「谁在说话」与按人排查质量时能显示名字。槽位序号在房间里统一分配
+  （发布者首次发声时取最小空位），所以所有人看到的映射是同一份；离开时释放、可被后来者复用。
   客户端订阅频道后服务端立即推一次快照，所以「本频道是直连还是中继」在加入语音之前就能显示。
   这取代了 2026-11-03 客户端临时代码：当时服务端还没有语音状态，客户端只能借
   `media.signal`（`media=voice, kind=candidate`）捎带 `{"type":"partyup.voice.presence",...}`。
@@ -108,6 +114,11 @@ HTTP 请求/响应体形状（2026-11-02 落地，此前文档未定义）：
 
 **服务端是 offerer**：`voice.join` 成功后（仅当服务端策略为 relay），服务端为该成员单独建一个
 `PeerConnection`，并下发：
+
+槽位说明：12 条 sendonly m-line 在 offer 时就各挂一条**占位轨**，其 track id 固定为
+`partyup-slot-00`…`partyup-slot-11`。因此客户端看到的每条远端音轨 id 都是稳定的槽位号
+（不会出现「后绑定的槽没有 msid、id 随机」），配合 `voice.state.slots` 就能把
+「第几条远端音轨」翻译成「哪个成员」。真实发布者通过 `ReplaceTrack` 挂上，不改变已协商的 msid。
 
 ```json
 { "type": "media.signal", "payload": {

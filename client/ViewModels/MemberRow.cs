@@ -29,6 +29,13 @@ public sealed partial class MemberRow : ObservableObject
     /// <summary>「在语音」图标只在未静音时显示——静音时只留 🔇，避免两个图标并排。</summary>
     public bool IsSpeakingIconVisible => IsInVoice && !IsMuted;
 
+    /// <summary>
+    /// 是否正在说话（v2.7：pu_voice_tracks 的 peak 超过阈值 + voice.state.slots 映射到人）。
+    /// 成员行上点亮一个绿点，这是「我的麦到底有没有工作」最直接的用户反馈。
+    /// </summary>
+    [ObservableProperty]
+    private bool _isSpeaking;
+
     partial void OnIsInVoiceChanged(bool value) => OnPropertyChanged(nameof(IsSpeakingIconVisible));
 
     partial void OnIsMutedChanged(bool value) => OnPropertyChanged(nameof(IsSpeakingIconVisible));

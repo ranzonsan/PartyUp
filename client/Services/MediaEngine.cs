@@ -50,6 +50,12 @@ public sealed record MediaEvent(
 public sealed record MediaSource(string Id, string Title, uint Width, uint Height, uint Kind);
 
 /// <summary>
+/// 单条远端音频轨的统计（pu_voice_tracks）。relay 下 Id 形如 "partyup-slot-&lt;n&gt;"，
+/// 用 <see cref="ShareSession.VoiceSlots"/> 的映射翻译成成员。
+/// </summary>
+public sealed record VoiceTrackStats(string Id, uint PcmFrames, uint Peak, ulong LastFrameMs);
+
+/// <summary>
 /// 媒体核心（partyup_media.dll，ABI v2）的托管包装。
 ///
 /// 设计要点：
@@ -259,6 +265,42 @@ public sealed class MediaEngine : IDisposable
         var stats = new PuStats { StructSize = (uint)Marshal.SizeOf<PuStats>() };
         Check(NativeMethods.pu_peer_stats(_engine, ref stats), "pu_peer_stats");
         return stats;
+    }
+
+    /// <summary>
+    /// 读远端音频按轨统计（v2.7）。只返回活跃轨（近 1 秒内有过非静音帧），
+    /// 每条带 id（relay 下是 "partyup-slot-&lt;n&gt;"）、累计有声帧数、最近一帧峰值。
+    /// 用于「谁在说话」与按人排查质量；direct 模式下只有一条。
+    /// </summary>
+    public IReadOnlyList<VoiceTrackStats> GetVoiceTracks()
+    {
+        ThrowIfDisposed();
+        EnsureCreated();
+        var count = NativeMethods.pu_voice_tracks(_engine, null, 0);
+        if (count <= 0) return Array.Empty<VoiceTrackStats>();
+
+        var buffer = new PuVoiceTrack[count];
+        for (var i = 0; i < buffer.Length; i++)
+        {
+            buffer[i].StructSize = (uint)Marshal.SizeOf<PuVoiceTrack>();
+            buffer[i].Id = new byte[64];
+        }
+        var written = NativeMethods.pu_voice_tracks(_engine, buffer, (uint)buffer.Length);
+        if (written <= 0) return Array.Empty<VoiceTrackStats>();
+
+        var result = new List<VoiceTrackStats>(written);
+        for (var i = 0; i < written && i < buffer.Length; i++)
+        {
+            var raw = buffer[i];
+            var len = Array.IndexOf(raw.Id, (byte)0);
+            if (len < 0) len = raw.Id.Length;
+            result.Add(new VoiceTrackStats(
+                System.Text.Encoding.UTF8.GetString(raw.Id, 0, len),
+                raw.PcmFrames,
+                raw.Peak,
+                raw.LastFrameMs));
+        }
+        return result;
     }
 
     /// <summary>枚举可共享的屏幕/窗口（v2.3 起返回真实显示器 + 末尾 synthetic 项）。</summary>

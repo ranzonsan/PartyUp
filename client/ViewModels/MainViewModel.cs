@@ -124,6 +124,17 @@ public sealed partial class MainViewModel : ObservableObject
     partial void OnIsInVoiceChanged(bool value) => OnPropertyChanged(nameof(VoiceJoinButtonText));
 
 
+    /// <summary>连接状态提示（重连中显示「重连中…（第 N 次）」；正常时为空）。</summary>
+    [ObservableProperty]
+    private string _connectionStatusText = string.Empty;
+
+    /// <summary>是否正在重连（驱动顶部提示条可见性）。</summary>
+    [ObservableProperty]
+    private bool _isConnectionReconnecting;
+
+    /// <summary>路径变化历史（最新在前，最多 20 条），绑定到语音区下方的「路径记录」。</summary>
+    public ObservableCollection<string> PathHistoryLines { get; } = new();
+
     [ObservableProperty]
     private string _footerText = string.Empty;
 
@@ -370,6 +381,9 @@ public sealed partial class MainViewModel : ObservableObject
         connection.TextReceived += OnTextReceived;
         connection.PresenceChanged += OnPresenceChanged;
         connection.Closed += OnConnectionClosed;
+        connection.ConnectionLost += OnConnectionLost;
+        connection.Reconnecting += OnReconnecting;
+        connection.Reconnected += OnReconnected;
         _connection = connection;
 
         SelfName = member.Name;
@@ -593,8 +607,50 @@ public sealed partial class MainViewModel : ObservableObject
         Dispatcher.UIThread.Post(() =>
         {
             StatusText = "连接已断开：" + reason;
+            IsConnectionReconnecting = false;
+            ConnectionStatusText = string.Empty;
             IsLoggedIn = false;
             AppLog.Warn("gui: connection closed: " + reason);
+        });
+    }
+
+    /// <summary>连接丢失（非主动关闭）：显示重连状态，不要静默——用户要看到正在恢复。</summary>
+    private void OnConnectionLost(string reason)
+    {
+        Dispatcher.UIThread.Post(() =>
+        {
+            IsConnectionReconnecting = true;
+            ConnectionStatusText = "连接已断开：正在重连…";
+            StatusText = ConnectionStatusText;
+            AppLog.Warn("gui: connection lost: " + reason);
+        });
+    }
+
+    private void OnReconnecting(int attempt, int delayMs)
+    {
+        Dispatcher.UIThread.Post(() =>
+        {
+            IsConnectionReconnecting = true;
+            ConnectionStatusText = $"重连中…（第 {attempt} 次，{delayMs}ms 后重试）";
+            StatusText = ConnectionStatusText;
+            AppLog.Info($"gui: reconnecting attempt={attempt} delayMs={delayMs}");
+        });
+    }
+
+    private void OnReconnected()
+    {
+        Dispatcher.UIThread.Post(async () =>
+        {
+            IsConnectionReconnecting = false;
+            ConnectionStatusText = string.Empty;
+            StatusText = "已重新连接";
+            AppLog.Pass("gui: reconnected");
+            // 频道订阅已在连接层重放；这里只需把语音重新协商一遍（媒体引擎不重建）。
+            if (_share is { } share)
+            {
+                await share.HandleConnectionRestoredAsync();
+                SyncVoiceFromShare();
+            }
         });
     }
 
@@ -751,7 +807,24 @@ public sealed partial class MainViewModel : ObservableObject
             : $"语音：已加入（{share.VoiceMemberCount} 人）" +
               (share.IsVoiceMuted ? "，麦克风静音" : string.Empty) +
               (share.IsVoiceDeafened ? "，扬声器关闭" : string.Empty);
+        SyncPathHistory(share);
         RebuildMemberRows();
+    }
+
+    /// <summary>把路径变化历史同步到 UI（最新在前）。</summary>
+    private void SyncPathHistory(ShareSession share)
+    {
+        var snapshot = share.PathHistory.Select(e => e.ToString()).ToList();
+        if (snapshot.Count == PathHistoryLines.Count &&
+            snapshot.Where((line, i) => line != PathHistoryLines[i]).Any() is false)
+        {
+            return;
+        }
+        PathHistoryLines.Clear();
+        foreach (var line in snapshot)
+        {
+            PathHistoryLines.Add(line);
+        }
     }
 
     /// <summary>按最近一次 presence 快照 + 语音状态重建成员行（语音/静音图标绑在这些属性上）。</summary>
@@ -766,6 +839,7 @@ public sealed partial class MainViewModel : ObservableObject
             voice?.TryGetValue(member.MemberId, out state);
             Members.Add(new MemberRow(member.MemberId, member.Name)
             {
+                IsSpeaking = _share?.IsSpeaking(member.MemberId) == true,
                 IsInVoice = state is not null,
                 IsMuted = state?.Muted == true,
             });

@@ -100,6 +100,10 @@ internal static class NativeMethods
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
     public static extern int pu_voice_set_deafen(IntPtr engine, int deafened);
 
+    /// <summary>pu_voice_tracks(v2.7)：按轨读远端音频统计；out 为 null 时返回活跃轨数。</summary>
+    [DllImport(Library, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    public static extern int pu_voice_tracks(IntPtr engine, [In, Out] PuVoiceTrack[]? outTracks, uint capacity);
+
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
     public static extern int pu_screen_sources(IntPtr engine, ref PuSourceList list);
 
@@ -224,6 +228,25 @@ internal struct PuStats
     public uint RemoteHeight;
     public uint Reserved;
     public ulong LastRemoteFrameUs;
+}
+
+/// <summary>
+/// pu_voice_track（v2.7）：单条远端音频轨的统计。
+/// id 形如 "partyup-slot-&lt;n&gt;"（relay 槽位号），配合 voice.state.slots 映射到成员。
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct PuVoiceTrack
+{
+    public uint StructSize;
+    /// <summary>webrtc track id，UTF-8，最多 63 字节 + NUL。</summary>
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 64)]
+    public byte[] Id;
+    /// <summary>累计「有声」PCM 帧数（每帧 10 ms；静音帧不计）。</summary>
+    public uint PcmFrames;
+    /// <summary>最近一帧峰值振幅（16 bit 有符号采样绝对值）。</summary>
+    public uint Peak;
+    /// <summary>最近一帧的单调时钟毫秒；0 = 从未收到。</summary>
+    public ulong LastFrameMs;
 }
 
 /// <summary>pu_voice_params：C sizeof = 24。</summary>

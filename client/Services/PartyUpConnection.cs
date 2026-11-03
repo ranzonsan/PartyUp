@@ -22,8 +22,25 @@ public sealed class PartyUpConnection : IAsyncDisposable
     private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(20);
     private static readonly TimeSpan CloseTimeout = TimeSpan.FromSeconds(3);
 
-    private readonly ClientWebSocket _socket = new();
+    // 断线重连（v1 验收第 6 条）：退避 0.5s→1s→2s→4s→5s 封顶，无限重试直到成功或用户关闭。
+    private static readonly TimeSpan ReconnectBaseDelay = TimeSpan.FromMilliseconds(500);
+    private static readonly TimeSpan ReconnectMaxDelay = TimeSpan.FromSeconds(5);
+    // 心跳看门狗：服务端每 20s 发一次 ping；45s 收不到任何帧就认为连接已死（拔网线是静默的，
+    // 读阻塞不会自己返回，必须靠这个判死）。
+    private static readonly TimeSpan HeartbeatTimeout = TimeSpan.FromSeconds(45);
+    private static readonly TimeSpan WatchdogInterval = TimeSpan.FromSeconds(5);
+
+    private ClientWebSocket _socket = new();
     private readonly SemaphoreSlim _sendGate = new(1, 1);
+    private readonly object _subscribedGate = new();
+    private readonly HashSet<string> _subscribedChannels = new(StringComparer.Ordinal);
+    private Uri? _baseUri;
+    private string _token = string.Empty;
+    private long _lastInboundTicks;
+    private int _reconnecting; // 0/1，Interlocked 保护
+    private volatile bool _userClosed;
+    private int _reconnectAttempt;
+    private Task? _watchdog;
     private readonly ConcurrentDictionary<string, TaskCompletionSource<EnvelopeDto>> _pending = new(StringComparer.Ordinal);
     private readonly object _waiterGate = new();
     private readonly List<TextWaiter> _textWaiters = new();
@@ -54,7 +71,21 @@ public sealed class PartyUpConnection : IAsyncDisposable
     /// <summary>语音状态推送（voice.state，docs/PROTOCOL.md §4）。在接收循环线程触发。</summary>
     public event Action<VoiceStateDto>? VoiceStateChanged;
 
+    /// <summary>连接丢失（非主动关闭）；随后会自动进入重连。</summary>
+    public event Action<string>? ConnectionLost;
+
+    /// <summary>主动关闭（Dispose）或重连无法继续。</summary>
     public event Action<string>? Closed;
+
+    /// <summary>重连中：(第几次尝试, 本次等待毫秒)。</summary>
+    public event Action<int, int>? Reconnecting;
+
+    /// <summary>重连成功，且已重新认证、重放订阅。</summary>
+    public event Action? Reconnected;
+
+    public bool IsReconnecting => Volatile.Read(ref _reconnecting) == 1;
+
+    public int ReconnectAttempt => Volatile.Read(ref _reconnectAttempt);
 
     /// <summary>连接 + auth 握手。失败时连接已释放，不会泄漏半开状态。</summary>
     public static async Task<PartyUpConnection> ConnectAsync(Uri baseUri, string token, CancellationToken ct = default)
@@ -63,6 +94,7 @@ public sealed class PartyUpConnection : IAsyncDisposable
         try
         {
             await connection.OpenAsync(baseUri, token, ct);
+            connection._watchdog = Task.Run(connection.WatchdogLoopAsync, CancellationToken.None);
             return connection;
         }
         catch
@@ -85,11 +117,30 @@ public sealed class PartyUpConnection : IAsyncDisposable
         return dto.Channel;
     }
 
-    public Task SubscribeAsync(string channelId, CancellationToken ct = default) =>
-        RequestAsync<SubscribeAckDto>("channel.subscribe", new { channel_id = channelId }, ct);
+    /// <summary>订阅频道；记录到订阅名单，重连后自动重放。</summary>
+    public Task<SubscribeAckDto> SubscribeAsync(string channelId, CancellationToken ct = default) =>
+        SubscribeCoreAsync(channelId, ct);
 
-    public Task UnsubscribeAsync(string channelId, CancellationToken ct = default) =>
-        RequestAsync<SubscribeAckDto>("channel.unsubscribe", new { channel_id = channelId }, ct);
+    /// <summary>退订频道，同时从重连重放名单里移除。</summary>
+    public async Task<SubscribeAckDto> UnsubscribeAsync(string channelId, CancellationToken ct = default)
+    {
+        var ack = await RequestAsync<SubscribeAckDto>("channel.unsubscribe", new { channel_id = channelId }, ct);
+        lock (_subscribedGate)
+        {
+            _subscribedChannels.Remove(channelId);
+        }
+        return ack;
+    }
+
+    private async Task<SubscribeAckDto> SubscribeCoreAsync(string channelId, CancellationToken ct)
+    {
+        var ack = await RequestAsync<SubscribeAckDto>("channel.subscribe", new { channel_id = channelId }, ct);
+        lock (_subscribedGate)
+        {
+            _subscribedChannels.Add(channelId);
+        }
+        return ack;
+    }
 
     public async Task<TextSendAckDto> SendTextAsync(string channelId, string body, CancellationToken ct = default)
     {
@@ -99,6 +150,18 @@ public sealed class PartyUpConnection : IAsyncDisposable
             client_msg_id = Ulid.NewUlid().ToString(),
             body,
         }, ct);
+    }
+
+    /// <summary>当前订阅的频道（重连后按这份名单重放 channel.subscribe）。</summary>
+    public IReadOnlyList<string> SubscribedChannels
+    {
+        get
+        {
+            lock (_subscribedGate)
+            {
+                return _subscribedChannels.ToArray();
+            }
+        }
     }
 
     public async Task<IReadOnlyList<TextMessageDto>> HistoryAsync(string channelId, long beforeSeq = 0, int limit = 50, CancellationToken ct = default)
@@ -260,6 +323,7 @@ public sealed class PartyUpConnection : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        _userClosed = true;
         await _cts.CancelAsync();
         try
         {
@@ -276,15 +340,16 @@ public sealed class PartyUpConnection : IAsyncDisposable
         _socket.Dispose();
         _cts.Dispose();
         _sendGate.Dispose();
-        if (_receiveLoop is not null)
+        foreach (var task in new[] { _receiveLoop, _watchdog })
         {
+            if (task is null) continue;
             try
             {
-                await _receiveLoop;
+                await task;
             }
             catch (Exception)
             {
-                // 接收循环在取消时的异常是可预期的。
+                // 接收循环 / 看门狗在取消时的异常是可预期的。
             }
         }
     }
@@ -295,17 +360,28 @@ public sealed class PartyUpConnection : IAsyncDisposable
 
     private async Task OpenAsync(Uri baseUri, string token, CancellationToken ct)
     {
-        var builder = new UriBuilder(baseUri)
-        {
-            Scheme = baseUri.Scheme == Uri.UriSchemeHttps ? "wss" : "ws",
-            Path = "/ws",
-        };
-        await _socket.ConnectAsync(builder.Uri, ct);
+        _baseUri = baseUri;
+        _token = token;
+        await ConnectSocketAsync(ct);
         _receiveLoop = Task.Run(ReceiveLoopAsync, CancellationToken.None);
 
         var auth = await RequestAsync<AuthOkDto>("auth", new { token }, ct);
         Member = auth.Member;
         Server = auth.Server;
+    }
+
+    /// <summary>建一条新的 WebSocket（首次连接与每次重连都走这里；媒体引擎不重建）。</summary>
+    private async Task ConnectSocketAsync(CancellationToken ct)
+    {
+        if (_baseUri is null) throw new InvalidOperationException("connection base uri is missing");
+        var builder = new UriBuilder(_baseUri)
+        {
+            Scheme = _baseUri.Scheme == Uri.UriSchemeHttps ? "wss" : "ws",
+            Path = "/ws",
+        };
+        _socket = new ClientWebSocket();
+        await _socket.ConnectAsync(builder.Uri, ct);
+        Interlocked.Exchange(ref _lastInboundTicks, DateTime.UtcNow.Ticks);
     }
 
     private async Task<T> RequestAsync<T>(string type, object? payload, CancellationToken ct)
@@ -348,11 +424,17 @@ public sealed class PartyUpConnection : IAsyncDisposable
 
     private async Task SendEnvelopeAsync(EnvelopeDto envelope, CancellationToken ct)
     {
+        var socket = _socket;
+        if (socket.State != WebSocketState.Open)
+        {
+            // 断线期间请求快速失败（上层会把失败翻译成「重连中」），不要挂 20 秒超时。
+            throw new WebSocketException("connection is not open (reconnecting)");
+        }
         var bytes = JsonSerializer.SerializeToUtf8Bytes(envelope, JsonDefaults.Options);
         await _sendGate.WaitAsync(ct);
         try
         {
-            await _socket.SendAsync(bytes, WebSocketMessageType.Text, endOfMessage: true, ct);
+            await socket.SendAsync(bytes, WebSocketMessageType.Text, endOfMessage: true, ct);
         }
         finally
         {
@@ -375,7 +457,7 @@ public sealed class PartyUpConnection : IAsyncDisposable
                     result = await _socket.ReceiveAsync(new ArraySegment<byte>(buffer), _cts.Token);
                     if (result.MessageType == WebSocketMessageType.Close)
                     {
-                        Closed?.Invoke("server closed the connection");
+                        HandleConnectionLost("server closed the connection");
                         return;
                     }
                     message.Write(buffer, 0, result.Count);
@@ -403,20 +485,144 @@ public sealed class PartyUpConnection : IAsyncDisposable
         }
         catch (OperationCanceledException)
         {
-            // 正常关闭路径。
+            // 取消：只有非主动关闭才算断线（比如上层把连接掐了）。
+            if (!_userClosed) HandleConnectionLost("receive loop canceled");
         }
         catch (WebSocketException ex)
         {
-            Closed?.Invoke(ex.Message);
+            HandleConnectionLost(ex.Message);
         }
         catch (Exception ex)
         {
-            Closed?.Invoke(ex.Message);
+            HandleConnectionLost(ex.Message);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 断线重连
+    // ------------------------------------------------------------------
+
+    /// <summary>连接丢失：非主动关闭就进入自动重连（同一时刻只允许一个重连循环）。</summary>
+    private void HandleConnectionLost(string reason)
+    {
+        if (_userClosed)
+        {
+            Closed?.Invoke(reason);
+            return;
+        }
+        if (Interlocked.CompareExchange(ref _reconnecting, 1, 0) != 0)
+        {
+            return; // 已经在重连（或刚被别的路径触发），让现有循环继续。
+        }
+        AppLog.Warn($"ws: connection lost: {reason}");
+        ConnectionLost?.Invoke(reason);
+        _watchdog ??= Task.Run(WatchdogLoopAsync, CancellationToken.None);
+        _ = Task.Run(ReconnectLoopAsync, CancellationToken.None);
+    }
+
+    /// <summary>指数退避重连：0.5s→1s→2s→4s→5s 封顶，无限重试直到成功或用户关闭。</summary>
+    private async Task ReconnectLoopAsync()
+    {
+        try
+        {
+            for (var attempt = 1; !_userClosed && !_cts.IsCancellationRequested; attempt++)
+            {
+                Volatile.Write(ref _reconnectAttempt, attempt);
+                var delayMs = (int)Math.Min(
+                    ReconnectMaxDelay.TotalMilliseconds,
+                    ReconnectBaseDelay.TotalMilliseconds * Math.Pow(2, Math.Min(attempt - 1, 4)));
+                Reconnecting?.Invoke(attempt, delayMs);
+                AppLog.Info($"ws: reconnect attempt {attempt} in {delayMs}ms");
+                try
+                {
+                    await Task.Delay(delayMs, _cts.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+
+                try
+                {
+                    await ConnectSocketAsync(_cts.Token);
+                    _receiveLoop = Task.Run(ReceiveLoopAsync, CancellationToken.None);
+
+                    var auth = await RequestAsync<AuthOkDto>("auth", new { token = _token }, _cts.Token);
+                    Member = auth.Member;
+                    Server = auth.Server;
+
+                    // 重放订阅：频道 presence / voice.state 由服务端在 subscribe 时补推。
+                    foreach (var channelId in SubscribedChannels)
+                    {
+                        try
+                        {
+                            await SubscribeCoreAsync(channelId, _cts.Token);
+                            AppLog.Info($"ws: resubscribed channel={channelId}");
+                        }
+                        catch (Exception ex)
+                        {
+                            AppLog.Warn($"ws: resubscribe {channelId} failed: {ex.Message}");
+                        }
+                    }
+
+                    Volatile.Write(ref _reconnectAttempt, 0);
+                    Interlocked.Exchange(ref _reconnecting, 0);
+                    AppLog.Pass($"ws: reconnected (attempt {attempt})");
+                    Reconnected?.Invoke();
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    AppLog.Warn($"ws: reconnect attempt {attempt} failed: {ex.Message}");
+                    try { _socket.Dispose(); } catch { /* ignore */ }
+                }
+            }
+        }
+        finally
+        {
+            if (!_userClosed)
+            {
+                Interlocked.Exchange(ref _reconnecting, 0);
+            }
+        }
+    }
+
+    /// <summary>
+    /// 心跳看门狗：拔网线时 TCP 读会静默阻塞、ReceiveAsync 不会返回，
+    /// 所以用「45 秒没收到任何帧」作为判死条件，主动 Abort 让接收循环抛错进入重连。
+    /// </summary>
+    private async Task WatchdogLoopAsync()
+    {
+        while (!_userClosed && !_cts.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(WatchdogInterval, _cts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+            if (_socket.State != WebSocketState.Open) continue;
+            var last = new DateTime(Interlocked.Read(ref _lastInboundTicks), DateTimeKind.Utc);
+            if (DateTime.UtcNow - last <= HeartbeatTimeout) continue;
+
+            AppLog.Warn($"ws: no frame for {(DateTime.UtcNow - last).TotalSeconds:F0}s, treating connection as dead");
+            try
+            {
+                _socket.Abort();
+            }
+            catch (Exception)
+            {
+                // Abort 失败也没有别的补救手段，交给接收循环的异常路径。
+            }
         }
     }
 
     private async Task DispatchAsync(EnvelopeDto envelope)
     {
+        // 任何入站帧（含服务端每 20s 的 ping）都算活着的证据，喂给心跳看门狗。
+        Interlocked.Exchange(ref _lastInboundTicks, DateTime.UtcNow.Ticks);
         switch (envelope.Type)
         {
             case "ping":

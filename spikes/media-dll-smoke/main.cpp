@@ -89,6 +89,8 @@ int CheckUnimplementedSurface(pu_engine* engine) {
        PU_NOT_IMPLEMENTED},
       {"pu_voice_set_mute(idle)", pu_voice_set_mute(engine, 1), PU_ERR_STATE},
       {"pu_voice_set_deafen(idle)", pu_voice_set_deafen(engine, 1), PU_ERR_STATE},
+      // v2.7：未加入语音时按轨查询返回 0（也是「先问条数再分配」的用法）。
+      {"pu_voice_tracks(idle)", pu_voice_tracks(engine, nullptr, 0), 0},
       {"pu_screen_watch", pu_screen_watch(engine, "peer-1"), PU_NOT_IMPLEMENTED},
       {"pu_screen_unwatch", pu_screen_unwatch(engine, "peer-1"), PU_NOT_IMPLEMENTED},
   };

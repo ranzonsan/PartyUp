@@ -421,6 +421,25 @@ PU_API int pu_signal_in(pu_engine* e, const char* payload, size_t len);
  * 不加锁、不发异步 GetStats，微秒级返回，可以从任意线程周期性调用。 */
 PU_API int pu_peer_stats(pu_engine* e, pu_stats* out);
 
+/* v2.7：单条远端音频轨的实时统计（SFU 中继下一个 PC 上会挂多条远端音频轨）。
+ *
+ * 语义约定：
+ *   - 一条 track 对应一个远端说话人；本端自己的上行轨**不计入**。
+ *   - tracks=N（pu_voice_tracks 的返回条数）是「当前挂载的远端音频轨数」，
+ *     不等于频道人数（本端自己不算、还没协商出音频轨的人也不算）。
+ *   - last_frame_ms 是单调时钟毫秒（不随系统时间跳变），0 表示这条轨从未收到过音频。
+ *     调用方据此判活：now - last_frame_ms < 300 可视为「正在说话」。
+ *   - pu_voice_tracks() 只返回**活跃**轨（超过 1000 ms 没有新帧的轨会被过滤掉），
+ *     所以对端离开后留下的冻结记录不会出现。
+ */
+typedef struct pu_voice_track {
+  uint32_t struct_size;
+  char id[64];            /* 远端音频轨 id（webrtc track id，UTF-8，保证 NUL 结尾） */
+  uint32_t pcm_frames;    /* 累计解出的 PCM 帧数（每帧 10 ms） */
+  uint32_t peak;          /* 最近一帧峰值振幅（16 bit 有符号采样绝对值），可用于说话指示灯 */
+  uint64_t last_frame_ms; /* 最近一帧的单调时钟毫秒；0 = 从未收到 */
+} pu_voice_track;
+
 /* ---- 以下 9 个为下一版实现，签名冻结、当前统一返回 PU_NOT_IMPLEMENTED ---- */
 
 PU_API int pu_voice_join(pu_engine* e, const pu_voice_params* p);
@@ -428,6 +447,15 @@ PU_API int pu_voice_leave(pu_engine* e);
 PU_API int pu_voice_set_mode(pu_engine* e, pu_mode mode);
 PU_API int pu_voice_set_mute(pu_engine* e, int muted);
 PU_API int pu_voice_set_deafen(pu_engine* e, int deafened);
+
+/* v2.7：按轨读取远端的音频统计（谁在说话 / 按人排查质量）。
+ *
+ *   out == nullptr            → 返回当前活跃轨数（调用方先问条数再分配缓冲区）
+ *   out != nullptr, capacity  → 最多写 capacity 条，返回实际写入条数
+ * 每条 out[i] 的 struct_size 由调用方设置；函数按 min(struct_size, sizeof) 填充。
+ * 只返回活跃轨（last_frame_ms 在 1000 ms 内），冻结记录被过滤。
+ * 未加入语音时返回 0。 */
+PU_API int pu_voice_tracks(pu_engine* e, pu_voice_track* out, uint32_t capacity);
 
 /* v2.3 起实现：枚举可共享的源。out->struct_size 必须 >= sizeof(pu_source_list)。
  * 返回 PU_OK 时 out->items 指向库内存，有效期到下一次调用本函数或 pu_engine_destroy；

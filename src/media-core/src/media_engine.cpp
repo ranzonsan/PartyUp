@@ -579,8 +579,9 @@ class NullAudioDeviceModule
 // 由 ADM 播放线程调用，只碰原子量。
 class AudioCountSink : public webrtc::AudioTrackSinkInterface {
  public:
-  AudioCountSink(std::atomic<uint32_t>* frames, std::atomic<uint32_t>* peak)
-      : frames_(frames), peak_(peak) {}
+  AudioCountSink(std::atomic<uint32_t>* frames, std::atomic<uint32_t>* peak,
+                 std::atomic<int64_t>* last_ms)
+      : frames_(frames), peak_(peak), last_ms_(last_ms) {}
 
   void OnData(const void* audio_data, int bits_per_sample, int sample_rate,
               size_t number_of_channels, size_t number_of_frames,
@@ -588,6 +589,7 @@ class AudioCountSink : public webrtc::AudioTrackSinkInterface {
     static_cast<void>(sample_rate);
     static_cast<void>(absolute_capture_timestamp_ms);
     frames_->fetch_add(1, std::memory_order_relaxed);
+    if (last_ms_ != nullptr) last_ms_->store(NowUsSteady() / 1000, std::memory_order_relaxed);
     if (audio_data != nullptr && bits_per_sample == 16) {
       const int16_t* pcm = static_cast<const int16_t*>(audio_data);
       const size_t count = number_of_channels * number_of_frames;
@@ -603,6 +605,7 @@ class AudioCountSink : public webrtc::AudioTrackSinkInterface {
  private:
   std::atomic<uint32_t>* frames_;
   std::atomic<uint32_t>* peak_;
+  std::atomic<int64_t>* last_ms_;
 };
 
 class MediaEngine {
@@ -625,6 +628,8 @@ class MediaEngine {
   int VoiceSetMode(pu_mode mode);
   int VoiceSetMute(bool muted);
   int VoiceSetDeafen(bool deafened);
+  // v2.7：按轨读远端音频统计（out==nullptr 时只返回活跃轨数）。
+  int VoiceTracks(pu_voice_track* out, uint32_t capacity);
   int Stop();
   // v2.3：枚举可共享的源（真实显示器 + "synthetic"），结果缓存在成员里。
   int Sources(pu_source_list* out);
@@ -741,6 +746,7 @@ class MediaEngine {
     std::unique_ptr<AudioCountSink> sink;
     std::atomic<uint32_t> frames{0};
     std::atomic<uint32_t> peak{0};
+    std::atomic<int64_t> last_frame_ms{0};  // 单调时钟毫秒，用于判活/判「正在说话」
   };
   std::mutex audio_tracks_mu_;
   std::vector<std::unique_ptr<TrackAudioStat>> audio_tracks_;
@@ -970,7 +976,8 @@ class MediaEngine::PcObserver : public webrtc::PeerConnectionObserver {
     auto stat = std::make_unique<TrackAudioStat>();
     stat->id = id;
     stat->track = audio_track;
-    stat->sink = std::make_unique<AudioCountSink>(&stat->frames, &stat->peak);
+    stat->sink = std::make_unique<AudioCountSink>(&stat->frames, &stat->peak,
+                                                  &stat->last_frame_ms);
     audio_track->AddSink(stat->sink.get());
     engine_->audio_tracks_.push_back(std::move(stat));
     engine_->Log(3, "remote audio track -> sink: id=%s (total tracks=%zu)", id.c_str(),
@@ -2929,6 +2936,35 @@ int MediaEngine::VoiceSetDeafen(bool deafened) {
   return rc;
 }
 
+// v2.7：把每条还在出声的远端音频轨交给调用方。超过 kAudioTrackActiveMs 没有新帧的
+// 轨视为「已离开的冻结记录」，直接过滤——这样对端走了不需要等 transceiver 回调。
+int MediaEngine::VoiceTracks(pu_voice_track* out, uint32_t capacity) {
+  constexpr int64_t kAudioTrackActiveMs = 1000;
+  if (!voice_joined_) return 0;
+
+  const int64_t now_ms = NowUsSteady() / 1000;
+  uint32_t written = 0;
+  std::lock_guard<std::mutex> lock(audio_tracks_mu_);
+  for (const auto& stat : audio_tracks_) {
+    const int64_t last_ms = stat->last_frame_ms.load(std::memory_order_relaxed);
+    if (last_ms == 0 || now_ms - last_ms > kAudioTrackActiveMs) continue;
+    if (out != nullptr && written < capacity) {
+      pu_voice_track& item = out[written];
+      // struct_size 由调用方给；只按它允许的长度填充，向后兼容加字段。
+      const uint32_t limit = item.struct_size == 0 ? static_cast<uint32_t>(sizeof(item))
+                                                   : item.struct_size;
+      std::memset(&item, 0, limit < sizeof(item) ? limit : sizeof(item));
+      item.struct_size = static_cast<uint32_t>(sizeof(item));
+      std::snprintf(item.id, sizeof(item.id), "%s", stat->id.c_str());
+      item.pcm_frames = stat->frames.load(std::memory_order_relaxed);
+      item.peak = stat->peak.load(std::memory_order_relaxed);
+      item.last_frame_ms = static_cast<uint64_t>(last_ms);
+    }
+    ++written;
+  }
+  return static_cast<int>(written);
+}
+
 }  // namespace
 }  // namespace partyup
 
@@ -2961,6 +2997,12 @@ PU_API int pu_voice_set_mute(pu_engine* e, int muted) {
 PU_API int pu_voice_set_deafen(pu_engine* e, int deafened) {
   if (e == nullptr) return PU_ERR_INVALID_ARG;
   return e->core.VoiceSetDeafen(deafened != 0);
+}
+
+PU_API int pu_voice_tracks(pu_engine* e, pu_voice_track* out, uint32_t capacity) {
+  if (e == nullptr) return PU_ERR_INVALID_ARG;
+  if (out == nullptr || capacity == 0) return e->core.VoiceTracks(nullptr, 0);
+  return e->core.VoiceTracks(out, capacity);
 }
 
 PU_API int pu_screen_sources(pu_engine* e, pu_source_list* out) {

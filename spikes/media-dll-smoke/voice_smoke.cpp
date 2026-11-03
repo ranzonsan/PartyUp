@@ -149,6 +149,28 @@ int main() {
   }
   const uint32_t b_frames_end = ReceivedFrames(b);
 
+  // ---- 2c. 按轨查询（v2.7）：先问条数再取明细 ----
+  {
+    const int track_count = pu_voice_tracks(b, nullptr, 0);
+    std::printf("  pu_voice_tracks(NULL) -> %d track(s)\n", track_count);
+    if (track_count != 1) {
+      std::printf("FAIL: expected 1 active remote audio track, got %d\n", track_count);
+      return 1;
+    }
+    pu_voice_track item;
+    std::memset(&item, 0, sizeof(item));
+    item.struct_size = sizeof(item);
+    const int got = pu_voice_tracks(b, &item, 1);
+    std::printf("  pu_voice_tracks(1) -> %d: id=%.8s... pcmFrames=%u peak=%u last_frame_ms=%llu\n",
+                got, item.id, item.pcm_frames, item.peak,
+                static_cast<unsigned long long>(item.last_frame_ms));
+    if (got != 1 || item.pcm_frames == 0 || item.last_frame_ms == 0) {
+      std::printf("FAIL: per-track snapshot looks wrong (got=%d frames=%u last=%llu)\n", got,
+                  item.pcm_frames, static_cast<unsigned long long>(item.last_frame_ms));
+      return 1;
+    }
+  }
+
   // ---- 3. 拆除 ----
   for (pu_engine* e : {a, b}) {
     const int rc = pu_voice_leave(e);

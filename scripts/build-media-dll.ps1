@@ -251,6 +251,11 @@ if ($exportNames.Count -eq 0) { throw "dumpbin reported no exports — DLL is br
 if ($badExports.Count -ne 0) {
   throw "non pu_* exports found: $($badExports -join ', ')"
 }
+# 导出表断言：v2.7 起是 19 个。少一个说明有函数被剥掉，多一个说明有人没走 ABI 评审就加导出。
+$expectedExports = 19
+if ($exportNames.Count -ne $expectedExports) {
+  throw ("export count {0} != expected {1} (v2.7). names: {2}" -f $exportNames.Count, $expectedExports, ($exportNames -join ' '))
+}
 
 $dllInfo = Get-Item $dllOut
 $libInfo = Get-Item $dllLib

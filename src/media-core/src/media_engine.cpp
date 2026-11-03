@@ -81,6 +81,8 @@
 #include "api/jsep.h"
 #include "api/media_stream_interface.h"
 #include "api/media_types.h"
+#include "api/audio/create_audio_device_module.h"
+#include "api/environment/environment_factory.h"
 #include "api/peer_connection_interface.h"
 #include "api/rtc_error.h"
 #include "api/rtp_receiver_interface.h"
@@ -678,6 +680,11 @@ class MediaEngine {
   std::unique_ptr<webrtc::Thread> worker_;
   std::unique_ptr<webrtc::Thread> signaling_;
   webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> pc_factory_;
+  // v2.6：真实 WASAPI ADM（语音）。生命周期契约见 NullAudioDeviceModule 的注释：
+  // 创建、Terminate、析构必须在同一条线程 —— 这里全程用 signaling_ 线程，
+  // 且 ~MediaEngine 里「Terminate → 释放本引用 → 释放工厂」也在 signaling 线程上，
+  // 那时三条线程都还活着（见 dtor）。
+  webrtc::scoped_refptr<webrtc::AudioDeviceModule> voice_adm_;
 
   // 一路共享流的对象
   webrtc::scoped_refptr<ScreenVideoSource> source_;
@@ -900,10 +907,20 @@ MediaEngine::~MediaEngine() {
   if (signaling_ != nullptr) {
     signaling_->BlockingCall([this] {
       Log(3, "dtor: destroying factory (signaling thread)");
+      // 真 ADM 的生命周期契约：Terminate 与析构都必须与创建同线程（signaling）。
+      // 顺序：先 Terminate（停掉 WASAPI 采集/播放），再释放工厂（它持有一份引用），
+      // 最后释放本类持有的引用 —— 两条引用都在本线程释放，析构线程才是确定的。
+      if (voice_adm_ != nullptr) {
+        voice_adm_->Terminate();
+        Log(3, "dtor: voice ADM terminated");
+      }
       pc_factory_ = nullptr;
+      voice_adm_ = nullptr;
+      Log(3, "dtor: voice ADM released");
     });
   } else {
     pc_factory_ = nullptr;
+    voice_adm_ = nullptr;
   }
   Log(3, "dtor: factory released");
 
@@ -1067,11 +1084,23 @@ bool MediaEngine::Init(const pu_config* cfg, std::string* error) {
   deps.video_decoder_factory = partyup::CreatePartyUpVideoDecoderFactory();
   deps.audio_encoder_factory = webrtc::CreateBuiltinAudioEncoderFactory();
   deps.audio_decoder_factory = webrtc::CreateBuiltinAudioDecoderFactory();
-  // v2.2：注入空 ADM（见 NullAudioDeviceModule 的注释）——必须在 EnableMedia 之前，
-  // 否则 MediaFactoryImpl 会把 deps.adm（nullptr）交给 WebRtcVoiceEngine，后者用
-  // EnsureAudioDeviceModule() 建出真实的 Windows Core Audio ADM。
-  deps.adm = webrtc::scoped_refptr<webrtc::AudioDeviceModule>(
-      new webrtc::RefCountedObject<NullAudioDeviceModule>());
+  // v2.6：换成**真实** WASAPI ADM，语音才有麦克风/扬声器。
+  // 生命周期契约（NullAudioDeviceModule 注释里写的那条）在这里落实：
+  //   * 创建在 signaling 线程（本轮创建、Init、Terminate、析构都在这条线程）；
+  //   * ~MediaEngine 在 signaling 线程上先 Terminate 再释放本引用，最后释放工厂
+  //     （工厂自己也持有 deps.adm 的一个引用），因此 ADM 的析构同样发生在
+  //     signaling 线程，且此刻三条线程都还没 Stop。
+  signaling_->BlockingCall([&] {
+    const webrtc::Environment adm_env = webrtc::CreateEnvironment();
+    voice_adm_ = webrtc::CreateAudioDeviceModule(
+        adm_env, webrtc::AudioDeviceModule::kPlatformDefaultAudio);
+  });
+  if (voice_adm_ == nullptr) {
+    *error = "CreateAudioDeviceModule(kPlatformDefaultAudio) returned null";
+    SetLastError(*error);
+    return false;
+  }
+  deps.adm = voice_adm_;
   webrtc::EnableMedia(deps);
 
   pc_factory_ = webrtc::CreateModularPeerConnectionFactory(std::move(deps));

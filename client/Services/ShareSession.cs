@@ -548,9 +548,14 @@ public sealed class ShareSession : IAsyncDisposable
             try { _engine.VoiceLeave(); } catch { /* 收尾尽力而为 */ }
             // 频道语音满员是**预期内的正常拒绝**，不是故障：给用户一句能看懂的话，
             // 并明确文字聊天不受影响（免得以为整个频道进不去）。
-            LastError = ex is PartyUpApiException { Code: "CONFLICT" } api &&
-                        api.Message.Contains("channel voice is full")
-                ? "频道语音已满（最多 12 人），文字聊天不受影响"
+            // 两种模式各有上限：relay 槽位数 12；direct（P2P）只有 1v1=2 人。
+            // direct 的错误信息由服务端给出「出路」（--voice-mode=relay），原样透传最准确。
+            LastError = ex is PartyUpApiException { Code: "CONFLICT" } api
+                ? api.Message.Contains("直连模式")
+                    ? api.Message + "（文字聊天不受影响）"
+                    : api.Message.Contains("channel voice is full")
+                        ? "频道语音已满（最多 12 人），文字聊天不受影响"
+                        : "voice.join 失败：" + ex.Message
                 : "voice.join 失败：" + ex.Message;
             AppLog.Warn("voice: " + LastError);
             Changed?.Invoke();

@@ -238,6 +238,17 @@ relay/direct（那是 `voice.state.transport` 与服务端策略的事）。
 服务端**不发 offer**，只做 `media.signal` 转发（§4.2）：由成员之间自行 offer/answer
 （1:1 直连）。服务端仍维护 `voice.state`（谁在语音、谁静音），并拒绝 `voice.set_mode`。
 
+**direct 语音硬上限 = 2 人**（`DirectMaxMembers`，P2P mesh 只实现了 1v1）。
+第 3 个成员 `voice.join` 直接收 `CONFLICT`：
+
+```
+当前服务器配置为直连模式，语音最多 2 人；需要更多人请让管理员用 --voice-mode=relay 重启服务器
+```
+
+错误信息里带**出路**（改配置）是刻意的：不给用户出路，用户只会以为产品坏了。
+与 relay 的槽位门禁同类——direct 下第 3 人如果被放进来，同样会「能进但互相听不到」，
+属静默降级，所以必须拒绝。语音满**不影响文字**。
+
 ### 4.2 直连
 
 服务端只做中转与定向投递，不解析也不改写 SDP：

@@ -44,19 +44,24 @@ func TestVoiceRolesAssignedByServer(t *testing.T) {
 			t.Fatalf("roles = %v, want alice=answerer bob=offerer", roles)
 		}
 
-		// 3) 第三个人加入：不能因为新来者把已在通话的两人角色改掉（mesh 暂不支持）。
+		// 3) 第三个人：direct 是硬上限 2 人（P2P mesh 只实现 1v1），必须在 voice.join 被拒绝，
+		//    而不是「进来当 answerer 但互相听不到」。已在通话的两人角色不受影响。
+		//    （2026-11-04：此前这里允许 3 人加入并断言 carol=answerer，那是静默降级，
+		//     已在 TestVoiceDirectCapacityGate 里改为「明确拒绝」。）
 		carol, carolToken := env.registerViaInvite(env.newInvite(), "carol", "secret123")
 		carolWS := dialWS(t, env.http.URL, carolToken)
 		carolWS.subscribe(ch.ID)
 		aliceWS.waitForPresenceWith(ch.ID, 3)
-		carolWS.request(protocol.TypeVoiceJoin, protocol.VoiceJoinRequest{ChannelID: ch.ID})
-		st = waitVoiceState(t, aliceWS, func(s protocol.VoiceStatePayload) bool { return len(s.Members) == 3 })
+		if ep := joinVoiceExpectConflict(t, carolWS, ch.ID); ep.Code != protocol.CodeConflict {
+			t.Fatalf("third direct voice.join error code = %q, want CONFLICT", ep.Code)
+		}
+		st = waitVoiceState(t, aliceWS, func(s protocol.VoiceStatePayload) bool { return len(s.Members) == 2 })
 		roles = map[string]string{}
 		for _, m := range st.Members {
 			roles[m.MemberID] = m.Role
 		}
-		if roles[alice.ID] != "answerer" || roles[bob.ID] != "offerer" || roles[carol.ID] != "answerer" {
-			t.Fatalf("roles after third join = %v, want alice=answerer bob=offerer carol=answerer", roles)
+		if roles[alice.ID] != "answerer" || roles[bob.ID] != "offerer" || roles[carol.ID] != "" {
+			t.Fatalf("roles after rejected third join = %v, want alice=answerer bob=offerer carol=absent", roles)
 		}
 	})
 

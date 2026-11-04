@@ -23,6 +23,11 @@ import (
 	"partyup/internal/sfu"
 )
 
+// DirectMaxMembers 是 direct（P2P）语音的成员上限：P2P mesh 只实现了 1v1，
+// 第 3 个人即使加入也互相听不到，所以在 voice.join 时直接拒绝（与 relay 的
+// 槽位门禁同类：宁可明确报错，也不留静默降级）。
+const DirectMaxMembers = 2
+
 // NormalizeVoiceMode 归一化服务端语音传输策略：只接受 relay / direct，
 // 空值或无法识别的值一律回落到默认 relay（ADR-0002：语音默认中继）。
 //
@@ -283,15 +288,30 @@ func (c *conn) handleVoiceJoin(env protocol.Envelope) {
 	// 该频道**实际**的 transport（v1 与策略同值；直连失败降级后变 relay）。
 	transport, transportReason := h.channelTransportLocked(channelID)
 	_, already := members[memberID]
-	// 槽位 = 语音成员上限（sfu.MaxRemoteSlots 是每接收端预协商的 sendonly 槽数，
-	// 而槽位是「发布者→槽位」的全局唯一映射：N 个发布者就要 N 个槽）。
-	// 满了必须**明确拒绝**，不能让 assignSlotLocked 静默返回 -1——那样第 13 个人
-	// 能加入、能听见别人，但**没人能听见他**，用户只会觉得「怎么没人理我」。
-	if !already && transport == "relay" && len(members) >= sfu.MaxRemoteSlots {
-		h.mu.Unlock()
-		c.replyError(env.Type, protocol.CodeConflict,
-			fmt.Sprintf("channel voice is full (max %d)", sfu.MaxRemoteSlots), env.ID)
-		return
+	// 两种传输方式都有**人数硬上限**，满了必须明确拒绝而不是静默降级：
+	//   - relay：槽位 = 语音上限（sfu.MaxRemoteSlots 是每接收端预协商的 sendonly 槽数，
+	//     而槽位是「发布者→槽位」的全局唯一映射：N 个发布者就要 N 个槽）。
+	//     不做门禁的话第 13 个人能加入、能听见别人，但**没人能听见他**。
+	//   - direct：P2P 只支持 2 人（1v1），第 3 人进来同样是「能进但互相听不到」。
+	// 两类都是同一类静默降级，所以都在 join 时拦下（错误信息要给用户「出路」）。
+	if !already {
+		switch transport {
+		case "relay":
+			if len(members) >= sfu.MaxRemoteSlots {
+				h.mu.Unlock()
+				c.replyError(env.Type, protocol.CodeConflict,
+					fmt.Sprintf("channel voice is full (max %d)", sfu.MaxRemoteSlots), env.ID)
+				return
+			}
+		case "direct":
+			if len(members) >= DirectMaxMembers {
+				h.mu.Unlock()
+				c.replyError(env.Type, protocol.CodeConflict,
+					"当前服务器配置为直连模式，语音最多 2 人；"+
+						"需要更多人请让管理员用 --voice-mode=relay 重启服务器", env.ID)
+				return
+			}
+		}
 	}
 	if !already {
 		// 角色由服务端单一来源裁决（客户端只消费，不自行推断）：

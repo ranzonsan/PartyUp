@@ -1,0 +1,25 @@
+<!-- PartyUp installer splash, 500x300.
+     Mark geometry mirrors brand/v2/icon-mark.svg; type is Noto Sans (Regular / SemiBold).
+     Render: cairosvg at 2x then downscale with LANCZOS (see scripts/make-splash.py). -->
+<svg xmlns="http://www.w3.org/2000/svg" width="500" height="300" viewBox="0 0 500 300">
+  <rect width="500" height="300" fill="#0B0C0E"/>
+
+  <!-- 标志：奶白双竖条 + 橙圈，与 v2 图标同源 -->
+  <svg x="95" y="100" width="104" height="104" viewBox="0 0 1024 1024">
+    <g transform="translate(249.53,143.36) scale(1.47456) translate(0,-300)">
+      <g fill="none" stroke="#F4F1EA" stroke-width="80" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M40.0 340.0 L40.0 496.0"/>
+        <path d="M40.0 612.0 L40.0 760.0"/>
+      </g>
+      <circle cx="238" cy="418" r="78" fill="none" stroke="#FF5A2B" stroke-width="80"/>
+    </g>
+  </svg>
+
+  <!-- 字标（属于 logo，保留） -->
+  <text x="217" y="163" font-family="Noto Sans" font-weight="600" font-size="46"
+        fill="#F4F1EA" letter-spacing="0.1">PartyUp</text>
+
+  <!-- 唯一的状态文字 -->
+  <text x="250" y="232" font-family="Noto Sans" font-weight="400" font-size="16"
+        fill="#8A8F98" letter-spacing="0.8" text-anchor="middle">Installing……</text>
+</svg>

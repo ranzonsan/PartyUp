@@ -41,6 +41,16 @@
  *         urls 换行分隔的 "stun:host:port"；建 PC 前调用，之后新建的每条会话
  *         （屏幕 + 语音）都会带上；空串/NULL 清空。
  *       - 未调用或清空时行为与 v2.11 完全一致（host-only）。
+ *   v2.13（无 ABI 变化，导出仍 24 个；只改屏幕编码策略与内部实现）：兑现
+ *       PRODUCT.md「弱网降帧不降分辨率」，并让起播码率跟分辨率走。
+ *       - 屏幕 video sender 固定 degradation_preference = MAINTAIN_RESOLUTION
+ *         （弱网优先丢帧、不降分辨率，文字不糊）；content_hint = kText。
+ *       - 码率上限 3 Mbps / 下限 300 kbps（sender 的 RtpEncodingParameters，
+ *         编码器侧再夹一道）；上限是**平均**码率，关键帧突发的瞬时峰值会短暂超过它。
+ *       - 起播码率不再用 libwebrtc 的固定 300 kbps，改为
+ *         clamp(width*height*0.75, 800 kbps, 2.5 Mbps)（1440p -> 2.5 Mbps）。
+ *         仍是 UnconstrainedVBR，不是 CBR。
+ *       - 以上都是内部行为，调用方代码与签名无需任何改动。
  *
  * 线程约定：所有 pu_* 调用必须来自同一个「控制线程」（通常是 UI 线程），
  * 且不得在库触发的任何回调里重入——本库没有任何回调，通知一律走 pu_poll_event。

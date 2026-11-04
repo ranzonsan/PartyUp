@@ -435,6 +435,13 @@ class MfH264Encoder final : public webrtc::VideoEncoder {
   std::atomic<size_t> nv12_size_{0};
   int fps_ = 30;
   uint32_t bitrate_bps_ = 2'000'000;
+  // v2.13：码率上下限（bps）。来源是 sender 的 RtpEncodingParameters.max/min_bitrate_bps，
+  // libwebrtc 会把它放进 VideoCodec::maxBitrate/minBitrate 传给 InitEncode；
+  // 拿不到时用产品默认值（3 Mbps / 300 kbps）兜底，保证 MFT 一定拿到一个上限。
+  uint32_t max_bitrate_bps_ = 3'000'000;
+  uint32_t min_bitrate_bps_ = 300'000;
+  // 起播码率（bps）：按像素数算，不再用 libwebrtc 给的固定 300 kbps（1440p 起播会糊）。
+  uint32_t start_bitrate_bps_ = 0;
   // 已推给 MFT 但还没取回输出的帧（FIFO，1 进 1 出）。
   std::deque<InFlightMeta> in_flight_;
   int64_t encode_failures_ = 0;
@@ -490,9 +497,41 @@ int MfH264Encoder::InitEncode(const webrtc::VideoCodec* codec_settings,
     width_ = codec_settings->width;
     height_ = codec_settings->height;
     fps_ = codec_settings->maxFramerate > 0 ? static_cast<int>(codec_settings->maxFramerate) : 30;
-    bitrate_bps_ = codec_settings->startBitrate > 0
-                       ? static_cast<uint32_t>(codec_settings->startBitrate) * 1000u
-                       : 2'000'000u;
+    // ---- ⑤ 码率上下限（用户批准的方案：max 3 Mbps / min 300 kbps）----
+    // VideoCodec::maxBitrate/minBitrate 是 kbps；它们由 sender 的 RtpEncodingParameters
+    // 经 libwebrtc 的 VideoEncoderConfig 落进来。为 0 时（sender 参数没生效）用产品默认值，
+    // 保证「一定有上限」这件事不依赖上层是否设对。
+    max_bitrate_bps_ = codec_settings->maxBitrate > 0
+                           ? static_cast<uint32_t>(codec_settings->maxBitrate) * 1000u
+                           : 3'000'000u;
+    min_bitrate_bps_ = codec_settings->minBitrate > 0
+                           ? static_cast<uint32_t>(codec_settings->minBitrate) * 1000u
+                           : 300'000u;
+    // 防御：min > max 是空区间（比如测试把 max 压到 200 kbps、产品下限还是 300 kbps）。
+    // 这时以上限为准，否则夹取的结果会反过来把实际码率抬上去。
+    if (min_bitrate_bps_ > max_bitrate_bps_) min_bitrate_bps_ = max_bitrate_bps_;
+    // ---- ④ 起播码率与分辨率脱钩 ----
+    // 原来直接吃 libwebrtc 的 startBitrate（实测恒为 300 kbps，1440p 起播要糊几十秒）。
+    // 改成按像素数算：start = clamp(pixels * 0.75, 800 kbps, 2.5 Mbps)
+    //   1920x1080 = 2.07 Mpx -> 1.56 Mbps
+    //   2560x1440 = 3.69 Mpx -> 2.77 Mbps -> 撞 2.5 Mbps 上限
+    //   1280x720  = 0.92 Mpx -> 691 kbps -> 抬到 800 kbps 下限
+    // 再夹进 [min,max]（测试用 200 kbps 上限时必须能被压住）。仍是 UnconstrainedVBR，
+    // 起播码率只是「第一秒的出发点」，不是 CBR 的目标。
+    const uint64_t pixels =
+        static_cast<uint64_t>(codec_settings->width) * static_cast<uint64_t>(codec_settings->height);
+    uint64_t start_bps = pixels * 3 / 4;
+    if (start_bps < 800'000ull) start_bps = 800'000ull;
+    if (start_bps > 2'500'000ull) start_bps = 2'500'000ull;
+    if (start_bps < min_bitrate_bps_) start_bps = min_bitrate_bps_;
+    if (start_bps > max_bitrate_bps_) start_bps = max_bitrate_bps_;
+    start_bitrate_bps_ = static_cast<uint32_t>(start_bps);
+    bitrate_bps_ = start_bitrate_bps_;
+    std::fprintf(stderr,
+                 "[partyup-media] h264 encoder: bitrate plan %dx%d -> start=%u bps "
+                 "(libwebrtc offered startBitrate=%u kbps), min=%u, max=%u\n",
+                 codec_settings->width, codec_settings->height, start_bitrate_bps_,
+                 codec_settings->startBitrate, min_bitrate_bps_, max_bitrate_bps_);
     stop_ = false;
     setup_done_ = false;
     setup_ok_ = false;
@@ -693,14 +732,44 @@ bool MfH264Encoder::OpenOnWorkerThread() {
   }
 
   // 2. 事件流开始。之后的编码循环按 NeedInput/HaveOutput 驱动。
+  // v2.13：把码率上下限也设到 MFT 上（VideoCodec::maxBitrate/minBitrate 这一半）。
+  // MeanBitRate 由 SetRates 动态下发；Max/Min 是硬边界，建流时定、由 MFT 自己夹。
+  if (codec_api_ != nullptr) {
+    const struct {
+      const GUID* api;
+      uint32_t value;
+      const char* name;
+    } limits[] = {
+        {&CODECAPI_AVEncCommonMinBitRate, min_bitrate_bps_, "min bitrate"},
+        {&CODECAPI_AVEncCommonMaxBitRate, max_bitrate_bps_, "max bitrate"},
+    };
+    for (const auto& limit : limits) {
+      VARIANT value;
+      VariantInit(&value);
+      value.vt = VT_UI4;
+      value.ulVal = static_cast<ULONG>(limit.value);
+      const HRESULT hr = codec_api_->SetValue(limit.api, &value);
+      VariantClear(&value);
+      if (hr == S_OK) {
+        std::fprintf(stderr, "[partyup-media] h264 encoder: %s = %u bps\n", limit.name,
+                     limit.value);
+      } else {
+        std::fprintf(stderr,
+                     "[partyup-media] h264 encoder: %s = %u NOT APPLIED (hr=0x%08X%s)\n",
+                     limit.name, limit.value, static_cast<unsigned>(hr),
+                     hr == S_FALSE ? " S_FALSE=read-only" : "");
+      }
+    }
+  }
   mft_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
   mft_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
   nv12_size_ = static_cast<size_t>(width_) * static_cast<size_t>(height_) * 3 / 2;
   std::fprintf(stderr,
-               "[partyup-media] h264 encoder ready: %s (%s) %dx%d @%d, bitrate=%u bps, "
-               "async=%d\n",
+               "[partyup-media] h264 encoder ready: %s (%s) %dx%d @%d, start=%u bps "
+               "(min=%u max=%u), async=%d\n",
                name.c_str(), hardware_ ? "hardware MFT" : "software MFT", width_.load(),
-               height_.load(), fps_, bitrate_bps_, async_ ? 1 : 0);
+               height_.load(), fps_, start_bitrate_bps_, min_bitrate_bps_, max_bitrate_bps_,
+               async_ ? 1 : 0);
   return true;
 }
 
@@ -729,6 +798,13 @@ void MfH264Encoder::ApplyPendingRates() {
     fps = requested_fps_;
   }
   if (codec_api_ == nullptr) return;
+  // v2.13：不管 GCC 给什么目标值，都夹在我们的上下限里再下发。上限保证「内容突变时
+  // 不会冲过 3 Mbps」，下限保证「不会压到完全没画面」。GCC 自己的目标值会同时受
+  // sender 的 max_bitrate_bps 约束，这里是第二道闸（防 libwebrtc 版本行为差异）。
+  if (bitrate_bps > 0) {
+    if (bitrate_bps < static_cast<int>(min_bitrate_bps_)) bitrate_bps = static_cast<int>(min_bitrate_bps_);
+    if (bitrate_bps > static_cast<int>(max_bitrate_bps_)) bitrate_bps = static_cast<int>(max_bitrate_bps_);
+  }
   // 限流：WebRTC 的 SetRates 在拥塞控制下可能每帧都调一次，而 NVENC/Intel 的
   // ICodecAPI 重配是数十毫秒级的重活——每帧重配会把编码线程堵死、编码数掉到
   // 推送数的 0.67x（实测）。所以只在「码率变化超过 15%」或「帧率变了」且距上次

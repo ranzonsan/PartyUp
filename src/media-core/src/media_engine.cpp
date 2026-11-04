@@ -714,7 +714,7 @@ class MediaEngine {
   //   PARTYUP_MEDIA_TEST_MAX_BITRATE=<bps>       → encodings[0].max_bitrate_bps
   //   PARTYUP_MEDIA_TEST_DEGRADATION=maintain_resolution|maintain_framerate|balanced
   // 生产路径不会设这两个变量，函数第一行就返回，行为与之前完全一致。
-  void ApplyTestSenderParamsOnSignalingThread();
+  void ApplyVideoSenderParamsOnSignalingThread();
   // v2.6：语音（1:1 直连）。全部在控制线程调用，内部把 PC/ADM 操作投 signaling 线程。
   int VoiceJoin(const pu_voice_params* params, std::string* error);
   int VoiceLeave();
@@ -1597,6 +1597,15 @@ int MediaEngine::Start(const char* screen_id, uint32_t flags, std::string* error
       return;
     }
     track_ = track;
+    // v2.13：屏幕共享的内容特性是「文字/细节」，不是摄像头视频。content_hint 会被
+    // libwebrtc 内部用于：传给编码器的 VideoCodecMode（kScreensharing vs
+    // kRealtimeVideo）、send-side BWE 的码率分配策略、quality scaler 的取舍。
+    // 我们的 MFT 编码器目前不读 codec_settings->mode，但上游这几处决策都吃这个 hint，
+    // 所以仍然必须设对（否则等于按"视频通话"来分配码率）。
+    track_->set_content_hint(webrtc::VideoTrackInterface::ContentHint::kText);
+    // 读回断言：content_hint 是虚函数、默认实现是空体，设错了不会报错。
+    Log(1, "video content hint: set=kText(3) read-back=%d",
+        static_cast<int>(track_->content_hint()));
   });
   if (track_ == nullptr) {
     ReleaseStreamObjects();
@@ -1795,61 +1804,121 @@ void MediaEngine::ApplyIceServersToConfig(
   config->servers = ice_servers_;
 }
 
-// v2.13（测试专用）：把「码率上限 / 降级偏好」临时套到屏幕 sender 上。
-// 存在的唯一理由：实测 has_trusted_rate_controller=false 时 libwebrtc 的 quality
-// scaler / BalancedDegradationSettings 会不会尝试降分辨率，以及降了之后我们那个
-// 「MFT 类型协商是静态的」编码器会不会把画面搞死。
-// 必须跑在 signaling 线程（RtpSenderInterface 的线程断言）。
-void MediaEngine::ApplyTestSenderParamsOnSignalingThread() {
+// v2.13：把 degradation 枚举写成日志用的短名（不用 libwebrtc 的
+// DegradationPreferenceToString，避免依赖 webrtc.lib 里那个符号是否被链进来）。
+// 注意 DISABLED 与 MAINTAIN_FRAMERATE_AND_RESOLUTION 是同一个值，只能列一个 case。
+const char* DegradationName(webrtc::DegradationPreference preference) {
+  switch (preference) {
+    case webrtc::DegradationPreference::MAINTAIN_FRAMERATE_AND_RESOLUTION:
+      return "maintain_framerate_and_resolution";
+    case webrtc::DegradationPreference::MAINTAIN_FRAMERATE:
+      return "maintain_framerate";
+    case webrtc::DegradationPreference::MAINTAIN_RESOLUTION:
+      return "maintain_resolution";
+    case webrtc::DegradationPreference::BALANCED:
+      return "balanced";
+  }
+  return "unknown";
+}
+
+// v2.13：屏幕 sender 的**产品级**发送参数（外加三个测试专用覆盖开关）。
+// 必须跑在 signaling 线程（RtpSenderInterface 有线程断言）。
+//
+// 产品默认值（来自用户批准的码率五步方案）：
+//   * degradation_preference = MAINTAIN_RESOLUTION —— 弱网**降帧不降分辨率**，
+//     这是 PRODUCT.md 的明写承诺（文字不能糊）。注意 libwebrtc 默认是 BALANCED。
+//   * max_bitrate_bps = 3 Mbps   —— 1080p30 的舒适值，也是内容突变时的硬上限。
+//   * min_bitrate_bps = 300 kbps —— 别被压到完全没有可用画面。
+//
+// 为什么必须**读回**再断言：`RtpSenderInterface::SetParameters()` 在很多情况下
+// （例如 sender 还没协商、或该字段被下层忽略）只是"没报错"，值并不会落地。
+// 这里把 GetParameters() 的结果打出来，并对 degradation 做显式比对 —— 不静默。
+//
+// 测试专用覆盖（生产不设即零行为，见 h264_degrade_smoke / bitrate_policy_smoke）：
+//   PARTYUP_MEDIA_TEST_MAX_BITRATE=<bps>       → 覆盖 max_bitrate_bps
+//   PARTYUP_MEDIA_TEST_DEGRADATION=maintain_resolution|maintain_framerate|balanced
+//   PARTYUP_MEDIA_TEST_SCALE_DOWN_BY=<n>       → 强制上游 1/n 缩放（用于逼降分辨率）
+void MediaEngine::ApplyVideoSenderParamsOnSignalingThread() {
   if (video_sender_ == nullptr) return;
 
-  char max_bitrate_text[64] = {0};
-  const DWORD max_bitrate_len =
-      ::GetEnvironmentVariableA("PARTYUP_MEDIA_TEST_MAX_BITRATE", max_bitrate_text,
-                                static_cast<DWORD>(sizeof(max_bitrate_text)));
-  const int max_bitrate_bps =
-      max_bitrate_len > 0 ? std::atoi(max_bitrate_text) : 0;
-
-  char degradation_text[64] = {0};
-  const DWORD degradation_len =
-      ::GetEnvironmentVariableA("PARTYUP_MEDIA_TEST_DEGRADATION", degradation_text,
-                                static_cast<DWORD>(sizeof(degradation_text)));
-  const std::string degradation = degradation_len > 0 ? std::string(degradation_text) : "";
-
-  // 这个才是「确定性触发降分辨率」的仪器：libwebrtc 会把帧在上游缩到 1/N，然后
-  // 用新尺寸再调一次 InitEncode —— 正好压在我们那个「MFT 类型协商是静态的」地雷上。
-  char scale_text[64] = {0};
-  const DWORD scale_len =
-      ::GetEnvironmentVariableA("PARTYUP_MEDIA_TEST_SCALE_DOWN_BY", scale_text,
-                                static_cast<DWORD>(sizeof(scale_text)));
-  const double scale_down_by = scale_len > 0 ? std::atof(scale_text) : 0.0;
-
-  if (max_bitrate_bps <= 0 && degradation.empty() && scale_down_by <= 1.0) {
-    return;  // 生产路径
-  }
+  constexpr int kProductMaxBitrateBps = 3'000'000;  // 3 Mbps
+  constexpr int kProductMinBitrateBps = 300'000;    // 300 kbps
 
   webrtc::RtpParameters parameters = video_sender_->GetParameters();
   if (parameters.encodings.empty()) {
     parameters.encodings.push_back(webrtc::RtpEncodingParameters{});
   }
-  if (max_bitrate_bps > 0) parameters.encodings[0].max_bitrate_bps = max_bitrate_bps;
-  if (scale_down_by > 1.0) parameters.encodings[0].scale_resolution_down_by = scale_down_by;
-  if (degradation == "maintain_resolution") {
-    // 保分辨率、允许降帧 —— PRODUCT.md 承诺的那一档。
-    parameters.degradation_preference = webrtc::DegradationPreference::MAINTAIN_RESOLUTION;
-  } else if (degradation == "maintain_framerate") {
+  parameters.degradation_preference = webrtc::DegradationPreference::MAINTAIN_RESOLUTION;
+  parameters.encodings[0].max_bitrate_bps = kProductMaxBitrateBps;
+  parameters.encodings[0].min_bitrate_bps = kProductMinBitrateBps;
+
+  // ---- 测试覆盖：只影响显式设了环境变量的测试进程 ----
+  char max_bitrate_text[64] = {0};
+  const DWORD max_bitrate_len =
+      ::GetEnvironmentVariableA("PARTYUP_MEDIA_TEST_MAX_BITRATE", max_bitrate_text,
+                                static_cast<DWORD>(sizeof(max_bitrate_text)));
+  const int test_max_bitrate_bps = max_bitrate_len > 0 ? std::atoi(max_bitrate_text) : 0;
+  if (test_max_bitrate_bps > 0) {
+    parameters.encodings[0].max_bitrate_bps = test_max_bitrate_bps;
+    // 测试要压到 200 kbps 时，产品下限 300 kbps 会把目标夹回去（min>max 是空区间）。
+    // 两处都守法：这里把 min 跟着降下来，encoder 侧还有一道 min<=max 的兜底。
+    if (parameters.encodings[0].min_bitrate_bps &&
+        *parameters.encodings[0].min_bitrate_bps > test_max_bitrate_bps) {
+      parameters.encodings[0].min_bitrate_bps = test_max_bitrate_bps;
+    }
+  }
+
+  char degradation_text[64] = {0};
+  const DWORD degradation_len =
+      ::GetEnvironmentVariableA("PARTYUP_MEDIA_TEST_DEGRADATION", degradation_text,
+                                static_cast<DWORD>(sizeof(degradation_text)));
+  const std::string test_degradation =
+      degradation_len > 0 ? std::string(degradation_text) : "";
+  if (test_degradation == "maintain_framerate") {
     parameters.degradation_preference = webrtc::DegradationPreference::MAINTAIN_FRAMERATE;
-  } else if (degradation == "balanced") {
+  } else if (test_degradation == "balanced") {
     parameters.degradation_preference = webrtc::DegradationPreference::BALANCED;
   }
+
+  // 这个才是「确定性触发降分辨率」的仪器：libwebrtc 会把帧在上游缩到 1/N，然后用
+  // 新尺寸再调一次 InitEncode —— 正好压在我们那个「MFT 类型协商是静态的」地雷上。
+  char scale_text[64] = {0};
+  const DWORD scale_len =
+      ::GetEnvironmentVariableA("PARTYUP_MEDIA_TEST_SCALE_DOWN_BY", scale_text,
+                                static_cast<DWORD>(sizeof(scale_text)));
+  const double test_scale_down_by = scale_len > 0 ? std::atof(scale_text) : 0.0;
+  if (test_scale_down_by > 1.0) {
+    parameters.encodings[0].scale_resolution_down_by = test_scale_down_by;
+  }
+
   const webrtc::RTCError error = video_sender_->SetParameters(parameters);
   if (!error.ok()) {
-    Log(1, "test sender params: SetParameters failed: %s", error.message());
-    return;
+    Log(1, "video sender params: SetParameters FAILED: %s", error.message());
   }
-  Log(1, "test sender params: max_bitrate_bps=%d degradation=%s (encodings=%zu)",
-      max_bitrate_bps, degradation.empty() ? "(unchanged)" : degradation.c_str(),
-      parameters.encodings.size());
+
+  // ---- 读回断言：不信 SetParameters 的返回值，只信 GetParameters 的结果 ----
+  const webrtc::RtpParameters effective = video_sender_->GetParameters();
+  const auto effective_degradation = effective.degradation_preference;
+  int effective_max = 0;
+  int effective_min = 0;
+  if (!effective.encodings.empty()) {
+    if (effective.encodings[0].max_bitrate_bps) effective_max = *effective.encodings[0].max_bitrate_bps;
+    if (effective.encodings[0].min_bitrate_bps) effective_min = *effective.encodings[0].min_bitrate_bps;
+  }
+  Log(1, "video sender params read-back: degradation=%s max_bitrate_bps=%d min_bitrate_bps=%d",
+      effective_degradation ? DegradationName(*effective_degradation) : "(unset)",
+      effective_max, effective_min);
+  if (!effective_degradation ||
+      *effective_degradation != webrtc::DegradationPreference::MAINTAIN_RESOLUTION) {
+    // 这是「承诺落空」的直接证据，必须显式报出来（用户明确要求用读回值断言）。
+    Log(1, "video sender params: WARNING degradation_preference DID NOT STICK "
+           "(wanted main-resolve, got %s) -- 弱网仍会降分辨率",
+        effective_degradation ? DegradationName(*effective_degradation) : "(unset)");
+  }
+  if (effective_max != parameters.encodings[0].max_bitrate_bps.value_or(0)) {
+    Log(1, "video sender params: WARNING max_bitrate_bps did not stick (wanted %d, got %d)",
+        parameters.encodings[0].max_bitrate_bps.value_or(0), effective_max);
+  }
 }
 
 int MediaEngine::Stop() {
@@ -2360,7 +2429,7 @@ bool MediaEngine::EnsurePeerConnection(bool for_sending, std::string* error) {
         }
         // v2.13：两条建轨路径都留下 sender（测试钩子与将来的 degradation 配置要用）。
         video_sender_ = added.value();
-        ApplyTestSenderParamsOnSignalingThread();
+        ApplyVideoSenderParamsOnSignalingThread();
       });
       if (!add_error.empty()) {
         *error = add_error;
@@ -2401,7 +2470,7 @@ bool MediaEngine::EnsurePeerConnection(bool for_sending, std::string* error) {
       }
       // v2.13：留下 sender，并按测试环境变量决定是否收紧码率上限/降级偏好。
       video_sender_ = added.value();
-      ApplyTestSenderParamsOnSignalingThread();
+      ApplyVideoSenderParamsOnSignalingThread();
       // v2.4：把 H.264 钉到编解码器偏好首位。硬件 NVENC 只做 H.264，VP8 只能
       // 软件编码；工厂已经按 H.264 在前返回，这里再把偏好显式写一次，免得 SDP
       // 里 VP8 的 payload type 更小而被对端优先选中。H.264 不可用时列表里没有
@@ -2732,6 +2801,9 @@ int MediaEngine::SignalIn(const char* media, const char* payload, size_t len,
                       added.error().message();
         } else {
           video_sender_ = added.value();
+          // v2.13：被动方（relay 里本端采屏、对端 offer）同样要产品级发送参数：
+          // 降帧不降分辨率 + 码率上下限。两条建轨路径必须一致。
+          ApplyVideoSenderParamsOnSignalingThread();
         }
       });
       if (!add_error.empty()) {

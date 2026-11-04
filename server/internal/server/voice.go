@@ -283,6 +283,16 @@ func (c *conn) handleVoiceJoin(env protocol.Envelope) {
 	// 该频道**实际**的 transport（v1 与策略同值；直连失败降级后变 relay）。
 	transport, transportReason := h.channelTransportLocked(channelID)
 	_, already := members[memberID]
+	// 槽位 = 语音成员上限（sfu.MaxRemoteSlots 是每接收端预协商的 sendonly 槽数，
+	// 而槽位是「发布者→槽位」的全局唯一映射：N 个发布者就要 N 个槽）。
+	// 满了必须**明确拒绝**，不能让 assignSlotLocked 静默返回 -1——那样第 13 个人
+	// 能加入、能听见别人，但**没人能听见他**，用户只会觉得「怎么没人理我」。
+	if !already && transport == "relay" && len(members) >= sfu.MaxRemoteSlots {
+		h.mu.Unlock()
+		c.replyError(env.Type, protocol.CodeConflict,
+			fmt.Sprintf("channel voice is full (max %d)", sfu.MaxRemoteSlots), env.ID)
+		return
+	}
 	if !already {
 		// 角色由服务端单一来源裁决（客户端只消费，不自行推断）：
 		//   - relay：服务端 SFU 是 offerer，所有成员都是 answerer；

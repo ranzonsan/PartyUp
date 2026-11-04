@@ -39,7 +39,8 @@ func main() {
 		server      = flag.String("server", "http://127.0.0.1:19001", "服务端 HTTP 地址")
 		adminToken  = flag.String("admin-token", "", "管理员 token（用于自动建频道）")
 		channelID   = flag.String("channel-id", "", "已有频道 id（与 -admin-token 二选一）")
-		channelName = flag.String("channel-name", "loadtest", "自动创建的频道名")
+		channelName = flag.String("channel-name", "loadtest", "自动创建的频道名前缀（多频道为 <name>-0..N-1）")
+		channels    = flag.Int("channels", 1, "频道数：成员按 i%channels 分摊到各频道（50 人用 5 频道 × 10 人）")
 		tokensFile  = flag.String("tokens-file", "", "成员 token 文件（每行一个，可 name=token）")
 		members     = flag.Int("members", 12, "参与压测的成员数")
 		duration    = flag.Duration("duration", 20*time.Second, "所有成员进语音后持续压测的时长")
@@ -60,7 +61,10 @@ func main() {
 	}
 
 	// 1) 管理员：建频道（如果没指定已有频道）。
-	if *channelID == "" {
+	chanIDs := make([]string, 0, *channels)
+	if *channelID != "" {
+		chanIDs = append(chanIDs, *channelID)
+	} else {
 		if *adminToken == "" {
 			fatalf("either -channel-id or -admin-token is required")
 		}
@@ -71,12 +75,18 @@ func main() {
 		if err := admin.connect(); err != nil {
 			fatalf("admin connect: %v", err)
 		}
-		ch, err := admin.createChannel(*channelName)
-		if err != nil {
-			fatalf("create channel: %v", err)
+		for i := 0; i < *channels; i++ {
+			name := *channelName
+			if *channels > 1 {
+				name = fmt.Sprintf("%s-%d", *channelName, i)
+			}
+			ch, err := admin.createChannel(name)
+			if err != nil {
+				fatalf("create channel %q: %v", name, err)
+			}
+			chanIDs = append(chanIDs, ch)
+			fmt.Printf("CHANNEL_ID=%s name=%s\n", ch, name)
 		}
-		*channelID = ch
-		fmt.Printf("CHANNEL_ID=%s\n", ch)
 		admin.close()
 	}
 
@@ -92,9 +102,10 @@ func main() {
 		}
 		clients = append(clients, c)
 		wg.Add(1)
+		chID := chanIDs[i%len(chanIDs)]
 		go func() {
 			defer wg.Done()
-			if err := c.joinVoice(*channelID); err != nil {
+			if err := c.joinVoice(chID); err != nil {
 				fmt.Printf("JOIN_FAILED name=%s err=%v\n", c.name, err)
 				return
 			}
@@ -129,7 +140,16 @@ func main() {
 		PPS        int64  `json:"pps"`
 	}
 	stats := make([]peerStat, 0, len(clients))
-	minTracks, minPublishers := 1<<30, 1<<30
+	// 每个频道的人数（i%channels 分摊），据此算每人应收到几路。
+	chanCounts := make(map[string]int, len(chanIDs))
+	expectByPeer := make([]int, len(clients))
+	for i := range clients {
+		chanCounts[chanIDs[i%len(chanIDs)]]++
+	}
+	for i, c := range clients {
+		expectByPeer[i] = chanCounts[c.channelID] - 1
+	}
+	minTracks, minPublishers, minDeficit := 1<<30, 1<<30, 0
 	var totalPPS int64
 	for i, c := range clients {
 		tracks, publishers, packets := c.snapshot()
@@ -144,16 +164,33 @@ func main() {
 		if publishers < minPublishers {
 			minPublishers = publishers
 		}
+		if d := expectByPeer[i] - tracks; d > minDeficit {
+			minDeficit = d
+		}
 		totalPPS += pps
 	}
 	sort.Slice(stats, func(i, j int) bool { return stats[i].Name < stats[j].Name })
+	// 单频道时 expect=members-1；多频道时每频道人数可能不同，取各频道期望的最小值。
+	minExpect := 1 << 30
+	for _, n := range chanCounts {
+		if n-1 < minExpect {
+			minExpect = n - 1
+		}
+	}
+	chanSummary := make(map[string]int, len(chanCounts))
+	for _, ch := range chanIDs {
+		chanSummary[ch] = chanCounts[ch]
+	}
 
 	summary := map[string]any{
 		"members":        *members,
+		"channels":       len(chanIDs),
+		"channel_counts": chanSummary,
 		"duration_s":     elapsed,
 		"min_tracks":     minTracks,
 		"min_publishers": minPublishers,
-		"expect_tracks":  *members - 1, // 每个成员应收到其余 N-1 人的音频
+		"expect_tracks":  minExpect, // 各频道「其余成员数」的最小值
+		"max_deficit":    minDeficit,
 		"total_pps":      totalPPS,
 		"avg_pps":        totalPPS / int64(*members),
 		"peers":          stats,
@@ -174,11 +211,12 @@ func main() {
 		c.close()
 	}
 
-	if minTracks < *members-1 {
-		fmt.Printf("RESULT=degraded min_tracks=%d expect=%d\n", minTracks, *members-1)
+	if minDeficit > 0 {
+		fmt.Printf("RESULT=degraded min_tracks=%d min_expect=%d max_deficit=%d\n",
+			minTracks, minExpect, minDeficit)
 		os.Exit(1)
 	}
-	fmt.Printf("RESULT=ok min_tracks=%d expect=%d avg_pps=%d\n", minTracks, *members-1, summary["avg_pps"])
+	fmt.Printf("RESULT=ok min_tracks=%d min_expect=%d avg_pps=%d\n", minTracks, minExpect, summary["avg_pps"])
 }
 
 type tokenEntry struct{ name, token string }

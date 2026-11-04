@@ -217,8 +217,16 @@ relay/direct（那是 `voice.state.transport` 与服务端策略的事）。
 - 成员进出只在空槽上 `ReplaceTrack`，**不产生重协商**；客户端一辈子只处理一次 offer/answer。
 - 服务端 `OnTrack` 收到某成员音频后，写进一条 `TrackLocalStaticRTP`，再挂到其他每个成员的
   空闲槽上 —— 这就是「A 的声音同时转给 B 和 C」。
-- 槽位 12 ⇒ 中继语音每频道最多 **13 人**（12 个远端 + 自己）。超过时新发布者分配槽位失败
-  会打 warn 并跳过那一路（该成员对那部分人不可闻），不会崩。
+- **槽位数 = 中继语音成员上限 = 12 人**（`MaxRemoteSlots`）。
+  为什么不是 13：槽位是**「发布者 → 槽位」的全局唯一映射**（同一个发布者在所有接收端用同一个
+  序号，`voice.state.slots` 才能只广播一份）。N 个成员会同时成为 N 个发布者，各需要 1 个槽位，
+  所以 13 个成员要 13 个槽位 —— 12 个槽位只能容纳 12 个成员。
+- **超过 12 人时 `voice.join` 直接回 `CONFLICT: channel voice is full (max 12)`**，
+  不会让第 13 个人「加入成功但没人听得到」。这是 2026-11-04 容量测试抓到的静默降级，
+  门禁在 `server/internal/server/voice.go`，护栏测试 `TestVoiceChannelCapacityGate`。
+- 槽位数与产品上限（`PRODUCT.md`「单频道同时在线 2–12 人」）是**同一个数**：
+  将来改产品上限，必须同步改 `sfu.MaxRemoteSlots`，否则会重现「上限 15 但第 13 个人是哑的」。
+- 语音满**不影响文字**：同一个频道可以有任意多文字成员，只有语音进不去。
 - 中继模式下**客户端不要给服务端发 offer**；收到 `kind=offer` 应理解成「服务端在协商」，只回 answer。
 
 服务端实现见 `server/internal/sfu/room.go`（房间）与 `server/internal/server/voice.go`（协议接线），

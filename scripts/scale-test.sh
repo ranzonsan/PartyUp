@@ -15,6 +15,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # 默认放工作区 .cache 下：DSH 的 /tmp 每次命令可能是隔离的，跑完就看不到证据了。
 WORK=${WORK:-$ROOT/.cache/scale}
 MEMBERS=${MEMBERS:-12}
+CHANNELS=${CHANNELS:-1}
 DURATION=${DURATION:-20}
 PORT=${PORT:-19001}
 CHANNEL=${CHANNEL:-scale}
@@ -72,7 +73,7 @@ echo "tokens ready: $(wc -l <"$WORK/tokens.txt")"
 
 echo "== run load for ${DURATION}s"
 "$BIN/loadtest" -server "http://127.0.0.1:$PORT" -admin-token "$ADMIN_TOKEN" \
-  -channel-name "$CHANNEL" -tokens-file "$WORK/tokens.txt" -members "$MEMBERS" \
+  -channel-name "$CHANNEL" -channels "$CHANNELS" -tokens-file "$WORK/tokens.txt" -members "$MEMBERS" \
   -duration "${DURATION}s" >"$WORK/load.out" 2>"$WORK/load.err" &
 LOAD_PID=$!
 
@@ -120,11 +121,12 @@ m = re.search(r"SUMMARY_JSON_BEGIN\n(.*?)\nSUMMARY_JSON_END", raw, re.S)
 if m:
     summary = json.loads(m.group(1))
 
-print(f"members(单频道) : {members}")
+print(f"members        : {members}")
+print(f"channels       : {summary['channels'] if summary else '?'}（每频道 {members // max(1, CHANNELS if (CHANNELS := int(os.environ.get('CHANNELS', '1'))) else 1)} 人）")
 print(f"server 平均 CPU : {avg_cpu:6.1f} %（峰值 {max_cpu:.1f} %）")
 print(f"server 峰值 RSS : {peak_rss:6.1f} MB")
 if summary:
-    print(f"每端远端音轨 : {summary['min_tracks']} / 期望 {summary['expect_tracks']}")
+    print(f"每端远端音轨 : {summary['min_tracks']} / 期望 {summary['expect_tracks']}（各频道期望最小值）")
     print(f"每端平均收包 : {summary['avg_pps']} pkt/s")
     print(f"服务端总转发 : {summary['total_pps']} pkt/s")
     bad = [p for p in summary["peers"] if p["tracks"] < summary["expect_tracks"]]

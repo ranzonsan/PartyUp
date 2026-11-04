@@ -13,6 +13,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -87,7 +88,7 @@ type Hub struct {
 
 // NewHub 构造会话中心。
 func NewHub(st *store.Store, log *slog.Logger, name, version, voiceMode, screenMode string, stunURLs []string) *Hub {
-	return &Hub{
+	h := &Hub{
 		store:                st,
 		log:                  log,
 		name:                 name,
@@ -113,6 +114,46 @@ func NewHub(st *store.Store, log *slog.Logger, name, version, voiceMode, screenM
 			CheckOrigin: func(*http.Request) bool { return true },
 		},
 	}
+	// 容量观测：每 60s 记一次 SFU 的 PC 数/频道数。默认 relay 后每个订阅者都会建
+	// 一条视频 PC（即使没人共享），需要真实部署数据再决定要不要做懒加载。
+	go h.startCapacityLogger()
+	return h
+}
+
+// capacityInterval 是容量日志的采样间隔（60s：够看趋势，又不刷日志）。
+const capacityInterval = 60 * time.Second
+
+// startCapacityLogger 定期记录 SFU 规模，给「要不要优化空跑视频 PC」提供数据。
+func (h *Hub) startCapacityLogger() {
+	ticker := time.NewTicker(capacityInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		h.LogCapacity()
+	}
+}
+
+// LogCapacity 记一条容量线：视频 PC 总数/频道数 + 语音成员数。
+// 日志形状：msg="sfu: video peers=6 channels=3" voice_peers=… voice_rooms=…
+func (h *Hub) LogCapacity() {
+	h.mu.RLock()
+	rooms := make([]*sfu.VideoRoom, 0, len(h.videoRooms))
+	for _, r := range h.videoRooms {
+		rooms = append(rooms, r)
+	}
+	voicePeers := 0
+	for _, members := range h.voice {
+		voicePeers += len(members)
+	}
+	voiceRooms := len(h.voice)
+	h.mu.RUnlock()
+
+	// 先快照再查每个房间：VideoRoom 的回调会反过来取 h.mu，持锁调用有锁序风险。
+	videoPeers := 0
+	for _, r := range rooms {
+		videoPeers += len(r.Members())
+	}
+	h.log.Info("sfu: video peers="+strconv.Itoa(videoPeers)+" channels="+strconv.Itoa(len(rooms)),
+		"voice_peers", voicePeers, "voice_rooms", voiceRooms)
 }
 
 // ServeWS 处理 GET /ws：升级后阻塞在读取循环里，直到连接断开。

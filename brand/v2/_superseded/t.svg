@@ -1,8 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
-  <!-- t · 短竖干 + 右高左低的横梁 + 平踩基线的右脚；头贴顶 -->
-  <g fill="none" stroke="#F4F1EA" stroke-width="72" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M512 380 L512 708 C512 730 534 764 616 764"/>
-    <path d="M392 476 L632 464"/>
-  </g>
-  <circle cx="512" cy="252" r="96" fill="#FF5A2B"/>
-</svg>

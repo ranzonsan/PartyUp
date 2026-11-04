@@ -1,9 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
-  <!-- r · 干→肩连续路径；头咬在干的末端（不是悬空）；下腿 664–800
-       ink 348 宽 · x-height 440–800 · stroke 72 -->
-  <g fill="none" stroke="#F4F1EA" stroke-width="72" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M60 560 L60 500 Q60 476 96 476 L336 476"/>
-    <path d="M60 700 L60 764"/>
-  </g>
-  <circle cx="60" cy="612" r="40" fill="#FF5A2B"/>
-</svg>

@@ -61,7 +61,8 @@ public sealed record VoiceTrackStats(string Id, uint PcmFrames, uint Peak, ulong
 /// 设计要点：
 ///   * 显式从 AppContext.BaseDirectory 加载 DLL（不靠 PATH 搜索），避免被同名旧库抢走——
 ///     这是 Spike 1 记下的坑；
-///   * 加载后校验 18 个导出全部可解析（ABI 契约的运行时检查）；
+///   * 加载后校验 18 个必需导出全部可解析，并统计全部已知导出（24 个）的实际命中数——
+///     自检数字必须来自真实探测，不能写死（写死的 18/18 在 DLL 扩到 24 个导出后就不再提示版本不匹配）；
 ///   * 只封装骨架要用的 create/destroy/poll_event/peer_stats/screen_start|stop/sources，
 ///     其余导出的签名也一并声明（NativeMethods），但未接进 UI——语音/共享不在本轮范围。
 /// </summary>
@@ -90,6 +91,27 @@ public sealed class MediaEngine : IDisposable
         "pu_frame_release",
     };
 
+    /// <summary>
+    /// ABI v2 在 18 个必需导出之后以加法方式追加的 6 个导出（共 24 个）。
+    /// 只用于统计"实际命中/已知总数"的自检显示；是否可用仍由下方的 has* 标志决定。
+    /// </summary>
+    public static readonly IReadOnlyList<string> ExtendedExportNames = new[]
+    {
+        "pu_engine_set_ice_servers",
+        "pu_signal_in_media",
+        "pu_signal_media",
+        "pu_screen_prepare",
+        "pu_screen_start_ex",
+        "pu_voice_tracks",
+    };
+
+    /// <summary>ABI 迄今声明的全部导出（18 必需 + 6 扩展）。自检显示的分母取自这里。</summary>
+    public static readonly IReadOnlyList<string> KnownExportNames =
+        ExportNames.Concat(ExtendedExportNames).ToArray();
+
+    /// <summary>已知导出总数（当前 24）；UI 自检显示 "命中数/这个数"。</summary>
+    public static int KnownExportCount => KnownExportNames.Count;
+
     private static readonly object ResolverGate = new();
     private static bool _resolverInstalled;
     private static string? _resolvedPath;
@@ -99,11 +121,12 @@ public sealed class MediaEngine : IDisposable
     private bool _disposed;
 
     private MediaEngine(string libraryPath, IntPtr handle, IReadOnlyList<string> missingExports,
-        bool hasMediaSignal, bool hasScreenRelay, bool hasIceServers)
+        int presentExportCount, bool hasMediaSignal, bool hasScreenRelay, bool hasIceServers)
     {
         LibraryPath = libraryPath;
         _handle = handle;
         MissingExports = missingExports;
+        PresentExportCount = presentExportCount;
         HasMediaSignalSupport = hasMediaSignal;
         HasScreenRelaySupport = hasScreenRelay;
         HasIceServersSupport = hasIceServers;
@@ -118,6 +141,12 @@ public sealed class MediaEngine : IDisposable
     public string LibraryPath { get; }
 
     public IReadOnlyList<string> MissingExports { get; }
+
+    /// <summary>
+    /// 实际探测到的导出数（来自 <see cref="KnownExportNames"/> 的真实 TryGetExport 命中数）。
+    /// 旧 DLL 会小于 <see cref="KnownExportCount"/>——这个数才是自检该显示的东西。
+    /// </summary>
+    public int PresentExportCount { get; }
 
     public bool IsCreated => _engine != IntPtr.Zero;
 
@@ -165,6 +194,12 @@ public sealed class MediaEngine : IDisposable
         var missing = ExportNames
             .Where(name => !NativeLibrary.TryGetExport(handle, name, out _))
             .ToArray();
+        // 自检数字：全部已知导出里真正能解析到的个数（24 个都命中才是 24/24）。
+        var presentExportCount = KnownExportNames.Count(name => NativeLibrary.TryGetExport(handle, name, out _));
+        if (presentExportCount < KnownExportCount)
+        {
+            AppLog.Warn($"media: 导出自检 {presentExportCount}/{KnownExportCount}——DLL 比客户端期望的旧");
+        }
         // 可选导出（加法式 ABI）：有就用，没有就明确报缺，不静默降级。
         var hasMediaSignal = NativeLibrary.TryGetExport(handle, "pu_signal_in_media", out _);
         if (!hasMediaSignal)
@@ -187,7 +222,7 @@ public sealed class MediaEngine : IDisposable
             AppLog.Warn("media: DLL 缺少 pu_engine_set_ice_servers（ABI 第 24 个导出）——" +
                         "STUN 配置暂不生效（等 split-dev 的 DLL），直连只剩 host 候选");
         }
-        return new MediaEngine(path, handle, missing, hasMediaSignal, hasScreenRelay, hasIceServers);
+        return new MediaEngine(path, handle, missing, presentExportCount, hasMediaSignal, hasScreenRelay, hasIceServers);
     }
 
     /// <summary>DllImport 解析器：只接管 partyup_media，其余交给默认逻辑。</summary>

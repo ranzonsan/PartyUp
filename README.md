@@ -6,6 +6,7 @@
 
 - [产品定义](docs/PRODUCT.md) — 目标、非目标、传输策略、v1 验收
 - [开发环境与版本基线](docs/DEV.md) — 装什么、装哪版、怎么验、构建流、已知坑
+- [打包与分发](docs/PACKAGING.md) — 一条命令产出绿色版 / Setup / MSI / 服务端包，版本源、未签名与 SmartScreen 说明
 - [架构](docs/ARCHITECTURE.md) — 组件、C ABI 边界、数据流、路径状态机、风险与 spike
 - [协议](docs/PROTOCOL.md) — 信令消息形状（草案）
 - [术语表](GLOSSARY.md) — 项目语言，写作与代码命名以此为准

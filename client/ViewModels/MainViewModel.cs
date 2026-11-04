@@ -183,8 +183,12 @@ public sealed partial class MainViewModel : ObservableObject
                 return;
             }
             _media.Create("partyup-ui");
-            MediaStatusText = "媒体引擎：已就绪（ABI v2，18/18 导出）";
-            AppLog.Pass($"media: pu_engine_create ok, dll={Path.GetFileName(_media.LibraryPath)}, exports=18/18");
+            // 自检数字来自真实探测（NativeLibrary.TryGetExport），不再写死：DLL 扩到 24 个导出后，
+            // 旧的 18/18 会永远"通过"，等于这道自检失效。
+            MediaStatusText =
+                $"媒体引擎：已就绪（ABI v2，{_media.PresentExportCount}/{MediaEngine.KnownExportCount} 导出）";
+            AppLog.Pass($"media: pu_engine_create ok, dll={_media.LibraryPath}, " +
+                        $"exports={_media.PresentExportCount}/{MediaEngine.KnownExportCount}");
             LoadSources();
         }
         catch (Exception ex)

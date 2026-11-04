@@ -1,6 +1,7 @@
 using Avalonia;
 using PartyUp.Client.Headless;
 using PartyUp.Client.Services;
+using Velopack;
 
 namespace PartyUp.Client;
 
@@ -12,6 +13,11 @@ internal static class Program
     [STAThread]
     public static int Main(string[] args)
     {
+        // 必须是 Main 的第一句：Velopack 在安装/更新/卸载时会用 --veloapp-* 参数重新调用本 exe，
+        // 由 Run() 处理完钩子后直接退出；放在后面会让这些钩子走到正常启动路径（弹 GUI、超时被杀）。
+        // 非 Velopack 安装（绿色版/直接 dotnet run）下 Run() 是 no-op，不影响其它启动方式。
+        VelopackApp.Build().Run();
+
         try
         {
             Options = ClientOptions.Parse(args);

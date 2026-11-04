@@ -10,6 +10,15 @@
     <RootNamespace>PartyUp.Client</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
 
+    <!-- 应用图标：唯一的图标文件是仓库根的 assets/icon.ico（占位图，换真 logo 只替换该文件）。
+         注意路径相对本 csproj：src 复制到打包临时目录时 assets/ 仍与 client/ 同级。 -->
+    <ApplicationIcon>$(MSBuildThisFileDirectory)../assets/icon.ico</ApplicationIcon>
+
+    <!--
+      Avalonia 依赖反射，trim 的风险高于收益：显式关闭（打包命令也会再传一次）。
+    -->
+    <PublishTrimmed>false</PublishTrimmed>
+
     <!--
       必须指定 RID（与 Spike 1 同样的理由）：Avalonia 的原生依赖只落在
       runtimes/win-x64/native，缺少 RID 时 SkiaSharp 会被 PATH 上的同名旧库抢走。
@@ -31,6 +40,10 @@
     <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.2" />
     <!-- ULID：PROTOCOL.md §0 规定消息 id 是 ULID，不自造编码。 -->
     <PackageReference Include="NUlid" Version="1.7.3" />
+    <!-- Velopack：安装器/更新框架的客户端钩子。必须在 Main 第一行调用
+         VelopackApp.Build().Run()，否则安装/卸载时 Velopack 的钩子参数不会被处理，
+         安装器会把 GUI 拉起来等 30s 再强杀。版本与本机 vpk CLI 1.2.0 对齐。 -->
+    <PackageReference Include="Velopack" Version="1.2.0" />
   </ItemGroup>
 
   <!--

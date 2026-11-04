@@ -12,8 +12,12 @@
 - [术语表](GLOSSARY.md) — 项目语言，写作与代码命名以此为准
 - [架构决策记录](docs/adr/) — 不可逆决定及其理由
 - [调研：桌面 GUI 与媒体栈](docs/research/2026-11-01-desktop-media-stack.md) — 选型事实与来源
-- [Spike 1：1080p60 帧呈现](docs/spikes/2026-11-01-frame-presentation.md) — 通过，托管呈现路径足够，v1 不做 D3D 互操作
-- [Spike 2：libwebrtc 链接](docs/spikes/2026-11-01-libwebrtc-link.md) — 通过，m152 静态库可被 MSVC 链接运行
+- [容量基准](docs/CAPACITY.md) — 实测 CPU / 内存 / 带宽，及建议机器配置
+- [品牌资产](brand/) — 图标、锁屏图、横竖版 lockup
+
+## 本机开发日志
+
+验证性 spike 的过程记录、实测证据（截图、候选地址、日志）保存在工作区的 `.docs/` 里，**不入库**——它们含内网地址、机器型号与临时 token，且属于「过程」而非「文档」。`docs/` 只放对使用者与贡献者长期有效的定义、协议与决策。
 
 ## 许可证
 
@@ -21,4 +25,4 @@ GPL-3.0，见 [LICENSE](LICENSE)。
 
 ## 状态
 
-产品与架构决策已定稿（2026-11-01）。下一步是验证性 spike（帧呈现、libwebrtc 构建、SFU 转发），代码尚未开始。
+v1 功能完整并通过七条验收（打包分发、邀请码、文字历史持久化、语音、屏幕共享、双传输路径、断线重连）。详见 [产品定义](docs/PRODUCT.md)。

@@ -235,4 +235,4 @@ fi
 log "全部通过"
 printf '服务端：%s（数据目录 %s）\n' "$BASE" "$DATA_DIR"
 printf '邀请码：%s\n' "$INVITE_CODE"
-printf '证据：docs/spikes/2026-11-02-skeleton.md\n'
+printf '证据：.docs/spikes/2026-11-02-skeleton.md\n'

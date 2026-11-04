@@ -8,7 +8,7 @@
 
 ## 环境
 
-- WSL2（Ubuntu 26.04，宿主 MECHREVO GM5AR0O / i7 + RTX 4060 Laptop），服务端与假客户端都在 WSL 内。
+- WSL2（Ubuntu 26.04；宿主为笔记本级 x86 机器，**未锁频、未绑核**），服务端与假客户端都在 WSL 内。
 - 服务端：`partyup serve --voice-mode relay --screen-mode direct`（纯语音，不含视频房间开销）。
 - 负载：每个成员每 20ms 写一帧假 Opus（50 pkt/s），统计**每端收到的远端音轨数**与 RTP 包数。
 - CPU 采样窗口丢弃进语音的爬坡段（前 6s），取稳态平均。

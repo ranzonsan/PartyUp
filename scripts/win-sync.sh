@@ -3,7 +3,7 @@
 # 用法: scripts/win-sync.sh [源] [目标]
 set -euo pipefail
 
-src="${1:-/home/ranzon/PartyUp}"
+src="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 dst="${2:-/mnt/c/src/PartyUp}"
 
 mkdir -p "$dst"

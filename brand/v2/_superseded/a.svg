@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- a · 圆肚子（288×360 椭圆环，35° 开口）+ 右竖干插进嘴口 + 头顶圆点
+       ink width 348 · x-height 440–800 · stroke 72 -->
+  <g fill="none" stroke="#F4F1EA" stroke-width="72" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M232.5 537.4 A108 144 0 1 0 232.5 702.6"/>
+    <path d="M312 476 L312 764"/>
+  </g>
+  <circle cx="312" cy="386" r="46" fill="#FF5A2B"/>
+</svg>

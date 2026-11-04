@@ -3,7 +3,7 @@
 // 它是服务端与测试共享的唯一定义处：信封形状、消息类型名、错误码、领域对象
 // 都在这里，避免 HTTP 层与 WebSocket 层各写一份字符串常量。
 //
-// 与文档的差异集中记录在 docs/spikes/2026-11-02-skeleton.md 的「协议补充」一节。
+// 与文档的差异集中记录在 .docs/spikes/2026-11-02-skeleton.md 的「协议补充」一节。
 package protocol
 
 import (

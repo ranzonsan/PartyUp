@@ -10,7 +10,7 @@
 //
 // 为什么不用零拷贝纹理：VP8 是软件编码器，只吃 I420，GPU 纹理必须先落到 CPU。
 // 真零拷贝要等硬件编码器（NVENC/MFT）直接吃 D3D11 纹理，见
-// docs/spikes/2026-11-02-wgc-in-media-core.md 的结论一节。
+// .docs/spikes/2026-11-02-wgc-in-media-core.md 的结论一节。
 #include "wgc_screen.h"
 
 #include <windows.h>

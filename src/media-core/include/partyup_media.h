@@ -1,7 +1,7 @@
 /* PartyUp 媒体核心 · 窄 C ABI（v2）
  *
- * 设计约束（见 docs/ARCHITECTURE.md §2.1 与 docs/spikes/2026-11-01-c-abi.md、
- * docs/spikes/2026-11-01-signaling-abi.md）：
+ * 设计约束（见 docs/ARCHITECTURE.md §2.1 与 .docs/spikes/2026-11-01-c-abi.md、
+ * .docs/spikes/2026-11-01-signaling-abi.md）：
  *   * 纯 C 接口，只暴露 C 类型：不透明句柄 + 定长 POD 结构 + 返回码；
  *   * 不跨边界传 std::string / std::vector，字符串一律 const char*（UTF-8，0 结尾），
  *     内存由调用方或库持有，所有权在函数注释里写死；
@@ -177,7 +177,7 @@ typedef enum pu_signal_kind {
  * 因为 SDP 有几 KB，装不进定长事件结构，只能给指针——这与 v1 的「事件按值复制」
  * 不同，是 v2 唯一的「库持有、调用方只读」输出。
  *
- * 信封格式见 docs/spikes/2026-11-01-signaling-abi.md：
+ * 信封格式见 .docs/spikes/2026-11-01-signaling-abi.md：
  *   {"type":"offer","sdp":"..."}
  *   {"type":"answer","sdp":"..."}
  *   {"type":"candidate","mid":"0","mline":0,"candidate":"candidate:..."}
@@ -499,7 +499,7 @@ PU_API const char* pu_last_error(pu_engine* e);
  * payload 指向 UTF-8 JSON，长度 len（不必 0 结尾，中间可以有 0）；字符串由
  * **调用方持有**，只在本次调用期间读取。
  *
- * 接受的信封（与 docs/PROTOCOL.md 对齐，见 docs/spikes/2026-11-01-signaling-abi.md）：
+ * 接受的信封（与 docs/PROTOCOL.md 对齐，见 .docs/spikes/2026-11-01-signaling-abi.md）：
  *   {"type":"offer","sdp":"..."}                          → 建/复用接收侧 PC，
  *                                                           SetRemoteDescription，
  *                                                           生成并推回 SIGNAL_OUT answer

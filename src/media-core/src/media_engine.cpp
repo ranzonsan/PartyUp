@@ -385,7 +385,7 @@ class SetRemoteObserver : public webrtc::SetRemoteDescriptionObserverInterface {
 };
 
 // ---- 信封 <-> 结构 ----
-// 出站信封（与 docs/PROTOCOL.md 对齐，详见 docs/spikes/2026-11-01-signaling-abi.md）
+// 出站信封（与 docs/PROTOCOL.md 对齐，详见 .docs/spikes/2026-11-01-signaling-abi.md）
 std::string MakeSdpEnvelope(const char* type, const std::string& sdp) {
   nlohmann::json j;
   j["type"] = type;
@@ -609,7 +609,7 @@ class StatsCollector : public webrtc::RTCStatsCollectorCallback {
 //   * 本类的实例由 PeerConnectionFactory 通过 deps.adm 独占（scoped_refptr），
 //     随工厂一起析构；引擎不另存引用。
 //   * 语音落地时把这里换成真实 ADM，并保证「创建与析构在同一条线程」，且该线程
-//     在工厂析构时仍然存活（见 docs/spikes/2026-11-01-signaling-abi.md §10）。
+//     在工厂析构时仍然存活（见 .docs/spikes/2026-11-01-signaling-abi.md §10）。
 class NullAudioDeviceModule
     : public webrtc::webrtc_impl::AudioDeviceModuleDefault<webrtc::AudioDeviceModule> {
  public:
@@ -633,7 +633,7 @@ class NullAudioDeviceModule
 //   可达 ~300），由客户端基于 peak/last_frame_ms 自适应判定，媒体核心只给原始量。
 // 阈值默认 8（16 bit 采样绝对值），可用环境变量 PARTYUP_VOICE_PEAK_THRESHOLD 覆盖
 // （1~32767）。注意：/MT DLL 有自己一份 CRT environ，宿主 _putenv_s 改不到，
-// 必须用 GetEnvironmentVariableA 读 Win32 进程环境块（见 docs/spikes C ABI 文档）。
+// 必须用 GetEnvironmentVariableA 读 Win32 进程环境块（见 .docs/spikes C ABI 文档）。
 uint32_t VoicePeakThresholdFromEnv() {
   // 注意：本 DLL 用 /MT（静态 CRT），std::getenv 读的是**本模块 CRT 自己那份**
   // environ 副本，宿主进程 _putenv_s 改不到它。所以这里直接问 Win32 进程环境块
@@ -1865,7 +1865,7 @@ void MediaEngine::ApplyVideoSenderParamsOnSignalingThread() {
   //
   // 按 max(width/1920, height/1080) 算，保证宽高都进框（21:9 或竖屏也不会宽度超限），
   // 宽高比不变。PARTYUP_MAX_CAPTURE_HEIGHT 可覆盖（<=0 关闭，退回原始分辨率）。
-  // 默认 **0 = 不缩放**（2026-11-04 实测后的决定，见 docs/spikes/2026-11-04-resolution-cap.md）：
+  // 默认 **0 = 不缩放**（2026-11-04 实测后的决定，见 .docs/spikes/2026-11-04-resolution-cap.md）：
   // 常见带宽（屏幕流实测 0.4–2.1 Mbps，3 Mbps 上限根本不 binding）下 1440p 明显更锐，
   // 强制降到 1080p 是画质回退（同区域 Laplacian 方差差 5–7 倍）。机制保留，需要时显式开会。
   int max_capture_height = 0;

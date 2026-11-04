@@ -7,7 +7,31 @@ artifacts/
 third_party/libwebrtc/*.7z
 third_party/libwebrtc/*.zip
 third_party/libwebrtc/
+
 # 构建产物（partyup_media.dll / 冒烟 exe / dumpbin 输出）
 src/media-core/out/
 spikes/*/out/
 spikes/wgc-probe/out/
+
+# 本机开发日志（实验记录、证据截图、含内网 IP 与机器信息的实测数据）
+# 真正的文档在 docs/，这里只放"过程"，不入库
+.docs/
+
+# 压测与验收的运行时产物（含临时 bootstrap token，绝不可入库）
+.cache/
+
+# 品牌资产构建工具（工作区本地 pip 安装，不入库）
+.tools/
+# 标识设计过程中的探索草稿（成品在 brand/）
+.design/
+
+# Python 构建脚本缓存
+__pycache__/
+*.pyc
+
+# 草图/参考图收件箱（用户手稿，不入库）
+brand/inbox/*
+!brand/inbox/.gitkeep
+
+# 临时日志（历史上被 git add -A 误收过一次）
+.tmp_*.log

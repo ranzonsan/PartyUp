@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1720" height="1596" viewBox="0 0 1720 1596"><rect width="1720" height="1596" fill="#0B0C0E"/><g transform="translate(40,40) scale(0.42)"></g><g transform="translate(500.08,40) scale(0.42)"><path d="M387 764 L387 336" stroke="#F4F1EA" stroke-width="72" stroke-linecap="round" fill="none"/><circle cx="568" cy="396" r="105" fill="#FF5A2B"/></g><g transform="translate(960.16,40) scale(0.42)">
+  <rect width="1024" height="512" fill="#0B0C0E"/>
+  <!-- S flat sole -->
+  <g transform="translate(0,0) scale(0.5)">
+    <g fill="none" stroke="#F4F1EA" stroke-width="72" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M492 416 L492 700 C492 752 514 764 556 764 L632 764"/>
+      <path d="M344 448 L680 428"/>
+    </g>
+    <circle cx="492" cy="254" r="96" fill="#FF5A2B"/>
+  </g>
+  <!-- T toe up -->
+  <g transform="translate(512,0) scale(0.5)">
+    <g fill="none" stroke="#F4F1EA" stroke-width="72" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M492 416 L492 700 C492 752 514 764 556 764 L632 752"/>
+      <path d="M344 448 L680 428"/>
+    </g>
+    <circle cx="492" cy="254" r="96" fill="#FF5A2B"/>
+  </g>
+</g><g transform="translate(1420.24,40) scale(0.42)">
+  <g fill="none" stroke="#F4F1EA" stroke-width="72" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M412 452 L516 716" />
+    <path d="M656 438 L516 716 C520 800 548 892 582 962" />
+  </g>
+  <circle cx="396" cy="288" r="92" fill="#FF5A2B" />
+</g><text x="40" y="30" font-family="DejaVu Sans Mono" font-size="18" fill="#8A8D93">P-A · family line</text><g transform="translate(40,510.08) scale(0.42)"></g><g transform="translate(500.08,510.08) scale(0.42)"><path d="M387 764 L387 336" stroke="#F4F1EA" stroke-width="72" stroke-linecap="round" fill="none"/><circle cx="560" cy="405" r="105" fill="#FF5A2B"/></g><g transform="translate(960.16,510.08) scale(0.42)">
+  <rect width="1024" height="512" fill="#0B0C0E"/>
+  <!-- S flat sole -->
+  <g transform="translate(0,0) scale(0.5)">
+    <g fill="none" stroke="#F4F1EA" stroke-width="72" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M492 416 L492 700 C492 752 514 764 556 764 L632 764"/>
+      <path d="M344 448 L680 428"/>
+    </g>
+    <circle cx="492" cy="254" r="96" fill="#FF5A2B"/>
+  </g>
+  <!-- T toe up -->
+  <g transform="translate(512,0) scale(0.5)">
+    <g fill="none" stroke="#F4F1EA" stroke-width="72" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M492 416 L492 700 C492 752 514 764 556 764 L632 752"/>
+      <path d="M344 448 L680 428"/>
+    </g>
+    <circle cx="492" cy="254" r="96" fill="#FF5A2B"/>
+  </g>
+</g><g transform="translate(1420.24,510.08) scale(0.42)">
+  <g fill="none" stroke="#F4F1EA" stroke-width="72" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M412 452 L516 716" />
+    <path d="M656 438 L516 716 C520 800 548 892 582 962" />
+  </g>
+  <circle cx="396" cy="288" r="92" fill="#FF5A2B" />
+</g><text x="40" y="500.08" font-family="DejaVu Sans Mono" font-size="18" fill="#8A8D93">P-B · family line</text><g transform="translate(40,980.16) scale(0.42)"></g><g transform="translate(500.08,980.16) scale(0.42)"><path d="M387 764 L387 336" stroke="#F4F1EA" stroke-width="72" stroke-linecap="round" fill="none"/><circle cx="558" cy="405" r="105" fill="#FF5A2B"/></g><g transform="translate(960.16,980.16) scale(0.42)">
+  <rect width="1024" height="512" fill="#0B0C0E"/>
+  <!-- S flat sole -->
+  <g transform="translate(0,0) scale(0.5)">
+    <g fill="none" stroke="#F4F1EA" stroke-width="72" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M492 416 L492 700 C492 752 514 764 556 764 L632 764"/>
+      <path d="M344 448 L680 428"/>
+    </g>
+    <circle cx="492" cy="254" r="96" fill="#FF5A2B"/>
+  </g>
+  <!-- T toe up -->
+  <g transform="translate(512,0) scale(0.5)">
+    <g fill="none" stroke="#F4F1EA" stroke-width="72" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M492 416 L492 700 C492 752 514 764 556 764 L632 752"/>
+      <path d="M344 448 L680 428"/>
+    </g>
+    <circle cx="492" cy="254" r="96" fill="#FF5A2B"/>
+  </g>
+</g><g transform="translate(1420.24,980.16) scale(0.42)">
+  <g fill="none" stroke="#F4F1EA" stroke-width="72" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M412 452 L516 716" />
+    <path d="M656 438 L516 716 C520 800 548 892 582 962" />
+  </g>
+  <circle cx="396" cy="288" r="92" fill="#FF5A2B" />
+</g><text x="40" y="970.16" font-family="DejaVu Sans Mono" font-size="18" fill="#8A8D93">P-F · family line</text><g transform="translate(40,1460.24) scale(0.09375)"><path d="M387 764 L387 336" stroke="#F4F1EA" stroke-width="72" stroke-linecap="round" fill="none"/><circle cx="568" cy="396" r="105" fill="#FF5A2B"/></g><g transform="translate(176,1460.24) scale(0.09375)"><path d="M387 764 L387 336" stroke="#F4F1EA" stroke-width="72" stroke-linecap="round" fill="none"/><circle cx="560" cy="405" r="105" fill="#FF5A2B"/></g><g transform="translate(312,1460.24) scale(0.09375)"><path d="M387 764 L387 336" stroke="#F4F1EA" stroke-width="72" stroke-linecap="round" fill="none"/><circle cx="558" cy="405" r="105" fill="#FF5A2B"/></g><g transform="translate(448,1460.24) scale(0.09375)">
+  <rect width="1024" height="512" fill="#0B0C0E"/>
+  <!-- S flat sole -->
+  <g transform="translate(0,0) scale(0.5)">
+    <g fill="none" stroke="#F4F1EA" stroke-width="72" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M492 416 L492 700 C492 752 514 764 556 764 L632 764"/>
+      <path d="M344 448 L680 428"/>
+    </g>
+    <circle cx="492" cy="254" r="96" fill="#FF5A2B"/>
+  </g>
+  <!-- T toe up -->
+  <g transform="translate(512,0) scale(0.5)">
+    <g fill="none" stroke="#F4F1EA" stroke-width="72" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M492 416 L492 700 C492 752 514 764 556 764 L632 752"/>
+      <path d="M344 448 L680 428"/>
+    </g>
+    <circle cx="492" cy="254" r="96" fill="#FF5A2B"/>
+  </g>
+</g><g transform="translate(584,1460.24) scale(0.09375)">
+  <g fill="none" stroke="#F4F1EA" stroke-width="72" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M412 452 L516 716" />
+    <path d="M656 438 L516 716 C520 800 548 892 582 962" />
+  </g>
+  <circle cx="396" cy="288" r="92" fill="#FF5A2B" />
+</g><text x="40" y="1452.24" font-family="DejaVu Sans Mono" font-size="18" fill="#8A8D93">96px: A/B/F then a t y</text></svg>

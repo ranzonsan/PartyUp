@@ -204,7 +204,7 @@ public static class ContractTests
     public static void PayloadReportFieldNamesExact()
     {
         var report = new PayloadReport(
-            BridgeProtocol.Version, "id-1", "/home/ranzon/x", 3, 1234, 1, ["bin/x.dll"],
+            BridgeProtocol.Version, "id-1", "/tmp/x", 3, 1234, 1, ["bin/x.dll"],
             ["bin", "obj"], "hash", DateTimeOffset.Parse("2026-10-11T09:30:00+08:00"));
 
         var json = BridgeJson.Serialize(report);
@@ -215,7 +215,7 @@ public static class ContractTests
     [WdbFact("contract.json-non-ascii-not-escaped")]
     public static void NonAsciiNotEscaped()
     {
-        var request = SampleRequest() with { SourceRoot = "/home/ranzon/画廊 目录" };
+        var request = SampleRequest() with { SourceRoot = "/tmp/画廊 目录" };
         var json = BridgeJson.Serialize(request);
 
         // 中文必须原样可读（UnsafeRelaxedJsonEscaping）；转义成 \uXXXX 会让人工核对与跨端 diff 变成盲区。
@@ -240,7 +240,7 @@ public static class ContractTests
           "timeoutSeconds": 0,
           "payload": { "relativePath": "payload", "fileCount": 3, "totalBytes": 42, "manifestHash": "ab12" },
           "createdUtc": "2026-10-11T09:30:00+08:00",
-          "sourceRoot": "/home/ranzon/galleries-manager",
+          "sourceRoot": "/tmp/project",
         }
         """;
 
@@ -297,7 +297,7 @@ public static class ContractTests
         0,
         new PayloadRef("payload", 3, 42, "ab12"),
         DateTimeOffset.Parse("2026-10-11T09:30:00+08:00"),
-        "/home/ranzon/galleries-manager");
+        "/tmp/project");
 
     private static string[] TopLevelKeys(string json)
     {

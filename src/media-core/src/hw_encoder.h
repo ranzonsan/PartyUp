@@ -8,7 +8,7 @@
 //     本机实测是 "NVIDIA H.264 Encoder MFT"（CLSID {60F44560-5A20-4857-BFEF-D29773CB8040}）；
 //   * 解码：系统自带 "Microsoft H264 Video Decoder MFT"（软件解码，够观看方用）。
 //
-// 关键实现约定（全部由 docs/spikes/2026-11-02-hw-encoder.md 的探针实测得出）：
+// 关键实现约定（全部由 .docs/spikes/2026-11-02-hw-encoder.md 的探针实测得出）：
 //   * 硬件 MFT 是 async（V2）MFT，**必须**在 `IMFTransform::GetAttributes()` 上设
 //     `MFT_TRANSFORM_ASYNC_UNLOCK=TRUE` 才能 `MFT_MESSAGE_SET_D3D_MANAGER`
 //     （在 IMFActivate 上设无效，会拿到 0xC00D6D77 MF_E_TRANSFORM_ASYNC_LOCKED）；

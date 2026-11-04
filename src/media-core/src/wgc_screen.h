@@ -5,7 +5,7 @@
 // 坑（D3D11 设备、COM 单元、FrameArrived 的 agile 委托、staging 复用）与信令
 // / 编码无关，放在一个文件里既能单独量耗时，也方便将来换成窗口捕获。
 //
-// 关键约定（全部来自 spikes/wgc-probe 与 docs/spikes/2026-11-02-wgc-capture.md）：
+// 关键约定（全部来自 spikes/wgc-probe 与 .docs/spikes/2026-11-02-wgc-capture.md）：
 //   * 显示器身份用 HMONITOR，**不要**用 GraphicsCaptureItem::DisplayName ——「显示 2」
 //     和 \\.\DISPLAY1 的编号对不上，拿它匹配会张冠李戴；
 //   * FrameArrived 的委托必须混入 Microsoft::WRL::FtmBase（否则 0x8000001C）；

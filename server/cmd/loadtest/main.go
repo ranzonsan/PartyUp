@@ -46,6 +46,9 @@ func main() {
 		duration    = flag.Duration("duration", 20*time.Second, "所有成员进语音后持续压测的时长")
 		joinTimeout = flag.Duration("join-timeout", 90*time.Second, "等待全部成员进语音的超时")
 		jsonOut     = flag.String("json", "", "把汇总 JSON 写到这个文件（空则只打印表格）")
+		shares      = flag.Int("share", 0, "有屏幕共享的频道数（每个频道 1 个假共享者，其余成员观看）")
+		videoFPS    = flag.Int("video-fps", 30, "假共享者的帧率")
+		videoBytes  = flag.Int("video-frame-bytes", 6000, "假共享者每帧字节数（6000B×30fps≈1.4 Mbps，接近真实 1440p 共享）")
 	)
 	flag.Parse()
 
@@ -124,20 +127,51 @@ func main() {
 	if int(joined.Load()) != *members {
 		fatalf("only %d/%d members joined voice", joined.Load(), *members)
 	}
-	fmt.Printf("LOAD=ready members=%d\n", *members)
+	// 2.5) 屏幕共享：每个指定频道挑第 1 个成员当假共享者（其余成员是观看者）。
+	//      screen.start 会触发服务端**重建**共享者的视频 PC 并重发 offer，所以给 2s 让
+	//      重协商完成，再开始计时——否则前几秒的视频流量会漏统计。
+	sharers := 0
+	for chIdx := 0; chIdx < *shares && chIdx < len(chanIDs); chIdx++ {
+		for _, c := range clients {
+			if c.channelID != chanIDs[chIdx] || c.isSharer {
+				continue
+			}
+			c.isSharer = true
+			c.videoFPS = *videoFPS
+			c.videoBytes = *videoBytes
+			sharers++
+			go func(cc *client) {
+				if err := cc.startShare(); err != nil {
+					fmt.Printf("SHARE_FAILED name=%s err=%v\n", cc.name, err)
+				}
+			}(c)
+			break
+		}
+	}
+	if sharers > 0 {
+		time.Sleep(2 * time.Second)
+	}
+	fmt.Printf("LOAD=ready members=%d sharers=%d\n", *members, sharers)
 
 	// 3) 压测：每个成员都在说话（20ms 一帧），期间统计每端收到的包。
 	startEdges := takeSnapshot(clients)
+	startVideo := make([]int64, len(clients))
+	for i, c := range clients {
+		_, startVideo[i] = c.videoSnapshot()
+	}
 	time.Sleep(*duration)
 
 	// 4) 汇总。
 	elapsed := duration.Seconds()
 	type peerStat struct {
-		Name       string `json:"name"`
-		Tracks     int    `json:"tracks"`
-		Publishers int    `json:"publishers"`
-		Packets    int64  `json:"packets"`
-		PPS        int64  `json:"pps"`
+		Name        string `json:"name"`
+		Tracks      int    `json:"tracks"`
+		Publishers  int    `json:"publishers"`
+		Packets     int64  `json:"packets"`
+		PPS         int64  `json:"pps"`
+		VideoTracks int    `json:"video_tracks"`
+		VideoPPS    int64  `json:"video_pps"`
+		Sharer      bool   `json:"sharer"`
 	}
 	stats := make([]peerStat, 0, len(clients))
 	// 每个频道的人数（i%channels 分摊），据此算每人应收到几路。
@@ -150,14 +184,26 @@ func main() {
 		expectByPeer[i] = chanCounts[c.channelID] - 1
 	}
 	minTracks, minPublishers, minDeficit := 1<<30, 1<<30, 0
-	var totalPPS int64
+	var totalPPS, totalVideoPPS int64
+	videoViewers := 0
+	var sharerFrames int64
 	for i, c := range clients {
 		tracks, publishers, packets := c.snapshot()
 		delta := packets - startEdges[i]
 		pps := int64(float64(delta) / elapsed)
+		vtracks, vpackets := c.videoSnapshot()
+		vpps := int64(float64(vpackets-startVideo[i]) / elapsed)
+		if vtracks > 0 {
+			videoViewers++
+		}
+		if c.isSharer {
+			sharerFrames += c.videoSendSnapshot()
+		}
 		stats = append(stats, peerStat{
 			Name: c.name, Tracks: tracks, Publishers: publishers, Packets: packets, PPS: pps,
+			VideoTracks: vtracks, VideoPPS: vpps, Sharer: c.isSharer,
 		})
+		totalVideoPPS += vpps
 		if tracks < minTracks {
 			minTracks = tracks
 		}
@@ -183,17 +229,21 @@ func main() {
 	}
 
 	summary := map[string]any{
-		"members":        *members,
-		"channels":       len(chanIDs),
-		"channel_counts": chanSummary,
-		"duration_s":     elapsed,
-		"min_tracks":     minTracks,
-		"min_publishers": minPublishers,
-		"expect_tracks":  minExpect, // 各频道「其余成员数」的最小值
-		"max_deficit":    minDeficit,
-		"total_pps":      totalPPS,
-		"avg_pps":        totalPPS / int64(*members),
-		"peers":          stats,
+		"members":         *members,
+		"channels":        len(chanIDs),
+		"channel_counts":  chanSummary,
+		"duration_s":      elapsed,
+		"min_tracks":      minTracks,
+		"min_publishers":  minPublishers,
+		"expect_tracks":   minExpect, // 各频道「其余成员数」的最小值
+		"max_deficit":     minDeficit,
+		"total_pps":       totalPPS,
+		"avg_pps":         totalPPS / int64(*members),
+		"sharers":         sharers,
+		"video_viewers":   videoViewers,
+		"total_video_pps": totalVideoPPS,
+		"avg_video_pps":   totalVideoPPS / int64(max(1, videoViewers)),
+		"peers":           stats,
 	}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
@@ -274,29 +324,42 @@ type client struct {
 	memberID  string
 	channelID string
 
-	mu         sync.Mutex
-	recv       map[string]int64 // 发布者 member id（= 远端 track id）→ 收到的 RTP 包数
-	tracks     map[string]struct{}
-	packets    int64
-	sfuOffers  int
-	requests   int
-	closeOnce  sync.Once
-	writeMu    sync.Mutex
-	nextID     int
-	pendingMu  sync.Mutex
-	pending    map[string]chan protocol.Envelope
-	connErrors []string
+	// 屏幕共享（视频中继）：服务端在 subscribe 时就会下发 screen offer（观看者身份），
+	// 共享者 screen.start 后服务端还会重建视频 PC 再发一次 offer（要带轨才发得出去）。
+	screenPC   *webrtc.PeerConnection
+	videoTrack *webrtc.TrackLocalStaticSample
+	isSharer   bool
+	videoFPS   int
+	videoBytes int
+
+	mu               sync.Mutex
+	recv             map[string]int64 // 发布者 member id（= 远端 track id）→ 收到的 RTP 包数
+	videoPackets     int64
+	videoFramesSent  int64
+	videoSenderReady bool
+	videoTracks      map[string]struct{}
+	tracks           map[string]struct{}
+	packets          int64
+	sfuOffers        int
+	requests         int
+	closeOnce        sync.Once
+	writeMu          sync.Mutex
+	nextID           int
+	pendingMu        sync.Mutex
+	pending          map[string]chan protocol.Envelope
+	connErrors       []string
 }
 
 func newClient(serverURL, name, token string) (*client, error) {
 	c := &client{
-		name:      name,
-		serverURL: serverURL,
-		token:     token,
-		recv:      make(map[string]int64, 16),
-		tracks:    make(map[string]struct{}, 16),
-		done:      make(chan struct{}),
-		pending:   make(map[string]chan protocol.Envelope, 8),
+		name:        name,
+		serverURL:   serverURL,
+		token:       token,
+		recv:        make(map[string]int64, 16),
+		tracks:      make(map[string]struct{}, 16),
+		videoTracks: make(map[string]struct{}, 4),
+		done:        make(chan struct{}),
+		pending:     make(map[string]chan protocol.Envelope, 8),
 	}
 	return c, nil
 }
@@ -484,16 +547,197 @@ func (c *client) readLoop() {
 			if err := env.DecodePayload(&push); err != nil {
 				continue
 			}
-			// 这个工具只压语音：screen 的信令交给真正的客户端，这里忽略，
-			// 否则会把 screen offer 塞进语音 PC（两条 PC 的 SDP 会互相覆盖）。
-			if push.Media != "voice" {
+			// 语音与屏幕各一条 PC：信令必须按 media 分流，否则两条 SDP 会互相覆盖。
+			switch push.Media {
+			case "voice":
+				switch push.Kind {
+				case "offer":
+					go c.applyOffer(push.Payload)
+				case "candidate":
+					c.applyCandidate(push.Payload)
+				}
+			case "screen":
+				switch push.Kind {
+				case "offer":
+					go c.applyScreenOffer(push.Payload)
+				case "candidate":
+					c.applyScreenCandidate(push.Payload)
+				}
+			}
+		}
+	}
+}
+
+// applyScreenCandidate 把服务端给视频 PC 的 ICE 候选喂进当前视频 PC。
+func (c *client) applyScreenCandidate(payload string) {
+	c.mu.Lock()
+	pc := c.screenPC
+	c.mu.Unlock()
+	if pc == nil {
+		return
+	}
+	var msg struct {
+		Candidate string `json:"candidate"`
+	}
+	if err := json.Unmarshal([]byte(payload), &msg); err != nil || msg.Candidate == "" {
+		return
+	}
+	_ = pc.AddICECandidate(webrtc.ICECandidateInit{Candidate: msg.Candidate})
+}
+
+// applyScreenOffer 处理服务端的视频 offer。
+//
+// 关键点：服务端在 screen.start 之后会**重建**共享者的视频 PC 并重发 offer（旧 PC 的那条
+// recvonly m-line 在「当观看者」时已经答成「不发」，ABI 不允许重协商）。所以这里每次都
+// 建一条全新的 PC，并把本地视频轨挂到 video transceiver 的发送侧——观看者不发帧，
+// 共享者随后由 frameLoop 写帧。收到的视频 RTP 计入 videoPackets（衡量转发成本）。
+func (c *client) applyScreenOffer(payload string) {
+	var msg struct {
+		SDP string `json:"sdp"`
+	}
+	if err := json.Unmarshal([]byte(payload), &msg); err != nil || msg.SDP == "" {
+		return
+	}
+	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		return
+	}
+	pc.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
+		c.mu.Lock()
+		c.videoTracks[track.ID()] = struct{}{}
+		c.mu.Unlock()
+		for {
+			if _, _, err := track.ReadRTP(); err != nil {
+				return
+			}
+			c.mu.Lock()
+			c.videoPackets++
+			c.mu.Unlock()
+		}
+	})
+
+	c.mu.Lock()
+	old := c.screenPC
+	c.screenPC = pc
+	if c.videoTrack == nil {
+		// 假 VP8 帧：pion 的 VP8 payloader 只做 RTP 分包，不校验码流，所以任意字节都能作为
+		// RTP 负载转发——我们要测的是服务端转发成本，不是解码。
+		tr, err := webrtc.NewTrackLocalStaticSample(
+			webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8, ClockRate: 90000},
+			"screen", c.name,
+		)
+		if err == nil {
+			c.videoTrack = tr
+		}
+	}
+	videoTrack := c.videoTrack
+	c.mu.Unlock()
+	if old != nil {
+		_ = old.Close()
+	}
+
+	// Pion 的 answerer 侧：只有**先**占一条 sendonly 的视频 transceiver，服务端 offer 的
+	// 第一条视频 m-line（recvonly：它收我们的屏幕）才会复用它、SDP 才会答成 sendonly 并
+	// 分配 sender。否则 SetRemoteDescription 之后这条 m-line 没有 sender，ReplaceTrack 无处可挂
+	// （实测表现为 SCREEN_ATTACH_FAILED、服务端收不到任何视频轨）。
+	if videoTrack != nil {
+		if _, err := pc.AddTransceiverFromTrack(videoTrack, webrtc.RTPTransceiverInit{
+			Direction: webrtc.RTPTransceiverDirectionSendonly,
+		}); err != nil {
+			fmt.Printf("SCREEN_TRACK_FAILED name=%s err=%v\n", c.name, err)
+		}
+	}
+	if err := pc.SetRemoteDescription(webrtc.SessionDescription{
+		Type: webrtc.SDPTypeOffer, SDP: msg.SDP,
+	}); err != nil {
+		return
+	}
+	// 服务端 offer 里**第一条**视频 m-line 是 recvonly（收我们的屏幕），其余是 sendonly 槽
+	// （看别人的屏幕）。所以只给第一条视频 transceiver 挂本地轨——挂到槽位上没意义，
+	// 且 Pion 在 answerer 侧对 Direction()/CurrentDirection() 的状态机不适合做判据。
+	if videoTrack != nil {
+		attached := false
+		for _, tr := range pc.GetTransceivers() {
+			if tr.Kind() != webrtc.RTPCodecTypeVideo {
 				continue
 			}
-			switch push.Kind {
-			case "offer":
-				go c.applyOffer(push.Payload)
-			case "candidate":
-				c.applyCandidate(push.Payload)
+			if tr.Sender() != nil {
+				if err := tr.Sender().ReplaceTrack(videoTrack); err == nil {
+					c.mu.Lock()
+					c.videoSenderReady = true
+					c.mu.Unlock()
+					attached = true
+				}
+			}
+			break // 只看第一条视频 transceiver
+		}
+		if !attached {
+			fmt.Printf("SCREEN_ATTACH_FAILED name=%s\n", c.name)
+		}
+	}
+	answer, err := pc.CreateAnswer(nil)
+	if err != nil {
+		return
+	}
+	gathered := webrtc.GatheringCompletePromise(pc)
+	if err := pc.SetLocalDescription(answer); err != nil {
+		return
+	}
+	<-gathered
+	local := pc.LocalDescription()
+	if local == nil {
+		return
+	}
+	body, _ := json.Marshal(map[string]string{"type": "answer", "sdp": local.SDP})
+	_, _ = c.request(protocol.TypeMediaSignal, protocol.MediaSignalRequest{
+		ChannelID: c.channelID,
+		Target:    "sfu",
+		Media:     "screen",
+		Kind:      "answer",
+		Payload:   string(body),
+	})
+}
+
+// startShare 让本客户端成为假共享者：screen.start 后服务端会重建视频 PC 再发 offer，
+// 帧循环从此开始写假 VP8 帧（30fps × videoBytes）。
+func (c *client) startShare() error {
+	resp, err := c.request(protocol.TypeScreenStart, protocol.ScreenStartRequest{
+		ChannelID: c.channelID,
+		Source: protocol.ScreenSource{
+			ID: "synthetic:0", Title: "loadtest synthetic", Width: 2560, Height: 1440, Kind: "synthetic",
+		},
+	})
+	if err != nil {
+		return err
+	}
+	if resp.Type != protocol.TypeOK(protocol.TypeScreenStart) {
+		return fmt.Errorf("screen.start: %s %s", resp.Type, resp.Payload)
+	}
+	go c.frameLoop()
+	return nil
+}
+
+// frameLoop 每 1/fps 秒写一帧假视频。
+func (c *client) frameLoop() {
+	interval := time.Second / time.Duration(c.videoFPS)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	frame := make([]byte, c.videoBytes)
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-ticker.C:
+			c.mu.Lock()
+			tr := c.videoTrack
+			c.mu.Unlock()
+			if tr == nil {
+				continue
+			}
+			if err := tr.WriteSample(media.Sample{Data: frame, Duration: interval}); err == nil {
+				c.mu.Lock()
+				c.videoFramesSent++
+				c.mu.Unlock()
 			}
 		}
 	}
@@ -595,6 +839,20 @@ func (c *client) snapshot() (tracks, publishers int, packets int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return len(c.tracks), len(c.recv), c.packets
+}
+
+// videoSendSnapshot 返回共享者已写出的帧数（诊断用）。
+func (c *client) videoSendSnapshot() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.videoFramesSent
+}
+
+// videoSnapshot 返回 (收到的远端视频轨数, 收到的视频 RTP 包数)。
+func (c *client) videoSnapshot() (tracks int, packets int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.videoTracks), c.videoPackets
 }
 
 func (c *client) close() {

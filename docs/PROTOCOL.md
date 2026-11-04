@@ -54,6 +54,28 @@ HTTP 请求/响应体形状（2026-11-02 落地，此前文档未定义）：
 
 失败统一为 `{ "code": "<错误码>", "message": "<人类可读>" }`，状态码：400 参数非法（`INVALID_ARGUMENT`）、401 未认证（`UNAUTHENTICATED`）、403 禁止（`FORBIDDEN`）、404 不存在（`NOT_FOUND`）、409 冲突（`CONFLICT`）、500 内部（`INTERNAL`）。
 
+### 1.4 服务器配置下发（`server.info`）
+
+客户端鉴权后请求一次，缓存起来：
+
+- `server.info {}` → `server.info.ok { stun_urls: ["stun:192.168.1.10:3478"] }`
+
+`stun_urls` 是服务端内建 STUN responder（`--stun-listen` / `--stun-advertise`）的地址，
+客户端必须拿它作为 PeerConnection 的 ICE servers 做候选收集——**不得硬编码公共 STUN**：
+自托管场景下只有服务端知道自己对外可达的地址，公共 STUN 还会把客户端 IP 泄露给第三方。
+空数组表示运维没开 STUN：仍可直连，但拿不到 srflx 候选，跨 NAT 通常连不上。
+
+**为什么单独一条消息、而不是塞进 `voice.state`**：
+
+1. **时序**：`stun_urls` 必须在**创建任何 PeerConnection 之前**拿到（要写进 ICE 配置），
+   而 `voice.state` 是加入语音房间之后才广播的。塞进 voice.state 会造成「第一次进语音
+   拿不到 STUN、第二次才有」的间歇性 bug。
+2. **归属**：STUN 是服务器级属性，屏幕直连也要用，不该耦合到语音房间状态里。
+3. **可扩展**：以后版本下限、频道上限、TURN 等都放这里，不再开新消息。
+
+`server.info` 只回**配置**，不含任何传输策略选择信息——客户端不能据此推断自己可以选
+relay/direct（那是 `voice.state.transport` 与服务端策略的事）。
+
 ## 2. 频道
 
 - `channel.list` → `channel.list.ok { channels: [{ id, name, voice: [...], shares: [...] }] }`
@@ -100,10 +122,23 @@ HTTP 请求/响应体形状（2026-11-02 落地，此前文档未定义）：
 - `voice.set_mute { channel_id, muted }` / `voice.set_deafen { channel_id, deafened }`
   —— 上报本端静音/闭音状态。本地 ADM 状态仍由客户端自己控制；上报是为了让别人看见（`voice.state`）。
 - 广播 `voice.state { channel_id, voice_mode, screen_mode,
-  members: [{ member_id, muted, deafened, role, joined_seq? }],
+  members: [{ member_id, muted, deafened, role, joined_seq?,
+              transport, transport_reason }],
   slots?: [{ index, member_id, muted }] }`
   —— `voice_mode` / `screen_mode` 是两条独立策略的服务端实际值（`relay|direct`）；
   旧字段 `mode` **已删除**（v1 客户端同版本发布，无兼容负担）。
+
+  **`transport` 按成员下发，不按频道下发（2026-11-04 硬要求）**：
+  `members[].transport ∈ { relay, direct }` 表示**这个成员实际在用什么**（事实），
+  `transport_reason ∈ { server_policy, direct_failed_fallback }` 说明为什么。
+  v1 服务端给所有人填同一个值（行为上仍是频道级），但**协议结构必须是 per-member**——
+  逐成员混合路径（含成员中继）是 v1 之后的方向，届时只改服务端填充逻辑，
+  协议与客户端都不用重设计；若现在写成频道级单字段，将来拆分就是一次破坏性变更。
+
+  注意两个字段语义不同、都要保留：
+  - `voice_mode` = 服务端**策略**（配置成什么，来自 `--voice-mode`）；
+  - `members[].transport` = 该成员**实际**使用的路径（将来可能因回落/混合而不同）。
+  客户端应读自己的 `members[].transport` 决定媒体路径；缺该字段的老服务端才回退读 `voice_mode`。
   `joined_seq` 是同一频道内单调递增的加入序号（仅诊断/排序用，不跨会话）。
   `members` 按 `member_id` 排序，稳定可比对。
 
@@ -229,6 +264,38 @@ HTTP 请求/响应体形状（2026-11-02 落地，此前文档未定义）：
 `p2p.start` 暂不实现（观看方收到 offer 即自动应答）。
 
 服务端角色：成员准入、消息定向、超时清理。它不解析也不改写 SDP——一旦开始 munge，直连就变成了"半个 SFU"。
+
+### 4.4 直连失败上报与回落（`voice.transport_failed`）
+
+direct 策略下，客户端检测到本端 ICE **连接失败**（`ice_state == FAILED`）或建会话后
+**N 秒内未连通**（默认 15 秒）时，发一条**只含事实**的消息：
+
+```json
+voice.transport_failed { "channel_id": "...", "media": "voice", "reason": "ice_failed" }
+```
+
+`reason ∈ { ice_failed, ice_timeout }`。服务端收到后**自己决定**是否把该频道的 voice
+transport 降级为 relay，并广播新的 `voice.state`（`voice_mode` 变为 relay），所有成员按
+新 transport 重建会话。
+
+**语义是「告知」不是「请求」**——客户端说的是「我这边连不上」，**不是**「给我 relay」。
+客户端**不得**据此推断自己可以指定 transport：路径决定权始终在服务端
+（PRODUCT 传输策略第 3 条约束）。后来人若想把它当 override 用，先回头读这一句。
+
+落地规则：
+
+- **按频道降级，不按成员**：`PRODUCT.md` 非目标明确「不做逐成员混合路径」。direct v1 只
+  支持 2 人，一对人连不上就等于这条通话连不上，按频道降级是唯一自洽做法。
+- **单向**：本进程生命周期内降级后不再升回 direct（避免抖动）；重启服务端才恢复策略原值。
+- **幂等**：同一成员重复上报不重复降级。
+- **防滥用**：同一成员 N 秒内最多触发一次降级判定（否则网络抖动会刷屏）。
+- **日志**：服务端必须打印
+  `voice: transport downgraded direct→relay channel=… reason=… member=…`。
+- 客户端写一条路径历史：`直连 → 中继（直连超时/失败，已自动回落）`，
+  UI 只显示这条记录 + 一句轻提示，**不重进频道、不掉线**。
+
+与 §6 的关系：§6 的 `media.report` / `media.path` 是「路径状态可视化」；
+`voice.transport_failed` 是「触发服务端决策的事实输入」，两者不互相替代。
 
 ## 5. 屏幕共享
 

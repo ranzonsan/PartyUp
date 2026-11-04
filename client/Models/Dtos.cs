@@ -63,7 +63,18 @@ public sealed record MediaSignalDto(
 /// voice.state.members 的一项。Role 是**服务端裁决的直连协商角色**（offerer / answerer）：
 /// 客户端不再按「谁先来」推断，否则两端同时加入会都判 answerer、没人发 offer。
 /// </summary>
-public sealed record VoiceMemberDto(string MemberId, bool Muted, bool Deafened, string? Role);
+/// <remarks>
+/// Transport / TransportReason 是**按成员下发的事实**（v1 全频道相同）：
+/// Transport 表示这个人实际在用什么路径，与 voice.state.voice_mode（服务端策略）语义不同。
+/// 逐成员混合路径是 v1 之后的方向，客户端从现在就按成员读，避免届时改协议。
+/// </remarks>
+public sealed record VoiceMemberDto(
+    string MemberId,
+    bool Muted,
+    bool Deafened,
+    string? Role,
+    string? Transport = null,
+    string? TransportReason = null);
 
 /// <summary>
 /// voice.state.slots 的一项：第 <paramref name="Index"/> 个远端音频槽位转发的是哪个成员。
@@ -84,6 +95,12 @@ public sealed record VoiceStateDto(
 /// Role 只有 voice.join.ok 会填（offerer / answerer）：客户端在建 PC 之前/之后都用它对齐。
 /// </summary>
 public sealed record VoiceAckDto(string ChannelId, string? Mode, string? Transport, string? Role);
+
+/// <summary>
+/// server.info 的响应（PROTOCOL.md §1.4）：服务端配置。目前只有 STUN 地址。
+/// 注意与 auth.ok 里的 <see cref="ServerInfoDto"/>（服务端身份/能力）区分：两条消息不同。
+/// </summary>
+public sealed record ServerConfigDto(IReadOnlyList<string> StunUrls);
 
 /// <summary>通用信封。v=1 由协议固定；Payload 原样保留，按消息类型再反序列化。</summary>
 public sealed record EnvelopeDto(int V, string Id, string Type, long Ts, JsonElement? Payload);

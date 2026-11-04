@@ -64,6 +64,16 @@ type Hub struct {
 	// screenMode 是**屏幕共享**的独立传输策略（--screen-mode），与 voiceMode 无关：
 	// 语音走中继、共享走直连（或反过来）都是合法配置（ADR-0002 三类媒体各自决定路径）。
 	screenMode string
+	// voiceTransport 是每频道**实际**的传输路径（relay | direct）。v1 与 voiceMode 同值，
+	// 但它是「事实」而非「策略」：直连失败回落时改它（整频道所有成员一起），不改 voiceMode。
+	// 按成员下发（VoiceMemberState.Transport）是为了将来支持逐成员混合路径而不破坏协议。
+	voiceTransport map[string]string
+	// voiceTransportReason 记录该频道为什么是当前 transport（server_policy / direct_failed_fallback）。
+	voiceTransportReason map[string]string
+	// stunURLs 是 server.info 下发给客户端的 STUN 地址（`stun:host:port`），
+	// 来自启动参数 --stun-listen/--stun-advertise。空表示没开 STUN。
+	// 它是**配置**不是**策略**：只影响 ICE 候选收集，不影响 transport 决策。
+	stunURLs []string
 	// sfuVideo 表示 SFU 中继是否已具备视频通道（屏幕共享，sfu.VideoRoom）。
 	sfuVideo   bool
 	rooms      map[string]*sfu.Room      // channel_id → 语音中继房间（仅 voice_mode=relay）
@@ -71,22 +81,25 @@ type Hub struct {
 }
 
 // NewHub 构造会话中心。
-func NewHub(st *store.Store, log *slog.Logger, name, version, voiceMode, screenMode string) *Hub {
+func NewHub(st *store.Store, log *slog.Logger, name, version, voiceMode, screenMode string, stunURLs []string) *Hub {
 	return &Hub{
-		store:      st,
-		log:        log,
-		name:       name,
-		version:    version,
-		conns:      make(map[*conn]struct{}, 8),
-		subs:       make(map[string]map[*conn]struct{}, 8),
-		shares:     make(map[string]map[string]protocol.ShareState, 4),
-		voice:      make(map[string]map[string]protocol.VoiceMemberState, 4),
-		voiceSeq:   make(map[string]int, 4),
-		voiceMode:  NormalizeVoiceMode(voiceMode),
-		screenMode: NormalizeScreenMode(screenMode),
-		sfuVideo:   true, // SFU 视频转发（sfu.VideoRoom）已落地
-		rooms:      make(map[string]*sfu.Room, 4),
-		videoRooms: make(map[string]*sfu.VideoRoom, 4),
+		store:                st,
+		log:                  log,
+		name:                 name,
+		version:              version,
+		stunURLs:             append([]string(nil), stunURLs...),
+		conns:                make(map[*conn]struct{}, 8),
+		subs:                 make(map[string]map[*conn]struct{}, 8),
+		shares:               make(map[string]map[string]protocol.ShareState, 4),
+		voice:                make(map[string]map[string]protocol.VoiceMemberState, 4),
+		voiceSeq:             make(map[string]int, 4),
+		voiceMode:            NormalizeVoiceMode(voiceMode),
+		screenMode:           NormalizeScreenMode(screenMode),
+		sfuVideo:             true, // SFU 视频转发（sfu.VideoRoom）已落地
+		voiceTransport:       make(map[string]string, 4),
+		voiceTransportReason: make(map[string]string, 4),
+		rooms:                make(map[string]*sfu.Room, 4),
+		videoRooms:           make(map[string]*sfu.VideoRoom, 4),
 		upgrader: websocket.Upgrader{
 			HandshakeTimeout: 10 * time.Second,
 			// 桌面客户端不是浏览器，没有同源概念；放开 Origin 检查。
@@ -434,6 +447,8 @@ func (c *conn) handle(env protocol.Envelope) {
 		c.handleVoiceSetMute(env)
 	case protocol.TypeVoiceSetDeafen:
 		c.handleVoiceSetDeafen(env)
+	case protocol.TypeServerInfo:
+		c.handleServerInfo(env)
 	default:
 		c.replyError(env.Type, protocol.CodeInvalidArgument, "unknown message type "+env.Type, env.ID)
 	}

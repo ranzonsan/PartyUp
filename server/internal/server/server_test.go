@@ -52,6 +52,12 @@ func newTestEnvWith(t *testing.T, voiceMode string) *testEnv {
 // newTestEnvWithModes 同时指定语音与屏幕共享策略（两者互相独立，见 ADR-0002）。
 func newTestEnvWithModes(t *testing.T, voiceMode, screenMode string) *testEnv {
 	t.Helper()
+	return newTestEnvWithOptions(t, server.Options{VoiceMode: voiceMode, ScreenMode: screenMode})
+}
+
+// newTestEnvWithOptions 用任意服务端选项起一个测试环境（目前用于 server.info 的 STUN 配置）。
+func newTestEnvWithOptions(t *testing.T, opts server.Options) *testEnv {
+	t.Helper()
 
 	st, err := store.Open(t.TempDir())
 	if err != nil {
@@ -64,13 +70,14 @@ func newTestEnvWithModes(t *testing.T, voiceMode, screenMode string) *testEnv {
 		logOut = os.Stderr
 	}
 	logger := slog.New(slog.NewTextHandler(logOut, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	srv := server.New(st, server.Options{
-		Name:       "test-server",
-		Version:    "0.0.0-test",
-		Logger:     logger,
-		VoiceMode:  voiceMode,
-		ScreenMode: screenMode,
-	})
+	if opts.Name == "" {
+		opts.Name = "test-server"
+	}
+	if opts.Version == "" {
+		opts.Version = "0.0.0-test"
+	}
+	opts.Logger = logger
+	srv := server.New(st, opts)
 
 	info, err := srv.EnsureFirstRun(context.Background())
 	if err != nil {

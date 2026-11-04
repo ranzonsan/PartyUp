@@ -99,13 +99,14 @@ public sealed class MediaEngine : IDisposable
     private bool _disposed;
 
     private MediaEngine(string libraryPath, IntPtr handle, IReadOnlyList<string> missingExports,
-        bool hasMediaSignal, bool hasScreenRelay)
+        bool hasMediaSignal, bool hasScreenRelay, bool hasIceServers)
     {
         LibraryPath = libraryPath;
         _handle = handle;
         MissingExports = missingExports;
         HasMediaSignalSupport = hasMediaSignal;
         HasScreenRelaySupport = hasScreenRelay;
+        HasIceServersSupport = hasIceServers;
     }
 
     /// <summary>
@@ -179,7 +180,14 @@ public sealed class MediaEngine : IDisposable
             AppLog.Warn("media: DLL 缺少 pu_screen_start_ex / pu_screen_prepare（ABI v2.11）——" +
                         "screen_mode=relay 的屏幕共享不可用");
         }
-        return new MediaEngine(path, handle, missing, hasMediaSignal, hasScreenRelay);
+        // 可选导出（直连回落 3a）：ICE servers 注入。没有它时直连只能拿到 host 候选。
+        var hasIceServers = NativeLibrary.TryGetExport(handle, "pu_engine_set_ice_servers", out _);
+        if (!hasIceServers)
+        {
+            AppLog.Warn("media: DLL 缺少 pu_engine_set_ice_servers（ABI 第 24 个导出）——" +
+                        "STUN 配置暂不生效（等 split-dev 的 DLL），直连只剩 host 候选");
+        }
+        return new MediaEngine(path, handle, missing, hasMediaSignal, hasScreenRelay, hasIceServers);
     }
 
     /// <summary>DllImport 解析器：只接管 partyup_media，其余交给默认逻辑。</summary>
@@ -223,6 +231,8 @@ public sealed class MediaEngine : IDisposable
         {
             Marshal.FreeCoTaskMem(namePtr);
         }
+        // ICE servers 必须在第一条 PeerConnection 之前写进引擎，所以在这里补应用。
+        ApplyIceServers();
     }
 
     /// <summary>非阻塞/阻塞取一条事件。<paramref name="timeoutMs"/> &lt; 0 表示一直等。无事件返回 null。</summary>
@@ -251,12 +261,62 @@ public sealed class MediaEngine : IDisposable
     /// <summary>pu_stats 在 C 侧 sizeof 为 64。</summary>
     public static int StatsStructSize { get; } = Marshal.SizeOf<PuStats>();
 
+    /// <summary>媒体核心是否支持 ICE servers 注入（ABI 第 24 个导出 pu_engine_set_ice_servers）。</summary>
+    public bool HasIceServersSupport { get; private set; }
+
+    /// <summary>是否已建过屏幕会话（只用于日志里标注 pu_stats 的状态来源，不参与逻辑）。</summary>
+    public bool HasScreenSession { get; private set; }
+
+    private IReadOnlyList<string> _iceServers = Array.Empty<string>();
+
+    /// <summary>
+    /// 设置 ICE servers（STUN 地址来自服务端 server.info，见 PROTOCOL.md §1.4）。
+    /// 幂等；引擎尚未 Create 时先缓存，Create 后自动应用。DLL 还没有该导出时只告警并缓存。
+    /// </summary>
+    public void SetIceServers(IReadOnlyList<string> urls)
+    {
+        ThrowIfDisposed();
+        _iceServers = (urls ?? Array.Empty<string>())
+            .Where(u => !string.IsNullOrWhiteSpace(u))
+            .Select(u => u.Trim())
+            .ToArray();
+        AppLog.Info("media: ice servers = " + (_iceServers.Count == 0
+            ? "(none)"
+            : string.Join(",", _iceServers)));
+        if (!HasIceServersSupport)
+        {
+            return; // 已缓存；等 DLL 提供导出后（下次 Load）或 Create 时再试
+        }
+        if (IsCreated)
+        {
+            ApplyIceServers();
+        }
+    }
+
+    /// <summary>把缓存的 ICE servers 写进引擎（建 PC 之前调用才有效）。</summary>
+    private void ApplyIceServers()
+    {
+        if (!HasIceServersSupport || _engine == IntPtr.Zero) return;
+        var joined = string.Join("\n", _iceServers);
+        var len = (UIntPtr)System.Text.Encoding.UTF8.GetByteCount(joined);
+        var rc = _iceServers.Count == 0
+            ? NativeMethods.pu_engine_set_ice_servers(_engine, null, UIntPtr.Zero)
+            : NativeMethods.pu_engine_set_ice_servers(_engine, joined, len);
+        if (rc != 0)
+        {
+            AppLog.Fail($"media: pu_engine_set_ice_servers 返回 {rc}：{LastErrorText()}");
+            return;
+        }
+        AppLog.Pass($"media: ice servers applied ({_iceServers.Count})");
+    }
+
     /// <summary>开始一路内置合成源共享（不需要真实屏幕，也不改动窗口内容）。</summary>
     public void StartSynthetic()
     {
         ThrowIfDisposed();
         EnsureCreated();
         Check(NativeMethods.pu_screen_start(_engine, "synthetic"), "pu_screen_start(synthetic)");
+        HasScreenSession = true;
     }
 
     /// <summary>开始共享指定屏幕（id 来自 <see cref="EnumerateSources"/> 或 "\\.\DISPLAY1"）。</summary>
@@ -265,6 +325,7 @@ public sealed class MediaEngine : IDisposable
         ThrowIfDisposed();
         EnsureCreated();
         Check(NativeMethods.pu_screen_start(_engine, screenId), "pu_screen_start");
+        HasScreenSession = true;
     }
 
     /// <summary>媒体核心是否支持被动屏幕会话（SFU 屏幕共享，ABI v2.11）。</summary>
@@ -284,6 +345,7 @@ public sealed class MediaEngine : IDisposable
                 "媒体核心缺少 pu_screen_start_ex：需要 ABI v2.11 的 DLL（SFU 屏幕共享）");
         }
         Check(NativeMethods.pu_screen_start_ex(_engine, screenId, 0x1u), "pu_screen_start_ex(passive)");
+        HasScreenSession = true;
     }
 
     /// <summary>观看者预建屏幕会话（answerer），不采屏、不建轨；幂等。</summary>
@@ -297,6 +359,7 @@ public sealed class MediaEngine : IDisposable
                 "媒体核心缺少 pu_screen_prepare：需要 ABI v2.11 的 DLL（SFU 屏幕共享）");
         }
         Check(NativeMethods.pu_screen_prepare(_engine), "pu_screen_prepare");
+        HasScreenSession = true;
     }
 
     /// <summary>停止共享（幂等）。</summary>
@@ -305,6 +368,7 @@ public sealed class MediaEngine : IDisposable
         ThrowIfDisposed();
         EnsureCreated();
         Check(NativeMethods.pu_screen_stop(_engine), "pu_screen_stop");
+        HasScreenSession = false;
     }
 
     /// <summary>读引擎统计快照（微秒级，不发异步 GetStats）。</summary>

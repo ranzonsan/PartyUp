@@ -105,6 +105,15 @@ internal static class NativeMethods
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
     public static extern int pu_peer_stats(IntPtr engine, ref PuStats stats);
 
+    /// <summary>
+    /// pu_engine_set_ice_servers（ABI v2 第 24 个导出，直连回落 3a）：设置本引擎所有
+    /// PeerConnection 的 ICE servers。urls 用换行分隔（"stun:1.2.3.4:3478\nstun:..."），
+    /// 空/null 表示清空。必须在建 PeerConnection **之前**调用（建好的 PC 不再改）。
+    /// </summary>
+    [DllImport(Library, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    public static extern int pu_engine_set_ice_servers(
+        IntPtr engine, [MarshalAs(UnmanagedType.LPUTF8Str)] string? urls, UIntPtr len);
+
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
     public static extern int pu_voice_join(IntPtr engine, in PuVoiceParams p);
 

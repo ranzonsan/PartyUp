@@ -71,6 +71,10 @@ const (
 	TypeVoiceSetMute   = "voice.set_mute"
 	TypeVoiceSetDeafen = "voice.set_deafen"
 	TypeVoiceState     = "voice.state"
+
+	// 服务器级信息（PROTOCOL.md §1.4）。客户端在鉴权后请求一次，缓存起来；
+	// 与语音/屏幕房间无关，任何 PC 创建之前都可以先拿到（这是 stun_urls 的时序要求）。
+	TypeServerInfo = "server.info"
 )
 
 // TypeOK 返回请求类型对应的成功响应类型：`text.send` → `text.send.ok`。
@@ -422,6 +426,19 @@ type VoiceMemberState struct {
 	Role string `json:"role"`
 	// JoinedSeq 是同一频道内单调递增的加入序号（仅用于诊断与稳定排序，不承诺跨会话语义）。
 	JoinedSeq int `json:"joined_seq,omitempty"`
+	// Transport 是该成员**实际使用**的传输路径（relay | direct），按成员下发。
+	//
+	// v1 服务端给所有人填同一个值（行为上仍是频道级），但**协议结构必须 per-member**：
+	// 逐成员混合路径是 v1 之后的方向，届时只改服务端的填充逻辑，协议与客户端都不用重设计
+	// （见 PRODUCT.md 传输策略硬要求）。
+	//
+	// 与 VoiceStatePayload.VoiceMode 语义不同：VoiceMode 是**服务端策略**（配置成什么），
+	// 这里是**这个成员实际在用什么**（事实）。
+	Transport string `json:"transport"`
+	// TransportReason 说明该成员为什么是这个 transport：
+	//   server_policy          = 服务端策略原值
+	//   direct_failed_fallback = 直连失败后的自动回落（v1 整个频道一起降级）
+	TransportReason string `json:"transport_reason"`
 }
 
 // VoiceSlotState 是「第几个远端音频槽位 → 哪个成员」的映射项（仅 relay 模式有）。
@@ -459,4 +476,17 @@ type VoiceJoinOK struct {
 	// 客户端在**创建 PeerConnection 之前**就要用它决定 passive，不能再靠本地推断。
 	// relay 模式下恒为 answerer（服务端 SFU 是 offerer）。
 	Role string `json:"role"`
+}
+
+// ServerInfoOK 是 server.info 的响应（PROTOCOL.md §1.4）。
+//
+// StunURLs 是服务端下发的 STUN 地址（`stun:host:port`）。客户端必须用它作为
+// PeerConnection 的 ICE servers 来做候选收集——**不得硬编码公共 STUN**：
+// 自托管场景下只有服务端知道自己对外可达的地址；空数组表示运维没开 STUN，
+// 此时仍可直连（只是拿不到 srflx 候选，跨 NAT 大概率连不上）。
+//
+// 这个字段是「配置」不是「策略」：它只影响候选收集，不决定 voice/screen 走
+// relay 还是 direct（那是 voice.state.transport 的事，客户端无权选择）。
+type ServerInfoOK struct {
+	StunURLs []string `json:"stun_urls"`
 }

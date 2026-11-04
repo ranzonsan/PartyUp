@@ -36,6 +36,9 @@ type Options struct {
 	// （ADR-0002：三类媒体各自决定路径）。"relay" = 走 SFU 视频通道；
 	// "direct" = 成员间 P2P。空值由 NormalizeScreenMode 归一到 direct。
 	ScreenMode string
+	// StunURLs 是内建 STUN responder 的地址（`stun:host:port`），由 server.info 下发。
+	// 空表示没开 STUN：客户端仍可直连，但没有 srflx 候选（跨 NAT 通常连不上）。
+	StunURLs []string
 }
 
 // Server 持有依赖与路由。一个进程一个 Server。
@@ -71,7 +74,7 @@ func New(st *store.Store, opts Options) *Server {
 		version:      opts.Version,
 		bootstrapTTL: opts.BootstrapTTL,
 	}
-	s.hub = NewHub(st, s.log, s.name, s.version, opts.VoiceMode, opts.ScreenMode)
+	s.hub = NewHub(st, s.log, s.name, s.version, opts.VoiceMode, opts.ScreenMode, opts.StunURLs)
 	s.mux = http.NewServeMux()
 	s.routes()
 	return s

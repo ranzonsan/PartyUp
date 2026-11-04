@@ -30,6 +30,7 @@ import (
 	"partyup/internal/protocol"
 	"partyup/internal/server"
 	"partyup/internal/store"
+	"partyup/internal/stunserver"
 )
 
 // version 是二进制版本。协议版本在 protocol.Version（当前 1）。
@@ -76,12 +77,13 @@ func printUsage() {
 	fmt.Fprint(os.Stderr, `partyup — PartyUp 服务端
 
 用法:
-  partyup serve  [--data DIR] [--http ADDR] [--name NAME] [--log-level L] [--voice-mode relay|direct]
+  partyup serve  [--data DIR] [--http ADDR] [--name NAME] [--log-level L]
+                 [--voice-mode relay|direct] [--stun-listen ADDR] [--stun-advertise HOST:PORT]
   partyup invite [--data DIR] [--by MEMBER_ID]
   partyup version
 
 serve 的 stdout 输出（每行 KEY=VALUE，最后一行 READY）:
-  DATA_DIR / DB_PATH / BOOTSTRAP_TOKEN / INVITE_CODE / VOICE_MODE / LISTEN_ADDR
+  DATA_DIR / DB_PATH / BOOTSTRAP_TOKEN / INVITE_CODE / VOICE_MODE / LISTEN_ADDR / STUN
 BOOTSTRAP_TOKEN 与 INVITE_CODE 只在本次启动新生成时出现。
 `)
 }
@@ -100,6 +102,13 @@ func cmdServe(args []string) error {
 	// 视频通道落地后把默认值切到 relay。
 	screenMode := fs.String("screen-mode", envOr("PARTYUP_SCREEN_MODE", "direct"),
 		"屏幕共享传输策略：direct（P2P 直连，当前默认）| relay（服务端 SFU 视频通道，开发中）")
+	// 内建 STUN responder（直连模式的 srflx 候选来源，见 docs/PROTOCOL.md §1.4）。
+	// 默认监听 :3478；传空串 / off 关闭。advertise 为空时自动从 listen 推导，
+	// 但**多网卡或有 NAT 的机器必须显式指定**，否则通告的是内网地址。
+	stunListen := fs.String("stun-listen", envOr("PARTYUP_STUN_LISTEN", ":3478"),
+		"STUN UDP 监听地址，默认 :3478；传空 / off 关闭")
+	stunAdvertise := fs.String("stun-advertise", envOr("PARTYUP_STUN_ADVERTISE", ""),
+		"STUN 对外通告的 IP:port（多网卡/NAT 必填；空则从 listen 或本机网卡推导）")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -112,12 +121,23 @@ func cmdServe(args []string) error {
 	}
 	defer st.Close()
 
+	stunSrv, err := stunserver.Start(*stunListen, *stunAdvertise, logger)
+	if err != nil {
+		return fmt.Errorf("stun responder: %w", err)
+	}
+	defer func() { _ = stunSrv.Close() }()
+	var stunURLs []string
+	if u := stunSrv.URL(); u != "" {
+		stunURLs = []string{u}
+	}
+
 	srv := server.New(st, server.Options{
 		Name:       *name,
 		Version:    version,
 		Logger:     logger,
 		VoiceMode:  *voiceMode,
 		ScreenMode: *screenMode,
+		StunURLs:   stunURLs,
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -150,6 +170,11 @@ func cmdServe(args []string) error {
 	}
 	fmt.Printf("VOICE_MODE=%s\n", server.NormalizeVoiceMode(*voiceMode))
 	fmt.Printf("SCREEN_MODE=%s\n", server.NormalizeScreenMode(*screenMode))
+	if adv := stunSrv.Advertise(); adv != "" {
+		fmt.Printf("STUN=udp://%s\n", adv)
+	} else {
+		fmt.Println("STUN=off")
+	}
 	fmt.Printf("LISTEN_ADDR=%s\n", ln.Addr().String())
 	fmt.Println("READY")
 

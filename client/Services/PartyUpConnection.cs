@@ -94,6 +94,9 @@ public sealed class PartyUpConnection : IAsyncDisposable
         try
         {
             await connection.OpenAsync(baseUri, token, ct);
+            // server.info 必须在任何 PeerConnection 之前拿到：STUN 地址要写进 ICE 配置。
+            // 失败不算致命（老服务端没有这条消息 / 没开 STUN 时照样能跑）。
+            await connection.EnsureServerInfoAsync(ct);
             connection._watchdog = Task.Run(connection.WatchdogLoopAsync, CancellationToken.None);
             return connection;
         }
@@ -213,6 +216,45 @@ public sealed class PartyUpConnection : IAsyncDisposable
             kind,
             payload,
         }, ct);
+
+    // ---- 服务端配置（docs/PROTOCOL.md §1.4）----
+
+    /// <summary>服务端下发的 STUN 地址（`stun:host:port`）；空表示服务端没开 STUN。</summary>
+    public IReadOnlyList<string> StunUrls { get; private set; } = Array.Empty<string>();
+
+    private bool _serverInfoLoaded;
+
+    /// <summary>请求 server.info 并缓存（幂等）。老服务端没有这条消息时只告警，不影响可用性。</summary>
+    public async Task EnsureServerInfoAsync(CancellationToken ct = default)
+    {
+        if (_serverInfoLoaded) return;
+        try
+        {
+            var info = await ServerInfoAsync(ct);
+            StunUrls = info.StunUrls ?? Array.Empty<string>();
+            _serverInfoLoaded = true;
+            AppLog.Info("server: stun_urls=" + (StunUrls.Count == 0
+                ? "(none — 服务端未开 STUN，直连只能靠 host 候选)"
+                : string.Join(",", StunUrls)));
+        }
+        catch (Exception ex)
+        {
+            AppLog.Warn("server: server.info 不可用（老服务端？），STUN 未配置：" + ex.Message);
+        }
+    }
+
+    /// <summary>server.info（§1.4）：服务端配置。只回配置，不含 transport 选择。</summary>
+    public Task<ServerConfigDto> ServerInfoAsync(CancellationToken ct = default) =>
+        RequestAsync<ServerConfigDto>("server.info", null, ct);
+
+    /// <summary>
+    /// voice.transport_failed（§4.4）：**只上报事实**（我这边 ICE 失败/超时），
+    /// 是否降级为 relay 由服务端决定。客户端不得据此推断自己能选 transport。
+    /// </summary>
+    public Task<VoiceAckDto> ReportTransportFailedAsync(
+        string channelId, string media, string reason, CancellationToken ct = default) =>
+        RequestAsync<VoiceAckDto>("voice.transport_failed",
+            new { channel_id = channelId, media, reason }, ct);
 
     // ---- 语音（docs/PROTOCOL.md §4）----
 

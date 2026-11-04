@@ -125,10 +125,16 @@ func (h *Hub) broadcastVoiceState(channelID string) {
 		targets = append(targets, peer)
 	}
 	room := h.rooms[channelID]
+	transport, transportReason := h.channelTransportLocked(channelID)
 	h.mu.RUnlock()
 
 	// 顺序稳定：成员按 id 排序，测试与客户端 diff 都不会因为 map 顺序抖动。
 	sort.Slice(members, func(i, j int) bool { return members[i].MemberID < members[j].MemberID })
+	// 逐成员下发「实际 transport」（v1 全是同一个值；字段结构与将来逐成员混合一致）。
+	for i := range members {
+		members[i].Transport = transport
+		members[i].TransportReason = transportReason
+	}
 
 	// relay 模式下补「槽位 → 成员」映射（direct 没有中继槽位，保持空）。
 	var slots []protocol.VoiceSlotState
@@ -297,6 +303,10 @@ func (c *conn) handleVoiceJoin(env protocol.Envelope) {
 			}
 		}
 		h.voiceSeq[channelID]++
+		if h.voiceTransport[channelID] == "" {
+			h.voiceTransport[channelID] = h.voiceMode
+			h.voiceTransportReason[channelID] = "server_policy"
+		}
 		members[memberID] = protocol.VoiceMemberState{
 			MemberID:  memberID,
 			Role:      role,
@@ -519,6 +529,20 @@ func (h *Hub) RefreshVideoPeer(channelID, memberID string) {
 	if err := room.Refresh(memberID); err != nil {
 		h.log.Error("refresh video peer", "channel", channelID, "member", memberID, "err", err)
 	}
+}
+
+// channelTransportLocked 返回频道当前**实际**的 transport 与原因（调用方必须持 h.mu）。
+//
+// v1 全频道一致；将来逐成员混合时，这个函数会按成员返回不同值（协议已经是 per-member）。
+func (h *Hub) channelTransportLocked(channelID string) (transport, reason string) {
+	if t := h.voiceTransport[channelID]; t != "" {
+		if r := h.voiceTransportReason[channelID]; r != "" {
+			return t, r
+		}
+		return t, "server_policy"
+	}
+	// 频道第一次有人进语音：以服务端策略为事实起点。
+	return h.voiceMode, "server_policy"
 }
 
 // StopVideoShare 在 screen.stop 时摘掉视频房间里的共享槽位并清空，

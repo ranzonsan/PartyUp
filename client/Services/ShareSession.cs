@@ -66,6 +66,19 @@ public sealed class ShareSession : IAsyncDisposable
     /// <summary>当前语音 PC 是按哪个 passive 值建的：用来发现「服务端角色与本地不一致」。</summary>
     private bool _enginePassive;
 
+    /// <summary>本次语音加入的时刻（direct 的 ICE 看门狗从这里开始计时）。</summary>
+    private DateTimeOffset? _voiceJoinStartedAt;
+    /// <summary>本次语音会话是否已经上报过「直连失败」（幂等：同一会话只报一次）。</summary>
+    private bool _transportFailedReported;
+    /// <summary>
+    /// direct 建连超时（秒）。超时仍未连上就认为直连失败、上报服务端。
+    /// 可用 PARTYUP_DIRECT_ICE_TIMEOUT_S 覆盖（验收时压短用）。
+    /// </summary>
+    private static readonly TimeSpan DirectIceTimeout = ReadDirectIceTimeout();
+    /// <summary>pu_stats 的 FAILED 值（与 libwebrtc 对齐：peer_state/ice_state 都是 4）。</summary>
+    private const int PeerStateFailed = 4;
+    private const int PeerStateConnected = 2;
+
     // 路径变化历史（v1 验收第 7 条）：最近 20 条，新的在前。
     private const int PathHistoryCapacity = 20;
     private readonly List<PathHistoryEntry> _pathHistory = new(capacity: PathHistoryCapacity);
@@ -98,6 +111,10 @@ public sealed class ShareSession : IAsyncDisposable
         _channelId = channelId;
         _thisMemberId = connection.Member.Id;
         _thisMemberName = connection.Member.Name;
+
+        // STUN 地址来自 server.info（在任何 PeerConnection 之前由连接层取到）。
+        // 放在 ctor：切频道时每条会话都会把同一份配置再应用一次，幂等且便宜。
+        _engine.SetIceServers(connection.StunUrls);
 
         connection.MediaSignalReceived += OnMediaSignal;
         connection.ScreenStateChanged += OnScreenState;
@@ -526,6 +543,8 @@ public sealed class ShareSession : IAsyncDisposable
         _voiceJoined = true;
         _voiceMuted = false;
         _voiceDeafened = false;
+        _voiceJoinStartedAt = DateTimeOffset.Now;
+        _transportFailedReported = false;
         LastError = null;
         AppLog.Pass($"voice: joined channel={_channelId} mode={_voiceMode} passive={passive} " +
                     $"role={ackRole ?? "?"}");
@@ -565,7 +584,12 @@ public sealed class ShareSession : IAsyncDisposable
                 try
                 {
                     var stats = _engine.GetStats();
-                    AppLog.Info($"voice: stats pcmRx={stats.FramesReceived} peerState={stats.PeerState} mode={_voiceMode}");
+                    // MediaEngine.PeerStats() 有屏幕 PC 时报屏幕的、否则报语音的（见 media_engine.cpp:2705）。
+                    // 把来源写进日志，排查时才知道这个数字属于哪条 PC（direct 下两者同路径）。
+                    var stateSource = _engine.HasScreenSession ? "screen" : "voice";
+                    AppLog.Info($"voice: stats pcmRx={stats.FramesReceived} peerState={stats.PeerState} " +
+                                $"iceState={stats.IceState} peerStateSource={stateSource} mode={_voiceMode}");
+                    EvaluateDirectHealth(stats);
                     foreach (var track in _engine.GetVoiceTracks())
                     {
                         AppLog.Info($"voice: track id={track.Id} pcmFrames={track.PcmFrames} peak={track.Peak} slotOwner={SlotOwnerOf(track.Id)}");
@@ -580,6 +604,86 @@ public sealed class ShareSession : IAsyncDisposable
                 catch { return; }
             }
         }, cts.Token);
+    }
+
+    // ------------------------------------------------------------------
+    // direct 回落：客户端只判「我这边连不上」，决定权在服务端（PROTOCOL.md §4.4）
+    // ------------------------------------------------------------------
+
+    private static TimeSpan ReadDirectIceTimeout()
+    {
+        var raw = Environment.GetEnvironmentVariable("PARTYUP_DIRECT_ICE_TIMEOUT_S");
+        return int.TryParse(raw, out var seconds) && seconds > 0
+            ? TimeSpan.FromSeconds(seconds)
+            : TimeSpan.FromSeconds(15);
+    }
+
+    /// <summary>
+    /// 每次统计采样（2s）调一次。只在 direct、已加入语音、频道里确有对端时判定：
+    /// ICE/PC 进入 failed，或超时仍未连上 → 上报服务端（**只报事实，不说「给我 relay」**）。
+    /// 频道里只有自己时不判：没有对端，PC 停在 NEW 是正常的。
+    /// </summary>
+    private void EvaluateDirectHealth(PuStats stats)
+    {
+        if (!_voiceJoined || _voiceMode != "direct" || _transportFailedReported) return;
+        if (_voiceMembers.Count < 2) return;
+
+        var failed = stats.PeerState == PeerStateFailed || stats.IceState == PeerStateFailed;
+        var elapsed = DateTimeOffset.Now - (_voiceJoinStartedAt ?? DateTimeOffset.Now);
+        var timeout = elapsed > DirectIceTimeout && stats.PeerState != PeerStateConnected;
+        if (!failed && !timeout) return;
+
+        _transportFailedReported = true;
+        var reason = failed ? "ice_failed" : "ice_timeout";
+        AppLog.Warn($"voice: direct 建连失败 reason={reason} peerState={stats.PeerState} " +
+                    $"iceState={stats.IceState} 已等 {elapsed.TotalSeconds:F1}s → 上报服务端（决定权在服务端）");
+        _ = ReportTransportFailureAsync(reason);
+    }
+
+    /// <summary>
+    /// 上报 voice.transport_failed。服务端是否降级由它决定；这里**不改**本地 transport，
+    /// 等它广播新的 voice.state 再重建（否则就变成客户端自己选路径了）。
+    /// </summary>
+    private async Task ReportTransportFailureAsync(string reason)
+    {
+        try
+        {
+            await _connection.ReportTransportFailedAsync(_channelId, "voice", reason);
+            AppLog.Info("voice: transport_failed 已上报，等待服务端降级广播");
+        }
+        catch (Exception ex)
+        {
+            // 服务端还没实现降级时这里会失败；不本地硬切，保持「服务端唯一决定源」。
+            AppLog.Warn("voice: transport_failed 上报失败（服务端可能尚未实现降级）：" + ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// 服务端把频道降级为 relay 后，按新 transport 重建语音会话（用户无感：不重进频道、不断连接）。
+    /// </summary>
+    private async Task RebuildVoiceForTransportAsync(string newMode)
+    {
+        if (!_voiceJoined || _voiceMode == newMode) return;
+        var from = _voiceMode;
+        AppLog.Warn($"voice: 服务端降级 transport {from}→{newMode}，重建语音会话");
+        try
+        {
+            StopVoiceStatsLoop();
+            StopSpeakingLoop();
+            _engine.VoiceLeave();
+            _voiceJoined = false;
+            _voiceMode = newMode;
+            _transportFailedReported = true;      // 已回落，不再重复上报
+            _lastTransport = newMode;             // 避免 JoinVoiceAsync 再记一条重复的路径变化
+            RecordPathChange(from, newMode, "直连失败，已自动回落");
+            await JoinVoiceAsync();
+            AppLog.Pass($"voice: 已按新 transport 重建 mode={newMode} joined={_voiceJoined}");
+            Changed?.Invoke();
+        }
+        catch (Exception ex)
+        {
+            AppLog.Fail("voice: 降级重建失败：" + ex.Message);
+        }
     }
 
     private void StopVoiceStatsLoop()
@@ -916,11 +1020,22 @@ public sealed class ShareSession : IAsyncDisposable
         var self = state.Members.FirstOrDefault(m => m.MemberId == _thisMemberId);
         ApplyServerRole(self?.Role);
 
-        var serverMode = IsDirectTransport(state.VoiceMode) ? "direct" : "relay";
-        if (!_voiceJoined && serverMode != _voiceMode)
+        // 「我」实际用的传输路径按**成员**下发（v1 全频道相同，但协议结构 per-member）。
+        // 老服务端可能没有这个字段：回退到频道级 voice_mode（那是策略值）。
+        var selfTransport = string.IsNullOrEmpty(self?.Transport)
+            ? (IsDirectTransport(state.VoiceMode) ? "direct" : "relay")
+            : (IsDirectTransport(self!.Transport) ? "direct" : "relay");
+        if (!_voiceJoined && selfTransport != _voiceMode)
         {
-            _voiceMode = serverMode;
-            AppLog.Info($"voice: server policy voice_mode={_voiceMode}");
+            _voiceMode = selfTransport;
+            AppLog.Info($"voice: server transport={_voiceMode} reason={self?.TransportReason ?? "?"}");
+        }
+        else if (_voiceJoined && selfTransport != _voiceMode)
+        {
+            // 服务端把频道降级了（通常是某个成员上报了 direct 失败，见 §4.4）。
+            // 客户端只跟随：按新 transport 重建会话，不重新进频道、不断 WS。
+            AppLog.Info($"voice: 服务端下发 transport={selfTransport} reason={self?.TransportReason ?? "?"}");
+            _ = RebuildVoiceForTransportAsync(selfTransport);
         }
         // 屏幕共享策略独立：无论是否在语音都要学，UI 才能在点共享前就显示/拦截。
         var screenMode = IsDirectTransport(state.ScreenMode) ? "direct" : "relay";

@@ -704,6 +704,11 @@ class MediaEngine {
   int Start(const char* screen_id, uint32_t flags, std::string* error);
   // v2.11：观看者预建屏幕会话（answerer，不采屏、不建轨）。幂等。
   int PrepareScreen(std::string* error);
+  // v2.12：引擎级 ICE servers。urls 换行分隔、只接受 stun:（无凭证）；
+  // nullptr / len==0 清空。只影响之后新建的 PC（屏幕与语音两条共用这份配置）。
+  int SetIceServers(const char* urls, size_t len, std::string* error);
+  // 建 PC 前把上面那份配置拷进 RTCConfiguration.servers（内部加锁，幂等）。
+  void ApplyIceServersToConfig(webrtc::PeerConnectionInterface::RTCConfiguration* config);
   // v2.6：语音（1:1 直连）。全部在控制线程调用，内部把 PC/ADM 操作投 signaling 线程。
   int VoiceJoin(const pu_voice_params* params, std::string* error);
   int VoiceLeave();
@@ -931,6 +936,13 @@ class MediaEngine {
   mutable std::mutex cand_mu_;
   std::vector<CandidateCopy> gathered_candidates_;   // OnIceCandidate 写
   std::vector<CandidateCopy> buffered_candidates_;   // SetRemote 之前到的一律先存
+
+  // ---- v2.12：引擎级 ICE servers（pu_engine_set_ice_servers）----
+  // 两条会话（屏幕 / 语音）共用同一份配置；建 PC 时由 ApplyIceServersToConfig()
+  // 拷进 RTCConfiguration.servers。空 = host-only（与 v2.11 行为完全一致）。
+  // 契约：只影响**之后**新建的 PC；已建立的会话要生效需 stop/leave 后重建。
+  std::mutex ice_servers_mu_;
+  webrtc::PeerConnectionInterface::IceServers ice_servers_;  // = vector<IceServer>
 
   // ---- v2：统计（全是原子量，pu_peer_stats 直接快照，不加锁） ----
   std::atomic<uint32_t> stat_frames_sent_{0};
@@ -1700,10 +1712,86 @@ int MediaEngine::PrepareScreen(std::string* error) {
   return PU_OK;
 }
 
+// ---------------------------------------------------------------------------
+// v2.12：引擎级 ICE servers（直连回落 3a 的底座）
+//
+// 直连（direct）要求两端换到 srflx 候选才可能穿越 NAT，而本引擎此前把所有 PC 都建成
+// host-only（两处 RTCConfiguration 都是默认构造）。这个入口让上层把 STUN 地址交进来，
+// 之后新建的每一条 PC（屏幕 + 语音）都会带上。
+//
+// 语义上的三个决定：
+//   * 只接受 "stun:" —— TURN 需要 username/credential，本版没有承载它们的字段，
+//     遇到 turn:/turns:/stuns: 明确返回 INVALID_ARG 并写清原因，不静默忽略（静默忽略
+//     会让上层以为配上了 TURN，跨 NAT 依旧失败却查不出原因）。
+//   * 引擎级而不是会话级：上层在 pu_engine_create 之后、任何 start/join 之前设一次。
+//     已建立的会话不会被追溯修改（RTCConfiguration 只在建 PC 时被读）。
+//   * 幂等：重复调用整体覆盖；空串/nullptr 清空（回到 host-only，与 v2.11 完全一致）。
+// ---------------------------------------------------------------------------
+int MediaEngine::SetIceServers(const char* urls, size_t len, std::string* error) {
+  webrtc::PeerConnectionInterface::IceServers parsed;
+  if (urls != nullptr && len != 0) {
+    // 逐行解析：\n 分隔，容忍 \r（Windows 换行）与行首尾空白，跳过空行。
+    size_t begin = 0;
+    while (begin <= len) {
+      size_t end = begin;
+      while (end < len && urls[end] != '\n') ++end;
+      std::string entry(urls + begin, end - begin);
+      const size_t first = entry.find_first_not_of(" \t\r");
+      if (first == std::string::npos) {
+        entry.clear();
+      } else {
+        entry.erase(0, first);
+        const size_t last = entry.find_last_not_of(" \t\r");
+        entry.erase(last + 1);
+      }
+      if (!entry.empty()) {
+        if (ToLowerAscii(entry).rfind("stun:", 0) != 0) {
+          if (error != nullptr) {
+            *error = "pu_engine_set_ice_servers: unsupported url \"" + entry +
+                     "\" (only stun: is supported; turn:/turns: need credentials and are "
+                     "not implemented in this ABI version)";
+          }
+          return PU_ERR_INVALID_ARG;
+        }
+        const std::string rest = entry.substr(5);
+        // 最小校验：host:port 形式（IPv6 用 [::1]:3478 也满足「有冒号」）。
+        if (rest.empty() || rest.find(':') == std::string::npos ||
+            rest.find(' ') != std::string::npos) {
+          if (error != nullptr) {
+            *error = "pu_engine_set_ice_servers: malformed url \"" + entry +
+                     "\" (expected stun:host:port)";
+          }
+          return PU_ERR_INVALID_ARG;
+        }
+        webrtc::PeerConnectionInterface::IceServer server;
+        server.urls.push_back(entry);
+        parsed.push_back(server);
+      }
+      if (end >= len) break;
+      begin = end + 1;
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lock(ice_servers_mu_);
+    ice_servers_ = std::move(parsed);
+    Log(3, "ice servers configured: %zu entr%s", ice_servers_.size(),
+        ice_servers_.size() == 1 ? "y" : "ies");
+  }
+  return PU_OK;
+}
+
+void MediaEngine::ApplyIceServersToConfig(
+    webrtc::PeerConnectionInterface::RTCConfiguration* config) {
+  if (config == nullptr) return;
+  std::lock_guard<std::mutex> lock(ice_servers_mu_);
+  // servers 是 RTCConfiguration 里的字段名（本版 libwebrtc 的 IceServers 别名就是
+  // vector<IceServer>，W3C 里叫 ice_servers；这里照 vendored 头文件的实际字段名写）。
+  config->servers = ice_servers_;
+}
+
 int MediaEngine::Stop() {
   std::lock_guard<std::mutex> control_lock(control_mu_);
   Log(3, "stop: enter (running=%d)", running_ ? 1 : 0);
-
   // v2：先停协商线程。它会在 ICE 收集完成后往事件队列推一条信令，必须在关闭 PC
   // 之前收掉，否则会出现「stop 之后还冒出一条 offer」。
   negotiator_stop_.store(true, std::memory_order_relaxed);
@@ -1928,7 +2016,9 @@ bool MediaEngine::EnsureVoicePeerConnection(bool for_sending, std::string* error
   webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc;
   signaling_->BlockingCall([&] {
     webrtc::PeerConnectionInterface::RTCConfiguration config;
-    // 与屏幕会话同策略：同进程回环只需要 host 候选；接 STUN/TURN 时在这里加。
+    // v2.12：带上引擎级 ICE servers（未设置时为空 = host-only，行为与 v2.11 一致）。
+    ApplyIceServersToConfig(&config);
+    // 与屏幕会话同策略：来源同上；上层若要跨 NAT 直连，先 pu_engine_set_ice_servers。
     webrtc::PeerConnectionDependencies dependencies(voice_observer_);
     auto created = pc_factory_->CreatePeerConnectionOrError(config, std::move(dependencies));
     if (!created.ok()) {
@@ -2219,7 +2309,8 @@ bool MediaEngine::EnsurePeerConnection(bool for_sending, std::string* error) {
   webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc;
   signaling_->BlockingCall([&] {
     webrtc::PeerConnectionInterface::RTCConfiguration config;
-    // 同进程回环只需要 host 候选；接 STUN/TURN 时在 config.ice_servers 里加。
+    // v2.12：带上引擎级 ICE servers（未设置时为空 = host-only，行为与 v2.11 一致）。
+    ApplyIceServersToConfig(&config);
     webrtc::PeerConnectionDependencies dependencies(pc_observer_);
     auto created = pc_factory_->CreatePeerConnectionOrError(config, std::move(dependencies));
     if (!created.ok()) {
@@ -3397,6 +3488,30 @@ PU_API void pu_engine_destroy(pu_engine* e) {
     delete e;
   } catch (...) {
     // 析构里不该有异常；真发生了也不能让它穿越 ABI。
+  }
+}
+
+// v2.12：引擎级 ICE servers（详见 MediaEngine::SetIceServers 的注释）。
+// 空串 / len==0 / urls==nullptr 都表示「清空」，回到 host-only（v2.11 行为）。
+PU_API int pu_engine_set_ice_servers(pu_engine* e, const char* urls, size_t len) {
+  if (e == nullptr) return PU_ERR_INVALID_ARG;
+  if (urls == nullptr && len != 0) {
+    e->core.SetLastError("pu_engine_set_ice_servers: urls is null but len != 0");
+    return PU_ERR_INVALID_ARG;
+  }
+  try {
+    std::string error;
+    const int rc = e->core.SetIceServers(urls, len, &error);
+    if (rc != PU_OK) {
+      e->core.SetLastError(error.empty() ? "pu_engine_set_ice_servers failed" : error);
+    }
+    return rc;
+  } catch (const std::exception& ex) {
+    e->core.SetLastError(std::string("pu_engine_set_ice_servers exception: ") + ex.what());
+    return PU_ERR_INTERNAL;
+  } catch (...) {
+    e->core.SetLastError("pu_engine_set_ice_servers: unknown exception");
+    return PU_ERR_INTERNAL;
   }
 }
 

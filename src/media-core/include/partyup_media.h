@@ -35,6 +35,12 @@
  *         （采屏但不发 offer，等对端 offer 后挂轨回 answer）；flags==0 等价旧入口；
  *       - pu_screen_prepare(e)：观看者预建 answerer 会话，幂等、不采屏不建轨；
  *       - pu_screen_start 行为不变。
+ *   v2.12（加法式扩张，ABI 仍 v2）：直连（direct）需要 srflx 候选才能穿 NAT，而
+ *       此前所有 PeerConnection 都是 host-only。新增一个导出、共 24 个：
+ *       - pu_engine_set_ice_servers(e, urls, len)：引擎级 ICE servers，
+ *         urls 换行分隔的 "stun:host:port"；建 PC 前调用，之后新建的每条会话
+ *         （屏幕 + 语音）都会带上；空串/NULL 清空。
+ *       - 未调用或清空时行为与 v2.11 完全一致（host-only）。
  *
  * 线程约定：所有 pu_* 调用必须来自同一个「控制线程」（通常是 UI 线程），
  * 且不得在库触发的任何回调里重入——本库没有任何回调，通知一律走 pu_poll_event。
@@ -372,6 +378,33 @@ PU_API pu_engine* pu_engine_create(const pu_config* cfg);
 /* 销毁引擎。会先停止屏幕共享，再按 Close → track → factory → signaling → worker →
  * network 的顺序收尾。e 为 NULL 时安全无操作。之后句柄不可再用。 */
 PU_API void pu_engine_destroy(pu_engine* e);
+
+/* v2.12（第 24 个导出）：设置本引擎所有 PeerConnection 的 ICE servers。
+ *
+ * 用途：direct（P2P 直连）模式下两端需要交换 srflx 候选才可能穿 NAT；不设置时
+ *       引擎只收集 host（局域网）候选，跨 NAT 必然失败。
+ *
+ * urls 格式：换行分隔的 STUN URL 列表（容忍 \r 与首尾空白，跳过空行）：
+ *     "stun:stun.example.com:3478\nstun:1.2.3.4:3478"
+ *   只支持 "stun:" scheme，且**不带凭证**；"turn:" / "turns:" / "stuns:" 需要
+ *   username/credential，本版 ABI 没有承载它们的字段，会返回 PU_ERR_INVALID_ARG
+ *   （不会静默忽略——静默忽略会让调用方以为 TURN 已生效）。
+ *   len 是 urls 的字节数（不含结尾 NUL 也可以，len 就是有效长度）。
+ *   urls == NULL 或 len == 0 表示**清空**，回到 host-only（与 v2.11 行为一致）。
+ *
+ * 作用域与时机：
+ *   - 配置是**引擎级**的，屏幕会话与语音会话共用同一份；
+ *   - 只影响**此后新建**的 PeerConnection（pu_screen_start* / pu_screen_prepare /
+ *     pu_voice_join 那一刻读配置）。已经建立的会话不会被追溯修改；要让新配置生效，
+ *     必须先 pu_screen_stop / pu_voice_leave 再重新开始；
+ *   - 幂等：重复调用整体覆盖旧值。
+ *
+ * 线程：与其它 pu_* 一样在控制线程调用。内部对配置加锁，因此即使与建 PC 并发
+ *      也只会读到「旧的完整配置」或「新的完整配置」，不会读到半个。
+ *
+ * 返回：PU_OK / PU_ERR_INVALID_ARG（e 为 NULL、urls 为 NULL 但 len != 0、未知
+ *       scheme、格式不是 host:port）。 */
+PU_API int pu_engine_set_ice_servers(pu_engine* e, const char* urls, size_t len);
 
 /* 开始一路屏幕共享。screen_id 为 NULL 或 "synthetic" 时使用内置合成源。
  * 成功返回 PU_OK；已在运行返回 PU_ERR_STATE；媒体初始化失败返回 PU_ERR_MEDIA，

@@ -251,11 +251,11 @@ if ($exportNames.Count -eq 0) { throw "dumpbin reported no exports — DLL is br
 if ($badExports.Count -ne 0) {
   throw "non pu_* exports found: $($badExports -join ', ')"
 }
-# 导出表断言：v2.11 起是 23 个（21 + pu_screen_start_ex + pu_screen_prepare）。
+# 导出表断言：v2.12 起是 24 个（23 + pu_engine_set_ice_servers）。
 # 少一个说明有函数被剥掉，多一个说明有人没走 ABI 评审就加导出。
-$expectedExports = 23
+$expectedExports = 24
 if ($exportNames.Count -ne $expectedExports) {
-  throw ("export count {0} != expected {1} (v2.11). names: {2}" -f $exportNames.Count, $expectedExports, ($exportNames -join ' '))
+  throw ("export count {0} != expected {1} (v2.12). names: {2}" -f $exportNames.Count, $expectedExports, ($exportNames -join ' '))
 }
 
 $dllInfo = Get-Item $dllOut

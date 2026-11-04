@@ -119,11 +119,21 @@ struct Sample {
   uint32_t bitrate_kbps = 0;
 };
 
+pu_stats ReadStats(pu_engine* engine) {
+  pu_stats stats;
+  std::memset(&stats, 0, sizeof(stats));
+  stats.struct_size = sizeof(stats);
+  pu_peer_stats(engine, &stats);
+  return stats;
+}
+
 struct PhaseResult {
   bool ok = false;
   bool media_up = false;
-  uint32_t width = 0;
+  uint32_t width = 0;   // 采集侧（PU_EVENT_FRAME）
   uint32_t height = 0;
+  uint32_t remote_width = 0;   // 解码侧（pu_peer_stats）—— 真正该用来断言分辨率的
+  uint32_t remote_height = 0;
   int window_frames = 0;
   double window_fps = 0.0;
   std::vector<Sample> series;
@@ -255,6 +265,12 @@ PhaseResult RunPhase(const char* tag, const char* max_bitrate, const char* degra
               result.first_nonzero_kbps, result.at_1s_kbps, result.mean_kbps,
               result.peak_kbps, result.reach_1mbps_s, result.reach_peak90_s);
 
+  // 分辨率断言必须读**解码侧**尺寸：PU_EVENT_FRAME.width/height 是采集侧，
+  // 永远等于采集尺寸，拿它做「降帧不降分辨率」的判据是同义反复、不可能失败。
+  const pu_stats viewer_stats = ReadStats(viewer);
+  result.remote_width = viewer_stats.remote_width;
+  result.remote_height = viewer_stats.remote_height;
+
   pu_screen_stop(sharer);
   pu_engine_destroy(sharer);
   pu_engine_destroy(viewer);
@@ -321,9 +337,12 @@ int main() {
                 tiny200.mean_kbps, tiny200.peak_kbps, tiny200.window_fps);
   }
   // ---- ③ 降帧不降分辨率：极小码率下分辨率不变 ----
-  if (!tiny200.ok || tiny200.width != product.width || tiny200.height != product.height) {
-    std::printf("FAIL step3: resolution changed under bandwidth pressure (%ux%u -> %ux%u)\n",
-                product.width, product.height, tiny200.width, tiny200.height);
+  if (!tiny200.ok || tiny200.remote_width != product.remote_width ||
+      tiny200.remote_height != product.remote_height) {
+    std::printf("FAIL step3: decoded resolution changed under bandwidth pressure "
+                "(%ux%u -> %ux%u)\n",
+                product.remote_width, product.remote_height, tiny200.remote_width,
+                tiny200.remote_height);
     ++failures;
   } else if (tiny200.window_fps >= product.window_fps * 0.95) {
     std::printf("FAIL step3: frame rate did not drop (%.1f -> %.1f fps) — was the "
@@ -331,8 +350,10 @@ int main() {
                 product.window_fps, tiny200.window_fps);
     ++failures;
   } else {
-    std::printf("PASS step3: kept %ux%u while fps dropped %.1f -> %.1f (降帧不降分辨率)\n",
-                tiny200.width, tiny200.height, product.window_fps, tiny200.window_fps);
+    std::printf("PASS step3: kept decoded %ux%u while fps dropped %.1f -> %.1f "
+                "(降帧不降分辨率)\n",
+                tiny200.remote_width, tiny200.remote_height, product.window_fps,
+                tiny200.window_fps);
   }
   // ---- 反向对照：balanced 必须与 maintain_resolution 表现不同（否则参数没生效）----
   std::printf("OBSERVATION: balanced phase %.1f fps @ %ux%u (control for step3)\n",

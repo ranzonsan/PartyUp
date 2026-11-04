@@ -1852,6 +1852,48 @@ void MediaEngine::ApplyVideoSenderParamsOnSignalingThread() {
   parameters.encodings[0].max_bitrate_bps = kProductMaxBitrateBps;
   parameters.encodings[0].min_bitrate_bps = kProductMinBitrateBps;
 
+  // ---- v2.14：编码尺寸上限 1080p（产品默认，不是省带宽而是画质）----
+  // 同一个 3 Mbps 上限下，像素越少 = 每个像素分到的比特越多。屏幕共享的内容是文字，
+  // 恰恰最吃「每像素比特数」：1440p 在 3 Mbps 下平均每像素不到 0.2 bit/frame，
+  // 文字边缘会糊；压到 1080p 后同样的码率只摊在 56% 的像素上，文字明显更锐利。
+  //
+  // 输入端用 scale_resolution_down_by 做**静态**降采样（libwebrtc 的 VideoAdapter 在
+  // 编码前缩帧，然后按新尺寸重建编码器 —— 这条路已由 PARTYUP_MEDIA_TEST_SCALE_DOWN_BY
+  // 实测验证：编码器完整重建、size_mismatch=0、画面连续）。
+  // 它和 degradation_preference 是两层：静态比例定「基准尺寸」，degradation 定「带宽
+  // 紧张时先动谁」。MAINTAIN_RESOLUTION 下只会掉帧，不会在基准之上再降分辨率。
+  //
+  // 按 max(width/1920, height/1080) 算，保证宽高都进框（21:9 或竖屏也不会宽度超限），
+  // 宽高比不变。PARTYUP_MAX_CAPTURE_HEIGHT 可覆盖（<=0 关闭，退回原始分辨率）。
+  // 默认 **0 = 不缩放**（2026-11-04 实测后的决定，见 docs/spikes/2026-11-04-resolution-cap.md）：
+  // 常见带宽（屏幕流实测 0.4–2.1 Mbps，3 Mbps 上限根本不 binding）下 1440p 明显更锐，
+  // 强制降到 1080p 是画质回退（同区域 Laplacian 方差差 5–7 倍）。机制保留，需要时显式开会。
+  int max_capture_height = 0;
+  char max_height_text[32] = {0};
+  const DWORD max_height_len =
+      ::GetEnvironmentVariableA("PARTYUP_MAX_CAPTURE_HEIGHT", max_height_text,
+                                static_cast<DWORD>(sizeof(max_height_text)));
+  if (max_height_len > 0) max_capture_height = std::atoi(max_height_text);
+
+  const uint32_t capture_w = capture_width_.load(std::memory_order_relaxed);
+  const uint32_t capture_h = capture_height_.load(std::memory_order_relaxed);
+  double scale_down_by = 1.0;
+  int encoded_w = static_cast<int>(capture_w);
+  int encoded_h = static_cast<int>(capture_h);
+  if (max_capture_height > 0 && capture_w > 0 && capture_h > 0) {
+    const double scale_for_width = static_cast<double>(capture_w) / 1920.0;
+    const double scale_for_height =
+        static_cast<double>(capture_h) / static_cast<double>(max_capture_height);
+    scale_down_by = scale_for_width > scale_for_height ? scale_for_width : scale_for_height;
+    if (scale_down_by < 1.0) scale_down_by = 1.0;
+    // 和 libwebrtc 的取整保持一致（VideoAdapter 用整除 + 偶数化），只用于日志好看。
+    if (scale_down_by > 1.0) {
+      encoded_w = static_cast<int>(static_cast<double>(capture_w) / scale_down_by) & ~1;
+      encoded_h = static_cast<int>(static_cast<double>(capture_h) / scale_down_by) & ~1;
+    }
+  }
+  parameters.encodings[0].scale_resolution_down_by = scale_down_by;
+
   // ---- 测试覆盖：只影响显式设了环境变量的测试进程 ----
   char max_bitrate_text[64] = {0};
   const DWORD max_bitrate_len =
@@ -1905,9 +1947,16 @@ void MediaEngine::ApplyVideoSenderParamsOnSignalingThread() {
     if (effective.encodings[0].max_bitrate_bps) effective_max = *effective.encodings[0].max_bitrate_bps;
     if (effective.encodings[0].min_bitrate_bps) effective_min = *effective.encodings[0].min_bitrate_bps;
   }
-  Log(1, "video sender params read-back: degradation=%s max_bitrate_bps=%d min_bitrate_bps=%d",
+  const double effective_scale =
+      effective.encodings.empty() || !effective.encodings[0].scale_resolution_down_by
+          ? 1.0
+          : *effective.encodings[0].scale_resolution_down_by;
+  Log(1, "video sender params read-back: degradation=%s max_bitrate_bps=%d min_bitrate_bps=%d "
+         "scale_resolution_down_by=%.4f",
       effective_degradation ? DegradationName(*effective_degradation) : "(unset)",
-      effective_max, effective_min);
+      effective_max, effective_min, effective_scale);
+  Log(1, "video sender scale: capture=%ux%u cap_height=%d -> encode %dx%d (scale=%.4f)",
+      capture_w, capture_h, max_capture_height, encoded_w, encoded_h, scale_down_by);
   if (!effective_degradation ||
       *effective_degradation != webrtc::DegradationPreference::MAINTAIN_RESOLUTION) {
     // 这是「承诺落空」的直接证据，必须显式报出来（用户明确要求用读回值断言）。

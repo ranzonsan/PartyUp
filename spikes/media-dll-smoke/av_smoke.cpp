@@ -289,9 +289,20 @@ SurviveResult RunVoiceSurvivesScreen() {
   std::printf("  screen video frames=%d | after stop: B track=%d A peerState=%d (want 1/2)\n",
               r.video_frames, track_alive ? 1 : 0, stats_a.peer_state);
 
-  const bool rate_ok = r.baseline_fps >= 60.0 && r.after_start_fps >= 0.6 * r.baseline_fps &&
-                       r.after_start_fps >= 30.0 && r.after_stop_fps >= 0.6 * r.baseline_fps &&
-                       r.after_stop_fps >= 30.0;
+  // 注意：这个绝对下限不能用 60。ADM 的周期随音频设备/系统负载在 10 ms（100 帧/s）与
+  // 20 ms（50 帧/s）之间切换，20 ms 时 baseline 50/s 是**完全正常**的，用 >=60 判会让
+  // 这个用例在没有回归的情况下间歇性 FAIL（2026-11-04 实测：同一二进制 50.0/50.4/89.0
+  // 判 FAIL，紧接着 100.0/100.0/91.0 判 PASS）。下限只用来排除"语音根本没出帧"，
+  // 真正的判据是相对比值（start/stop 后仍 >= baseline 的 60%）。
+  // 相对比值也放宽到 0.45：ADM 在共享启停时会重新协商周期，10 ms(100 帧/s) 与
+  // 20 ms(50 帧/s) 之间的切换本身就是"合法的 0.5×"，用 0.6× 会把这种正常切换判成
+  // 回归（2026-11-04 实测 100.7/100.0/54.5 被判 FAIL，而 54.5 正是 20 ms 周期的满速）。
+  // 真正的失败是"几乎不出帧"（例如 100 → 5），0.45× + 绝对下限 15 仍能抓住。
+  const bool rate_ok = r.baseline_fps >= 25.0 &&
+                       r.after_start_fps >= 0.45 * r.baseline_fps &&
+                       r.after_start_fps >= 15.0 &&
+                       r.after_stop_fps >= 0.45 * r.baseline_fps &&
+                       r.after_stop_fps >= 15.0;
   r.ok = rate_ok && r.session_alive_after_stop && r.video_frames >= 15;
   if (!rate_ok) {
     std::printf("  FAIL: voice PCM rate dropped across screen start/stop\n");

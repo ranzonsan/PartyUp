@@ -709,6 +709,12 @@ class MediaEngine {
   int SetIceServers(const char* urls, size_t len, std::string* error);
   // 建 PC 前把上面那份配置拷进 RTCConfiguration.servers（内部加锁，幂等）。
   void ApplyIceServersToConfig(webrtc::PeerConnectionInterface::RTCConfiguration* config);
+  // v2.13（**测试专用，不是产品 ABI**）：从环境变量读「码率上限 / 降级偏好」并套到
+  // 屏幕 sender 的 RtpParameters 上，用来实测 quality scaler 降分辨率时会发生什么。
+  //   PARTYUP_MEDIA_TEST_MAX_BITRATE=<bps>       → encodings[0].max_bitrate_bps
+  //   PARTYUP_MEDIA_TEST_DEGRADATION=maintain_resolution|maintain_framerate|balanced
+  // 生产路径不会设这两个变量，函数第一行就返回，行为与之前完全一致。
+  void ApplyTestSenderParamsOnSignalingThread();
   // v2.6：语音（1:1 直连）。全部在控制线程调用，内部把 PC/ADM 操作投 signaling 线程。
   int VoiceJoin(const pu_voice_params* params, std::string* error);
   int VoiceLeave();
@@ -1789,6 +1795,63 @@ void MediaEngine::ApplyIceServersToConfig(
   config->servers = ice_servers_;
 }
 
+// v2.13（测试专用）：把「码率上限 / 降级偏好」临时套到屏幕 sender 上。
+// 存在的唯一理由：实测 has_trusted_rate_controller=false 时 libwebrtc 的 quality
+// scaler / BalancedDegradationSettings 会不会尝试降分辨率，以及降了之后我们那个
+// 「MFT 类型协商是静态的」编码器会不会把画面搞死。
+// 必须跑在 signaling 线程（RtpSenderInterface 的线程断言）。
+void MediaEngine::ApplyTestSenderParamsOnSignalingThread() {
+  if (video_sender_ == nullptr) return;
+
+  char max_bitrate_text[64] = {0};
+  const DWORD max_bitrate_len =
+      ::GetEnvironmentVariableA("PARTYUP_MEDIA_TEST_MAX_BITRATE", max_bitrate_text,
+                                static_cast<DWORD>(sizeof(max_bitrate_text)));
+  const int max_bitrate_bps =
+      max_bitrate_len > 0 ? std::atoi(max_bitrate_text) : 0;
+
+  char degradation_text[64] = {0};
+  const DWORD degradation_len =
+      ::GetEnvironmentVariableA("PARTYUP_MEDIA_TEST_DEGRADATION", degradation_text,
+                                static_cast<DWORD>(sizeof(degradation_text)));
+  const std::string degradation = degradation_len > 0 ? std::string(degradation_text) : "";
+
+  // 这个才是「确定性触发降分辨率」的仪器：libwebrtc 会把帧在上游缩到 1/N，然后
+  // 用新尺寸再调一次 InitEncode —— 正好压在我们那个「MFT 类型协商是静态的」地雷上。
+  char scale_text[64] = {0};
+  const DWORD scale_len =
+      ::GetEnvironmentVariableA("PARTYUP_MEDIA_TEST_SCALE_DOWN_BY", scale_text,
+                                static_cast<DWORD>(sizeof(scale_text)));
+  const double scale_down_by = scale_len > 0 ? std::atof(scale_text) : 0.0;
+
+  if (max_bitrate_bps <= 0 && degradation.empty() && scale_down_by <= 1.0) {
+    return;  // 生产路径
+  }
+
+  webrtc::RtpParameters parameters = video_sender_->GetParameters();
+  if (parameters.encodings.empty()) {
+    parameters.encodings.push_back(webrtc::RtpEncodingParameters{});
+  }
+  if (max_bitrate_bps > 0) parameters.encodings[0].max_bitrate_bps = max_bitrate_bps;
+  if (scale_down_by > 1.0) parameters.encodings[0].scale_resolution_down_by = scale_down_by;
+  if (degradation == "maintain_resolution") {
+    // 保分辨率、允许降帧 —— PRODUCT.md 承诺的那一档。
+    parameters.degradation_preference = webrtc::DegradationPreference::MAINTAIN_RESOLUTION;
+  } else if (degradation == "maintain_framerate") {
+    parameters.degradation_preference = webrtc::DegradationPreference::MAINTAIN_FRAMERATE;
+  } else if (degradation == "balanced") {
+    parameters.degradation_preference = webrtc::DegradationPreference::BALANCED;
+  }
+  const webrtc::RTCError error = video_sender_->SetParameters(parameters);
+  if (!error.ok()) {
+    Log(1, "test sender params: SetParameters failed: %s", error.message());
+    return;
+  }
+  Log(1, "test sender params: max_bitrate_bps=%d degradation=%s (encodings=%zu)",
+      max_bitrate_bps, degradation.empty() ? "(unchanged)" : degradation.c_str(),
+      parameters.encodings.size());
+}
+
 int MediaEngine::Stop() {
   std::lock_guard<std::mutex> control_lock(control_mu_);
   Log(3, "stop: enter (running=%d)", running_ ? 1 : 0);
@@ -2291,7 +2354,13 @@ bool MediaEngine::EnsurePeerConnection(bool for_sending, std::string* error) {
       std::string add_error;
       signaling_->BlockingCall([&] {
         auto added = pc_->AddTrack(track_, {"partyup-screen"});
-        if (!added.ok()) add_error = std::string("AddTrack(video) failed: ") + added.error().message();
+        if (!added.ok()) {
+          add_error = std::string("AddTrack(video) failed: ") + added.error().message();
+          return;
+        }
+        // v2.13：两条建轨路径都留下 sender（测试钩子与将来的 degradation 配置要用）。
+        video_sender_ = added.value();
+        ApplyTestSenderParamsOnSignalingThread();
       });
       if (!add_error.empty()) {
         *error = add_error;
@@ -2330,6 +2399,9 @@ bool MediaEngine::EnsurePeerConnection(bool for_sending, std::string* error) {
         pc = nullptr;
         return;
       }
+      // v2.13：留下 sender，并按测试环境变量决定是否收紧码率上限/降级偏好。
+      video_sender_ = added.value();
+      ApplyTestSenderParamsOnSignalingThread();
       // v2.4：把 H.264 钉到编解码器偏好首位。硬件 NVENC 只做 H.264，VP8 只能
       // 软件编码；工厂已经按 H.264 在前返回，这里再把偏好显式写一次，免得 SDP
       // 里 VP8 的 payload type 更小而被对端优先选中。H.264 不可用时列表里没有

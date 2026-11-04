@@ -70,11 +70,19 @@ public sealed class ShareSession : IAsyncDisposable
     private DateTimeOffset? _voiceJoinStartedAt;
     /// <summary>本次语音会话是否已经上报过「直连失败」（幂等：同一会话只报一次）。</summary>
     private bool _transportFailedReported;
+    /// <summary>是否正在按新 transport 重建语音会话（防止连续的 voice.state 触发重复重建）。</summary>
+    private bool _rebuildingVoice;
     /// <summary>
     /// direct 建连超时（秒）。超时仍未连上就认为直连失败、上报服务端。
     /// 可用 PARTYUP_DIRECT_ICE_TIMEOUT_S 覆盖（验收时压短用）。
     /// </summary>
     private static readonly TimeSpan DirectIceTimeout = ReadDirectIceTimeout();
+    /// <summary>
+    /// 验收/调试用故障注入：设置 PARTYUP_FORCE_TRANSPORT_FAIL=&lt;秒&gt; 后，direct 会话
+    /// 在该秒数后**按超时处理**（走真实的看门狗→上报→服务端降级→重建链路）。
+    /// 用于同一台机器无法真正阻断 UDP 时验证回落；生产不设即无行为。
+    /// </summary>
+    private static readonly TimeSpan? ForcedTransportFailAfter = ReadForcedTransportFail();
     /// <summary>pu_stats 的 FAILED 值（与 libwebrtc 对齐：peer_state/ice_state 都是 4）。</summary>
     private const int PeerStateFailed = 4;
     private const int PeerStateConnected = 2;
@@ -610,6 +618,13 @@ public sealed class ShareSession : IAsyncDisposable
     // direct 回落：客户端只判「我这边连不上」，决定权在服务端（PROTOCOL.md §4.4）
     // ------------------------------------------------------------------
 
+    private static TimeSpan? ReadForcedTransportFail()
+    {
+        var raw = Environment.GetEnvironmentVariable("PARTYUP_FORCE_TRANSPORT_FAIL");
+        if (!int.TryParse(raw, out var seconds) || seconds <= 0) return null;
+        return TimeSpan.FromSeconds(seconds);
+    }
+
     private static TimeSpan ReadDirectIceTimeout()
     {
         var raw = Environment.GetEnvironmentVariable("PARTYUP_DIRECT_ICE_TIMEOUT_S");
@@ -630,13 +645,16 @@ public sealed class ShareSession : IAsyncDisposable
 
         var failed = stats.PeerState == PeerStateFailed || stats.IceState == PeerStateFailed;
         var elapsed = DateTimeOffset.Now - (_voiceJoinStartedAt ?? DateTimeOffset.Now);
+        // 故障注入（仅验收用）：到点无条件按超时处理，模拟「UDP 被阻断」。
+        var forced = ForcedTransportFailAfter is { } forcedAfter && elapsed > forcedAfter;
         var timeout = elapsed > DirectIceTimeout && stats.PeerState != PeerStateConnected;
-        if (!failed && !timeout) return;
+        if (!failed && !timeout && !forced) return;
 
         _transportFailedReported = true;
         var reason = failed ? "ice_failed" : "ice_timeout";
         AppLog.Warn($"voice: direct 建连失败 reason={reason} peerState={stats.PeerState} " +
-                    $"iceState={stats.IceState} 已等 {elapsed.TotalSeconds:F1}s → 上报服务端（决定权在服务端）");
+                    $"iceState={stats.IceState} 已等 {elapsed.TotalSeconds:F1}s" +
+                    (forced ? " [故障注入]" : "") + " → 上报服务端（决定权在服务端）");
         _ = ReportTransportFailureAsync(reason);
     }
 
@@ -683,6 +701,10 @@ public sealed class ShareSession : IAsyncDisposable
         catch (Exception ex)
         {
             AppLog.Fail("voice: 降级重建失败：" + ex.Message);
+        }
+        finally
+        {
+            _rebuildingVoice = false;
         }
     }
 
@@ -1030,11 +1052,12 @@ public sealed class ShareSession : IAsyncDisposable
             _voiceMode = selfTransport;
             AppLog.Info($"voice: server transport={_voiceMode} reason={self?.TransportReason ?? "?"}");
         }
-        else if (_voiceJoined && selfTransport != _voiceMode)
+        else if (_voiceJoined && selfTransport != _voiceMode && !_rebuildingVoice)
         {
             // 服务端把频道降级了（通常是某个成员上报了 direct 失败，见 §4.4）。
             // 客户端只跟随：按新 transport 重建会话，不重新进频道、不断 WS。
             AppLog.Info($"voice: 服务端下发 transport={selfTransport} reason={self?.TransportReason ?? "?"}");
+            _rebuildingVoice = true;
             _ = RebuildVoiceForTransportAsync(selfTransport);
         }
         // 屏幕共享策略独立：无论是否在语音都要学，UI 才能在点共享前就显示/拦截。

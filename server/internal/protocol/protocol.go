@@ -75,6 +75,10 @@ const (
 	// 服务器级信息（PROTOCOL.md §1.4）。客户端在鉴权后请求一次，缓存起来；
 	// 与语音/屏幕房间无关，任何 PC 创建之前都可以先拿到（这是 stun_urls 的时序要求）。
 	TypeServerInfo = "server.info"
+
+	// TypeVoiceTransportFailed 是客户端**上报事实**的消息（PROTOCOL.md §4.4）：
+	// 「我这边直连 ICE 失败/超时」。是否有必要降级、怎么降级，由服务端决定。
+	TypeVoiceTransportFailed = "voice.transport_failed"
 )
 
 // TypeOK 返回请求类型对应的成功响应类型：`text.send` → `text.send.ok`。
@@ -476,6 +480,28 @@ type VoiceJoinOK struct {
 	// 客户端在**创建 PeerConnection 之前**就要用它决定 passive，不能再靠本地推断。
 	// relay 模式下恒为 answerer（服务端 SFU 是 offerer）。
 	Role string `json:"role"`
+}
+
+// VoiceTransportFailedRequest 是客户端上报「本端直连失败」的载荷（PROTOCOL.md §4.4）。
+//
+// **语义是告知，不是请求**：客户端不得据此推断自己可以指定 transport。
+type VoiceTransportFailedRequest struct {
+	ChannelID string `json:"channel_id"`
+	Media     string `json:"media"`  // 目前只接受 "voice"
+	Reason    string `json:"reason"` // ice_failed | ice_timeout
+}
+
+// VoiceTransportFailedOK 只是确认收到事实；是否降级由服务端决定并在响应里说明。
+type VoiceTransportFailedOK struct {
+	ChannelID string `json:"channel_id"`
+	// Transport 是处理完这次上报后该频道的**实际** transport（可能刚刚被降级）。
+	Transport string `json:"transport"`
+	// Degraded 表示**本次**上报是否触发了降级（幂等：重复上报为 false）。
+	Degraded bool `json:"degraded"`
+	// Reason 是服务端说明：downgraded | already_relay | rate_limited | not_in_voice。
+	Reason string `json:"reason"`
+	// TriggerCount 是本次生命周期内该频道累计成功降级次数（正常只会是 1）。
+	TriggerCount int `json:"trigger_count,omitempty"`
 }
 
 // ServerInfoOK 是 server.info 的响应（PROTOCOL.md §1.4）。

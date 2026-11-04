@@ -440,6 +440,12 @@ class MfH264Encoder final : public webrtc::VideoEncoder {
   int64_t encode_failures_ = 0;
   // 上一次真正下发的码率与时刻（SetRates 限流用，见 ApplyPendingRates）。
   int64_t last_rate_apply_ms_ = 0;
+  // 上一次真正下发成功的帧率上限（CODECAPI_AVEncMaxFrameRate，v2.13）。0 = 还没成功。
+  int last_fps_applied_ = 0;
+  // 这个驱动是否接受改帧率上限。S_FALSE/失败后置 false，不再每 250 ms 重试（只报一次）。
+  bool fps_property_supported_ = true;
+  // Release() 会被 libwebrtc 和析构各调一次；取证日志只打一次。
+  bool release_reported_ = false;
 
   // ---- 吞吐取证计数器（Release 时打印一行，用来定位「编码数 < 推送数」）----
   // 这些不是给产品用的统计，是排查工具：没有它们只能猜瓶颈。
@@ -449,6 +455,11 @@ class MfH264Encoder final : public webrtc::VideoEncoder {
   int64_t frames_out_ = 0;        // 从 MFT 收回的包数
   int64_t callback_us_ = 0;       // 投递 OnEncodedImage 的总耗时（微秒）
   int64_t push_us_ = 0;           // PushFrameToMft（含 I420→NV12 转换）的总耗时
+  // ---- v2.13 新增的两个取证计数器 ----
+  // 这两个数是「libwebrtc 想改分辨率、而我们改不了」这条路的探针：
+  // 正常稳态（尺寸不变）应恒为 0；非 0 就说明降分辨率路径被触发过。
+  int64_t size_mismatch_frames_ = 0;  // Encode 因尺寸不符被拒的帧数
+  int64_t ignored_reconfigs_ = 0;     // InitEncode 在已运行时被再次调用且被忽略的次数
 };
 
 int MfH264Encoder::InitEncode(const webrtc::VideoCodec* codec_settings,
@@ -459,7 +470,23 @@ int MfH264Encoder::InitEncode(const webrtc::VideoCodec* codec_settings,
   }
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (worker_started_) return WEBRTC_VIDEO_CODEC_OK;  // 重配走 Encode 内的尺寸检查
+    if (worker_started_) {
+      // v2.13：libwebrtc 的 quality scaler / 降分辨率一旦触发，会**再调一次 InitEncode**
+      // 带上更小的尺寸。MFT 的类型协商是静态的，这里没法原地改尺寸，于是只能忽略——
+      // 而随后的 Encode() 会因为尺寸不符一路返回 ERR_PARAMETER（上层表现是画面卡死）。
+      // 原来这里是静默 return，等于把这个地雷埋掉了；现在留一条日志当探针。
+      const int wanted_w = codec_settings->width;
+      const int wanted_h = codec_settings->height;
+      if (wanted_w != width_.load() || wanted_h != height_.load()) {
+        ++ignored_reconfigs_;
+        std::fprintf(stderr,
+                     "[partyup-media] h264 encoder: IGNORING re-init %dx%d (running %dx%d) -- "
+                     "subsequent frames will be REJECTED (ignored_reconfigs=%lld)\n",
+                     wanted_w, wanted_h, width_.load(), height_.load(),
+                     static_cast<long long>(ignored_reconfigs_));
+      }
+      return WEBRTC_VIDEO_CODEC_OK;  // 重配走 Encode 内的尺寸检查
+    }
     width_ = codec_settings->width;
     height_ = codec_settings->height;
     fps_ = codec_settings->maxFramerate > 0 ? static_cast<int>(codec_settings->maxFramerate) : 30;
@@ -510,16 +537,22 @@ int32_t MfH264Encoder::Release() {
   }
   // 吞吐取证：encode_calls（WebRTC 真正交给我们的帧数）与 frames_out（真正出去的包数）
   // 一比，就能判断「丢帧」发生在我们内部还是 WebRTC 上游（帧丢弃器/管线）。
-  std::fprintf(stderr,
-               "[partyup-media] h264 encoder: closed; encode_calls=%lld "
-               "enqueue_drops=%lld pushed=%lld out=%lld push_avg_us=%lld "
-               "callback_avg_us=%lld\n",
-               static_cast<long long>(encode_calls_),
-               static_cast<long long>(enqueue_drops_),
-               static_cast<long long>(frames_pushed_),
-               static_cast<long long>(frames_out_),
-               static_cast<long long>(frames_pushed_ > 0 ? push_us_ / frames_pushed_ : 0),
-               static_cast<long long>(frames_out_ > 0 ? callback_us_ / frames_out_ : 0));
+  // libwebrtc 会先 Release() 再析构（析构里又调一次 Release），所以只打一次。
+  if (!release_reported_) {
+    release_reported_ = true;
+    std::fprintf(stderr,
+                 "[partyup-media] h264 encoder: closed; encode_calls=%lld "
+                 "enqueue_drops=%lld pushed=%lld out=%lld push_avg_us=%lld "
+                 "callback_avg_us=%lld size_mismatch=%lld ignored_reinit=%lld fps_last=%d\n",
+                 static_cast<long long>(encode_calls_),
+                 static_cast<long long>(enqueue_drops_),
+                 static_cast<long long>(frames_pushed_),
+                 static_cast<long long>(frames_out_),
+                 static_cast<long long>(frames_pushed_ > 0 ? push_us_ / frames_pushed_ : 0),
+                 static_cast<long long>(frames_out_ > 0 ? callback_us_ / frames_out_ : 0),
+                 static_cast<long long>(size_mismatch_frames_),
+                 static_cast<long long>(ignored_reconfigs_), last_fps_applied_);
+  }
   return WEBRTC_VIDEO_CODEC_OK;
 }
 
@@ -530,6 +563,16 @@ int32_t MfH264Encoder::Encode(const webrtc::VideoFrame& frame,
   const int frame_width = frame.width();
   const int frame_height = frame.height();
   if (frame_width != width_.load() || frame_height != height_.load()) {
+    // v2.13：不再静默拒绝。这条日志 + Release 时的计数是判断「降分辨率路是否被打通」
+    // 的唯一证据（预期：正常稳态下恒为 0）。
+    ++size_mismatch_frames_;
+    if (size_mismatch_frames_ <= 3 || size_mismatch_frames_ % 100 == 0) {
+      std::fprintf(stderr,
+                   "[partyup-media] h264 encoder: REJECT frame %dx%d (encoder is %dx%d) "
+                   "count=%lld\n",
+                   frame_width, frame_height, width_.load(), height_.load(),
+                   static_cast<long long>(size_mismatch_frames_));
+    }
     return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
   }
   PendingFrame pending(frame);
@@ -619,6 +662,36 @@ bool MfH264Encoder::OpenOnWorkerThread() {
   mft_->QueryInterface(IID_PPV_ARGS(&event_generator_));
   async_ = event_generator_ != nullptr;
 
+  // v2.13：显式把 rate-control mode 设成**合法枚举**。
+  // 历史 bug：ApplyPendingRates 曾把 fps 数值（30/60）写进这个属性——那是
+  // CBR/PeakConstrainedVBR/UnconstrainedVBR/Quality 的枚举，等于每次收到 SetRates
+  // 就把 rate-control mode 破坏一次，而且从未改到帧率。
+  // 屏幕共享取 UnconstrainedVBR：允许按内容瞬时拉高码率（文字/滚动更友好），
+  // 不套 CBR 的漏桶约束。失败不致命（驱动默认值仍生效），但必须留证。
+  if (codec_api_ != nullptr) {
+    VARIANT rc_value;
+    VariantInit(&rc_value);
+    rc_value.vt = VT_UI4;
+    rc_value.ulVal = eAVEncCommonRateControlMode_UnconstrainedVBR;
+    const HRESULT rc_hr =
+        codec_api_->SetValue(&CODECAPI_AVEncCommonRateControlMode, &rc_value);
+    VariantClear(&rc_value);
+    if (rc_hr == S_OK) {
+      std::fprintf(stderr,
+                   "[partyup-media] h264 encoder: rate control mode = UnconstrainedVBR\n");
+    } else if (rc_hr == S_FALSE) {
+      // S_FALSE 不是失败，是「属性只读」。它同样意味着我们的意图没落地，必须报出来。
+      std::fprintf(stderr,
+                   "[partyup-media] h264 encoder: rate control mode is READ-ONLY (S_FALSE); "
+                   "driver default stays\n");
+    } else {
+      std::fprintf(stderr,
+                   "[partyup-media] h264 encoder: set rate control mode=UnconstrainedVBR "
+                   "FAILED hr=0x%08X (driver default stays)\n",
+                   static_cast<unsigned>(rc_hr));
+    }
+  }
+
   // 2. 事件流开始。之后的编码循环按 NeedInput/HaveOutput 驱动。
   mft_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
   mft_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
@@ -658,15 +731,30 @@ void MfH264Encoder::ApplyPendingRates() {
   if (codec_api_ == nullptr) return;
   // 限流：WebRTC 的 SetRates 在拥塞控制下可能每帧都调一次，而 NVENC/Intel 的
   // ICodecAPI 重配是数十毫秒级的重活——每帧重配会把编码线程堵死、编码数掉到
-  // 推送数的 0.67x（实测）。所以只在「变化超过 15% 且距上次 >= 250 ms」时才下发。
+  // 推送数的 0.67x（实测）。所以只在「码率变化超过 15%」或「帧率变了」且距上次
+  // 下发 >= 250 ms 时才动 MFT。
   const int64_t now_ms = NowMs();
-  const int previous = static_cast<int>(bitrate_bps_);
-  const bool big_change =
-      previous <= 0 ||
-      std::abs(static_cast<long long>(bitrate_bps) - previous) * 100LL >
-          static_cast<long long>(previous) * 15LL;
-  if (!big_change || now_ms - last_rate_apply_ms_ < 250) return;
-  if (bitrate_bps > 0) {
+  const int previous_bitrate = static_cast<int>(bitrate_bps_);
+  const bool bitrate_due =
+      bitrate_bps > 0 &&
+      (previous_bitrate <= 0 ||
+       std::abs(static_cast<long long>(bitrate_bps) - previous_bitrate) * 100LL >
+           static_cast<long long>(previous_bitrate) * 15LL);
+  // v2.13：帧率**不再**写进 CODECAPI_AVEncCommonRateControlMode（那是
+  // CBR/PeakConstrainedVBR/UnconstrainedVBR/Quality 的枚举，把 30/60 当枚举值写
+  // 进去既改了错误的属性、也从来没改到帧率，还会把 rate-control mode 写坏）。
+  // 正确的属性是 CODECAPI_AVEncMaxFrameRate：VT_UI8，高 32 位分子、低 32 位分母。
+  // 抖动容差：libwebrtc 报的 framerate_fps 是「实测输入帧率」，在 55–60 之间来回跳。
+  // 差 1–2 fps 就重配一次 MFT 没有意义，只会每 250 ms 打一次驱动；变化 >= 10% 才下发。
+  const bool fps_due =
+      fps_property_supported_ && fps > 0 &&
+      (last_fps_applied_ == 0 ||
+       std::abs(fps - last_fps_applied_) * 10 >= last_fps_applied_);
+  if (!bitrate_due && !fps_due) return;
+  if (now_ms - last_rate_apply_ms_ < 250) return;
+
+  bool applied = false;
+  if (bitrate_due) {
     VARIANT value;
     VariantInit(&value);
     value.vt = VT_UI4;
@@ -674,22 +762,39 @@ void MfH264Encoder::ApplyPendingRates() {
     const HRESULT hr = codec_api_->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &value);
     VariantClear(&value);
     if (FAILED(hr)) {
+      // 不静默：失败要留证，且保留上一次成功下发的值（bitrate_bps_ 不动）。
       std::fprintf(stderr,
-                   "[partyup-media] h264 encoder: set mean bitrate %d failed 0x%08X\n",
-                   bitrate_bps, static_cast<unsigned>(hr));
-      return;
+                   "[partyup-media] h264 encoder: set mean bitrate %d bps FAILED hr=0x%08X "
+                   "(keeping %u bps)\n",
+                   bitrate_bps, static_cast<unsigned>(hr), bitrate_bps_);
+    } else {
+      bitrate_bps_ = static_cast<uint32_t>(bitrate_bps);
+      applied = true;
     }
-    bitrate_bps_ = static_cast<uint32_t>(bitrate_bps);
-    last_rate_apply_ms_ = now_ms;
   }
-  if (fps > 0) {
+  if (fps_due) {
     VARIANT value;
     VariantInit(&value);
-    value.vt = VT_UI4;
-    value.ulVal = static_cast<ULONG>(fps);
-    codec_api_->SetValue(&CODECAPI_AVEncCommonRateControlMode, &value);
+    value.vt = VT_UI8;
+    value.ullVal = (static_cast<ULONGLONG>(fps) << 32) | 1ULL;  // fps / 1
+    const HRESULT hr = codec_api_->SetValue(&CODECAPI_AVEncMaxFrameRate, &value);
     VariantClear(&value);
+    if (hr == S_OK) {
+      last_fps_applied_ = fps;
+      applied = true;
+      std::fprintf(stderr, "[partyup-media] h264 encoder: max frame rate -> %d\n", fps);
+    } else {
+      // S_FALSE = 属性只读；其它 = 驱动不支持。两种情况都**不能每 250 ms 重试**：
+      // 记一次、报一次，并说清「帧率仍然由 libwebrtc 在编码器上游节流」。
+      fps_property_supported_ = false;
+      std::fprintf(stderr,
+                   "[partyup-media] h264 encoder: set max frame rate %d NOT APPLIED "
+                   "(hr=0x%08X%s); frame pacing stays upstream of the encoder\n",
+                   fps, static_cast<unsigned>(hr),
+                   hr == S_FALSE ? " S_FALSE=read-only" : "");
+    }
   }
+  if (applied) last_rate_apply_ms_ = now_ms;
 }
 
 MfH264Encoder::PushResult MfH264Encoder::PushFrameToMft(const PendingFrame& pending) {

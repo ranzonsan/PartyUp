@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"partyup/internal/protocol"
 	"partyup/internal/sfu"
@@ -277,6 +278,8 @@ func (c *conn) handleVoiceJoin(env protocol.Envelope) {
 		members = make(map[string]protocol.VoiceMemberState, 4)
 		h.voice[channelID] = members
 	}
+	// 该频道**实际**的 transport（v1 与策略同值；直连失败降级后变 relay）。
+	transport, transportReason := h.channelTransportLocked(channelID)
 	_, already := members[memberID]
 	if !already {
 		// 角色由服务端单一来源裁决（客户端只消费，不自行推断）：
@@ -286,7 +289,7 @@ func (c *conn) handleVoiceJoin(env protocol.Envelope) {
 		//     已有一对在通话 → 新来者 answerer（三人及以上的 mesh 暂不支持，
 		//     但绝不能因为第三个人进来就把已在通话的两人的 PC 拆了）。
 		role := "answerer"
-		if h.voiceMode == "direct" {
+		if transport == "direct" {
 			others := 0
 			hasOfferer := false
 			for id, m := range members {
@@ -306,16 +309,19 @@ func (c *conn) handleVoiceJoin(env protocol.Envelope) {
 		if h.voiceTransport[channelID] == "" {
 			h.voiceTransport[channelID] = h.voiceMode
 			h.voiceTransportReason[channelID] = "server_policy"
+			transport, transportReason = h.channelTransportLocked(channelID)
 		}
 		members[memberID] = protocol.VoiceMemberState{
-			MemberID:  memberID,
-			Role:      role,
-			JoinedSeq: h.voiceSeq[channelID],
+			MemberID:        memberID,
+			Role:            role,
+			JoinedSeq:       h.voiceSeq[channelID],
+			Transport:       transport,
+			TransportReason: transportReason,
 		}
 	}
 	h.mu.Unlock()
 
-	if h.voiceMode == "relay" {
+	if transport == "relay" {
 		room, err := h.ensureRoom(channelID)
 		if err != nil {
 			// 加入失败要回滚刚写进 voice 表的成员，避免幽灵成员。
@@ -334,11 +340,11 @@ func (c *conn) handleVoiceJoin(env protocol.Envelope) {
 	// 不能等 voice.state 广播（那会晚一步，先建错 PC 再拆）。
 	c.replyOK(env, protocol.VoiceJoinOK{
 		ChannelID: channelID,
-		Transport: h.voiceMode,
+		Transport: transport,
 		Role:      h.memberRole(channelID, memberID),
 	})
 	if !already {
-		h.log.Info("voice: joined", "channel", channelID, "member", memberID, "transport", h.voiceMode)
+		h.log.Info("voice: joined", "channel", channelID, "member", memberID, "transport", transport)
 		h.broadcastVoiceState(channelID)
 	}
 }
@@ -366,6 +372,115 @@ func (c *conn) handleVoiceLeave(env protocol.Envelope) {
 	}
 	c.hub.leaveVoiceChannel(c.member.ID, channelID)
 	c.replyOK(env, protocol.VoiceJoinOK{ChannelID: channelID})
+}
+
+// voiceFailedCooldown 是同一成员两次「直连失败上报」的最小间隔：网络抖动会连续触发，
+// 冷却窗口内只处理第一次（防刷；幂等性另有「已经是 relay」分支兜底）。
+const voiceFailedCooldown = 30 * time.Second
+
+// handleVoiceTransportFailed 处理客户端的「本端直连失败」**事实上报**（PROTOCOL.md §4.4）。
+//
+// 设计要点（都是 Lead 明确要求的）：
+//   - 客户端只说「我这边连不上」，降级决定权 100% 在服务端；
+//   - 按频道降级（v1 direct 只支持 2 人，一对人连不上 = 这条通话连不上）；
+//   - 表达为「把该频道所有成员的 transport 改成 relay」，不是改一个频道级字段；
+//   - 幂等：已经是 relay 时不再降级；同一成员 30s 内重复上报直接丢弃；
+//   - 单向：本进程生命周期内不再升回 direct（重启服务端才恢复策略原值）。
+func (c *conn) handleVoiceTransportFailed(env protocol.Envelope) {
+	var req protocol.VoiceTransportFailedRequest
+	if err := env.DecodePayload(&req); err != nil {
+		c.replyError(env.Type, protocol.CodeInvalidArgument, err.Error(), env.ID)
+		return
+	}
+	channelID := strings.TrimSpace(req.ChannelID)
+	if channelID == "" {
+		c.replyError(env.Type, protocol.CodeInvalidArgument, "channel_id is required", env.ID)
+		return
+	}
+	media := strings.TrimSpace(req.Media)
+	if media == "" {
+		media = "voice"
+	}
+	if media != "voice" {
+		c.replyError(env.Type, protocol.CodeInvalidArgument, "media must be voice (screen 暂不支持回落)", env.ID)
+		return
+	}
+	reason := strings.TrimSpace(req.Reason)
+	switch reason {
+	case "ice_failed", "ice_timeout":
+	default:
+		c.replyError(env.Type, protocol.CodeInvalidArgument,
+			"reason must be ice_failed or ice_timeout", env.ID)
+		return
+	}
+	if !c.hub.isSubscribed(c, channelID) {
+		c.replyError(env.Type, protocol.CodeForbidden, "not a subscriber of this channel", env.ID)
+		return
+	}
+
+	h := c.hub
+	memberID := c.member.ID
+	now := time.Now()
+
+	h.mu.Lock()
+	// 只有在语音里的人上报才可能意味着「这条通话连不上」。
+	if _, ok := h.voice[channelID][memberID]; !ok {
+		current, _ := h.channelTransportLocked(channelID)
+		h.mu.Unlock()
+		c.replyOK(env, protocol.VoiceTransportFailedOK{
+			ChannelID: channelID, Transport: current, Reason: "not_in_voice",
+		})
+		return
+	}
+	// 防刷：同一成员 30s 内只处理一次。
+	rateKey := channelID + "\x00" + memberID
+	if last, ok := h.voiceFailedAt[rateKey]; ok && now.Sub(last) < voiceFailedCooldown {
+		current, _ := h.channelTransportLocked(channelID)
+		h.mu.Unlock()
+		h.log.Info("voice: transport_failed ignored (rate limited)",
+			"channel", channelID, "member", memberID, "reason", reason)
+		c.replyOK(env, protocol.VoiceTransportFailedOK{
+			ChannelID: channelID, Transport: current, Reason: "rate_limited",
+		})
+		return
+	}
+	h.voiceFailedAt[rateKey] = now
+
+	current, _ := h.channelTransportLocked(channelID)
+	if current == "relay" {
+		// 幂等：已经降过了（可能是别的成员先触发），不重复降级。
+		h.mu.Unlock()
+		c.replyOK(env, protocol.VoiceTransportFailedOK{
+			ChannelID: channelID, Transport: "relay", Reason: "already_relay",
+		})
+		return
+	}
+
+	// 降级：把该频道**所有成员**的 transport 表达为 relay（不是改一个频道级字段）。
+	h.voiceTransport[channelID] = "relay"
+	h.voiceTransportReason[channelID] = "direct_failed_fallback"
+	h.voiceDowngradeCount[channelID]++
+	triggerCount := h.voiceDowngradeCount[channelID]
+	for id, m := range h.voice[channelID] {
+		m.Transport = "relay"
+		m.TransportReason = "direct_failed_fallback"
+		h.voice[channelID][id] = m
+	}
+	h.mu.Unlock()
+
+	h.log.Warn("voice: transport downgraded direct→relay",
+		"channel", channelID, "reason", reason, "member", memberID, "trigger_count", triggerCount)
+	// 广播新 voice.state：所有客户端看到自己的 transport 变 relay 后各自重建会话。
+	// 重建窗口内各成员独立 leave→join（relay SFU 天然支持先后加入，槽位后绑），
+	// 因此「部分已重建、部分还没有」的中间态会自愈，不需要服务端等全员确认。
+	h.broadcastVoiceState(channelID)
+	c.replyOK(env, protocol.VoiceTransportFailedOK{
+		ChannelID:    channelID,
+		Transport:    "relay",
+		Degraded:     true,
+		Reason:       "downgraded",
+		TriggerCount: triggerCount,
+	})
 }
 
 func (c *conn) handleVoiceSetMute(env protocol.Envelope) {

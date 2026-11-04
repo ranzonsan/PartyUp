@@ -70,6 +70,11 @@ type Hub struct {
 	voiceTransport map[string]string
 	// voiceTransportReason 记录该频道为什么是当前 transport（server_policy / direct_failed_fallback）。
 	voiceTransportReason map[string]string
+	// voiceFailedAt 是「直连失败上报」的限流表：channel_id + member_id → 上次处理时刻。
+	// 网络抖动会连续上报，同一成员在冷却窗口内只处理一次（防刷）。
+	voiceFailedAt map[string]time.Time
+	// voiceDowngradeCount 是每频道成功降级次数（正常恒为 1；用于日志 trigger_count 与测试断言）。
+	voiceDowngradeCount map[string]int
 	// stunURLs 是 server.info 下发给客户端的 STUN 地址（`stun:host:port`），
 	// 来自启动参数 --stun-listen/--stun-advertise。空表示没开 STUN。
 	// 它是**配置**不是**策略**：只影响 ICE 候选收集，不影响 transport 决策。
@@ -98,6 +103,8 @@ func NewHub(st *store.Store, log *slog.Logger, name, version, voiceMode, screenM
 		sfuVideo:             true, // SFU 视频转发（sfu.VideoRoom）已落地
 		voiceTransport:       make(map[string]string, 4),
 		voiceTransportReason: make(map[string]string, 4),
+		voiceFailedAt:        make(map[string]time.Time, 8),
+		voiceDowngradeCount:  make(map[string]int, 4),
 		rooms:                make(map[string]*sfu.Room, 4),
 		videoRooms:           make(map[string]*sfu.VideoRoom, 4),
 		upgrader: websocket.Upgrader{
@@ -449,6 +456,8 @@ func (c *conn) handle(env protocol.Envelope) {
 		c.handleVoiceSetDeafen(env)
 	case protocol.TypeServerInfo:
 		c.handleServerInfo(env)
+	case protocol.TypeVoiceTransportFailed:
+		c.handleVoiceTransportFailed(env)
 	default:
 		c.replyError(env.Type, protocol.CodeInvalidArgument, "unknown message type "+env.Type, env.ID)
 	}
@@ -942,7 +951,10 @@ func (c *conn) handleMediaSignal(env protocol.Envelope) {
 	// 为什么必须显式 media：语音与屏幕各用独立 PeerConnection 后，candidate 的 SDP 行里
 	// 不带媒体类型，靠嗅探只能「两边都试一次让 libwebrtc 拒掉一个」——那是静默失败。
 	c.hub.mu.RLock()
-	voiceMode, screenMode := c.hub.voiceMode, c.hub.screenMode
+	// 语音按**频道实际 transport** 路由（不是策略值）：direct 失败降级后，
+	// 媒体信令要立刻改走 SFU，否则会继续按 direct 转发给成员、永远连不上。
+	voiceMode, _ := c.hub.channelTransportLocked(channelID)
+	screenMode := c.hub.screenMode
 	sfuVideo := c.hub.sfuVideo
 	c.hub.mu.RUnlock()
 	target := strings.TrimSpace(req.Target)

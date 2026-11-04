@@ -34,7 +34,7 @@ type Options struct {
 	VoiceMode string
 	// ScreenMode 是服务端**屏幕共享**传输策略，与 VoiceMode 相互独立
 	// （ADR-0002：三类媒体各自决定路径）。"relay" = 走 SFU 视频通道；
-	// "direct" = 成员间 P2P。空值由 NormalizeScreenMode 归一到 direct。
+	// "direct" = 成员间 P2P（只支持 1v1 观看）。空值由 NormalizeScreenMode 归一到 relay。
 	ScreenMode string
 	// StunURLs 是内建 STUN responder 的地址（`stun:host:port`），由 server.info 下发。
 	// 空表示没开 STUN：客户端仍可直连，但没有 srflx 候选（跨 NAT 通常连不上）。

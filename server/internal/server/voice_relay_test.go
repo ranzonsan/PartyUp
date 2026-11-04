@@ -427,7 +427,9 @@ type relayEnv struct {
 
 func newRelayEnv(t *testing.T) *relayEnv {
 	t.Helper()
-	env := newTestEnv(t)
+	// 这是语音中继的测试环境：屏幕策略钉成 direct，避免默认 relay 带来的视频房间
+	// 给三个假客户端发 screen offer（它们只实现语音 PC）。
+	env := newTestEnvWithModes(t, "relay", "direct")
 	_, adminToken := env.bootstrapAdmin("alice", "alice-password-123")
 	_, bobToken := env.registerViaInvite(env.newInvite(), "bob", "bob-password-123")
 	_, carolToken := env.registerViaInvite(env.newInvite(), "carol", "carol-password-123")
@@ -641,7 +643,9 @@ func TestVoiceModeIsServerPolicy(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			env := newTestEnvWith(t, tc.serverMode)
+			// 屏幕策略钉 direct：这个用例只关心语音策略，避免默认 relay 的视频房间
+			// 给这些只实现语音 PC 的假客户端发 screen offer。
+			env := newTestEnvWithModes(t, tc.serverMode, "direct")
 			// 先 bootstrap 管理员（bootstrap 要求成员数为 0），再用邀请码建普通成员。
 			_, adminToken := env.bootstrapAdmin("admin-"+tc.name, "password-123")
 			member, token := env.registerViaInvite(env.newInvite(), "policy-"+tc.name, "password-123")

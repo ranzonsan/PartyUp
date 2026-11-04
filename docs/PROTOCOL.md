@@ -104,14 +104,15 @@ relay/direct（那是 `voice.state.transport` 与服务端策略的事）。
 （ADR-0002「三类媒体各自决定路径」）：
 
 - `--voice-mode=relay|direct`（`PARTYUP_VOICE_MODE`，默认 `relay`）只管**语音**；
-- `--screen-mode=relay|direct`（`PARTYUP_SCREEN_MODE`，默认 `direct`）只管**屏幕共享**。
+- `--screen-mode=relay|direct`（`PARTYUP_SCREEN_MODE`，默认 `relay`）只管**屏幕共享**。
+  `direct` 只能 1v1 观看（P2P mesh 未实现），第三个人看不到；多人共享必须用 `relay`。
 
 两者可以不同：语音中继 + 屏幕直连是合法配置，反之亦然。客户端从
 `voice.join.ok.transport`（语音）与 `voice.state.voice_mode` / `voice.state.screen_mode`
 （两者）读取结果，再按结果走对应媒体路径。
 
-> `--screen-mode` 默认 `direct` 是过渡值：SFU 视频通道尚未实现，默认配置下屏幕共享必须可用。
-> 视频通道落地后默认值切到 `relay`（与语音对齐）。
+> `--screen-mode` 自 2026-11-04 起默认 `relay`：SFU 视频通道已实现并验收（1 共享 + N 观看）。
+> 默认值必须让"多数人能看到"——direct 只支持 1v1，不能当默认。
 
 - `voice.join { channel_id }` —— 上行载荷**只有** `channel_id`。
   客户端即使多传一个 `mode` 字段也会被服务端忽略（协议不再定义该字段）。

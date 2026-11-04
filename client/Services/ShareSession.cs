@@ -51,8 +51,9 @@ public sealed class ShareSession : IAsyncDisposable
     /// <summary>
     /// 屏幕共享的传输策略（服务端 --screen-mode，从 voice.state / screen.state 学习）。
     /// 与语音 _voiceMode 完全独立：语音可中继、共享可直连。
+    /// 初始值与服务端默认一致（relay）；学到真实值后覆盖。
     /// </summary>
-    private string _screenMode = "direct";
+    private string _screenMode = "relay";
 
     /// <summary>当前本端共享的源（断线重连后按原状恢复）。</summary>
     private MediaSource? _sharingSource;
@@ -173,10 +174,13 @@ public sealed class ShareSession : IAsyncDisposable
     /// <summary>屏幕共享传输策略（服务端 --screen-mode）。</summary>
     public string ScreenMode => _screenMode;
 
-    /// <summary>屏幕共享策略展示文本。</summary>
+    /// <summary>
+    /// 屏幕共享策略展示文本。direct 必须标注「仅支持 2 人观看」：
+    /// P2P mesh 下第三个人看不到共享，不说明白部署者会以为坏了。
+    /// </summary>
     public string ScreenModeText => _screenMode == "relay"
         ? "中继（服务端 SFU 转发）"
-        : "直连（P2P）";
+        : "直连（P2P，仅支持 2 人观看）";
 
     /// <summary>语音模式展示文本（服务端策略值；客户端不参与选择）。</summary>
     public string VoiceModeText => _voiceMode == "relay"

@@ -850,7 +850,8 @@ func TestTextMessagesCarryMemberName(t *testing.T) {
 // screen.start/stop → screen.state 广播；media.signal 的广播（offer）与定向投递
 // （answer/candidate 发给指定成员），以及非法 kind / 未订阅频道的拒绝。
 func TestMediaSignalRelayAndScreenState(t *testing.T) {
-	env := newTestEnv(t)
+	// 显式 direct：这个用例验证的是直连信令转发（默认值已是 relay，见 TestDefaultScreenModeIsRelay）。
+	env := newTestEnvWithModes(t, "relay", "direct")
 	alice, aliceToken := env.bootstrapAdmin("alice", "secret123")
 	code := env.newInvite()
 	bob, bobToken := env.registerViaInvite(code, "bob", "secret123")
@@ -894,7 +895,7 @@ func TestMediaSignalRelayAndScreenState(t *testing.T) {
 			share.Source.Width, share.Source.Height, share.Source.Kind)
 	}
 	if share.Mode != "direct" {
-		t.Fatalf("share mode = %q, want direct (default)", share.Mode)
+		t.Fatalf("share mode = %q, want direct (显式 --screen-mode=direct)", share.Mode)
 	}
 
 	// 2) offer 广播：alice → bob，payload 原样透传。

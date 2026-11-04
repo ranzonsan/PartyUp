@@ -173,3 +173,37 @@ func waitVoiceState(t *testing.T, c *wsClient, pred func(protocol.VoiceStatePayl
 	t.Fatalf("voice.state never satisfied predicate")
 	return protocol.VoiceStatePayload{}
 }
+
+// TestDefaultScreenModeIsRelay 锁定默认值（2026-11-04 决策）：
+// 不带任何 --screen-mode 启动时，屏幕共享默认走服务端 SFU 中继。
+//
+// 理由：direct 只能 1v1 观看，第三人看不到；默认配置必须让"多数人能看到"。
+// 想省带宽的部署者显式传 --screen-mode=direct（行为仍由 TestScreenModeIndependentOfVoiceMode 等锁定）。
+func TestDefaultScreenModeIsRelay(t *testing.T) {
+	env := newTestEnv(t) // 不传 screen 策略 → 走服务端默认值
+	_, aliceToken := env.bootstrapAdmin("alice", "secret123")
+	aliceWS := dialWS(t, env.http.URL, aliceToken)
+	ch := aliceWS.createChannel("default-screen")
+	aliceWS.subscribe(ch.ID)
+
+	st := waitVoiceState(t, aliceWS, func(s protocol.VoiceStatePayload) bool { return true })
+	if st.ScreenMode != "relay" {
+		t.Fatalf("voice.state.screen_mode = %q, want relay (默认值)", st.ScreenMode)
+	}
+
+	aliceWS.request(protocol.TypeScreenStart, protocol.ScreenStartRequest{
+		ChannelID: ch.ID,
+		Source:    protocol.ScreenSource{ID: "1", Title: "DISPLAY1", Width: 1920, Height: 1080, Kind: "screen"},
+	})
+	env2 := aliceWS.waitFor(protocol.TypeScreenState)
+	var state protocol.ScreenStatePayload
+	if err := env2.DecodePayload(&state); err != nil {
+		t.Fatalf("decode screen.state: %v", err)
+	}
+	if state.Mode != "relay" {
+		t.Fatalf("screen.state.mode = %q, want relay (默认值)", state.Mode)
+	}
+	if len(state.Shares) != 1 || state.Shares[0].Mode != "relay" {
+		t.Fatalf("screen.state shares = %+v, want 1 share with mode=relay", state.Shares)
+	}
+}

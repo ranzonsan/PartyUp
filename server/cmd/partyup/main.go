@@ -34,7 +34,10 @@ import (
 )
 
 // version 是二进制版本。协议版本在 protocol.Version（当前 1）。
-const version = "0.1.0"
+//
+// 必须是 var 而不是 const：scripts/package.ps1 用 `-ldflags -X main.version=<VERSION>` 注入，
+// 版本号的唯一来源是仓库根的 VERSION 文件；直接 `go build`（不走打包脚本）时为 "dev"。
+var version = "dev"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -78,12 +81,14 @@ func printUsage() {
 
 用法:
   partyup serve  [--data DIR] [--http ADDR] [--name NAME] [--log-level L]
-                 [--voice-mode relay|direct] [--stun-listen ADDR] [--stun-advertise HOST:PORT]
+                 [--voice-mode relay|direct] [--screen-mode relay|direct]
+                 [--stun-listen ADDR] [--stun-advertise HOST:PORT]
   partyup invite [--data DIR] [--by MEMBER_ID]
   partyup version
 
 serve 的 stdout 输出（每行 KEY=VALUE，最后一行 READY）:
-  DATA_DIR / DB_PATH / BOOTSTRAP_TOKEN / INVITE_CODE / VOICE_MODE / LISTEN_ADDR / STUN
+  DATA_DIR / DB_PATH / BOOTSTRAP_TOKEN / INVITE_CODE / VOICE_MODE / SCREEN_MODE / STUN /
+  LISTEN_ADDR（SCREEN_MODE=direct 时屏幕共享只支持 1v1）
 BOOTSTRAP_TOKEN 与 INVITE_CODE 只在本次启动新生成时出现。
 `)
 }
@@ -98,10 +103,10 @@ func cmdServe(args []string) error {
 	voiceMode := fs.String("voice-mode", envOr("PARTYUP_VOICE_MODE", "relay"),
 		"语音传输策略：relay（服务端 SFU 中继，默认）| direct（P2P 直连）")
 	// 屏幕共享是**独立**的传输策略，与语音互不影响（ADR-0002：三类媒体各自决定路径）。
-	// 默认 direct：SFU 视频通道尚未实现，默认配置下共享必须可用；
-	// 视频通道落地后把默认值切到 relay。
-	screenMode := fs.String("screen-mode", envOr("PARTYUP_SCREEN_MODE", "direct"),
-		"屏幕共享传输策略：direct（P2P 直连，当前默认）| relay（服务端 SFU 视频通道，开发中）")
+	// 默认 relay（2026-11-04 起）：direct 只能 1v1，多于 2 人时第三个人看不到共享，
+	// 默认配置必须是"多数人能看到"的。想省带宽的部署者显式传 --screen-mode=direct。
+	screenMode := fs.String("screen-mode", envOr("PARTYUP_SCREEN_MODE", "relay"),
+		"屏幕共享传输策略：relay（服务端 SFU 视频中继，默认）| direct（P2P 直连，仅支持 1v1）")
 	// 内建 STUN responder（直连模式的 srflx 候选来源，见 docs/PROTOCOL.md §1.4）。
 	// 默认监听 :3478；传空串 / off 关闭。advertise 为空时自动从 listen 推导，
 	// 但**多网卡或有 NAT 的机器必须显式指定**，否则通告的是内网地址。

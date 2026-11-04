@@ -30,11 +30,13 @@ import (
 // NormalizeScreenMode 归一化屏幕共享传输策略。与语音策略完全独立（ADR-0002）。
 // SFU 视频通道尚未实现，所以默认 direct：默认配置下屏幕共享必须可用；
 // 视频通道落地后把 main.go 的默认值切到 relay。
+// NormalizeScreenMode 归一到 relay|direct。**空值/未识别值一律按 relay**（默认值）：
+// direct 屏幕共享只能 1v1，第三个人看不到，不能当默认。
 func NormalizeScreenMode(mode string) string {
-	if strings.EqualFold(strings.TrimSpace(mode), "relay") {
-		return "relay"
+	if strings.EqualFold(strings.TrimSpace(mode), "direct") {
+		return "direct"
 	}
-	return "direct"
+	return "relay"
 }
 
 func NormalizeVoiceMode(mode string) string {

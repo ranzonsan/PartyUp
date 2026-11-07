@@ -42,6 +42,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdarg>
 #include <cstddef>
@@ -49,6 +50,7 @@
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -69,6 +71,14 @@
 
 // v2.4 硬件 H.264 编解码（Media Foundation MFT）：编/解码器工厂 + 能力探测。
 #include "hw_encoder.h"
+
+// v2.15：通话中的音频设备热切 / 系统默认跟随 / 热插拔回退。纯控制逻辑与 ADM
+// 端口分离；fake ADM 回归测试驱动同一份 AudioDeviceController 实现。
+#include "adm_lifetime_proxy.h"
+#include "audio_device_adm_win.h"
+#include "audio_device_control.h"
+#include "audio_monitor.h"
+#include "audio_monitor_observer.h"
 
 // Media Foundation 进程级初始化（MFTEnumEx / MFCreateSample 都依赖 MFStartup）。
 #include <mfapi.h>
@@ -143,6 +153,31 @@ static_assert(static_cast<int>(webrtc::PeerConnectionInterface::IceConnectionSta
 
 
 namespace partyup {
+
+// v2.14 ABI 结构的编译期尺寸断言：C# 侧按这些字节数固定 Marshal。
+static_assert(sizeof(pu_audio_device) == 204, "pu_audio_device C layout changed");
+static_assert(sizeof(pu_audio_status_info) == 292, "pu_audio_status_info C layout changed");
+static_assert(sizeof(pu_voice_level_info) == 72, "pu_voice_level_info C layout changed");
+static_assert(offsetof(pu_voice_level_info, last_frame_ms) == 24,
+              "voice_level.last_frame_ms offset changed");
+static_assert(offsetof(pu_voice_level_info, capture_frames) == 32,
+              "voice_level.capture_frames offset changed (v2.19 tail append)");
+static_assert(offsetof(pu_voice_level_info, capture_bytes) == 40,
+              "voice_level.capture_bytes offset changed");
+static_assert(offsetof(pu_voice_level_info, last_cb_ms) == 48,
+              "voice_level.last_cb_ms offset changed");
+static_assert(offsetof(pu_voice_level_info, adm_instance) == 68,
+              "voice_level.adm_instance offset changed");
+static_assert(sizeof(pu_audio_monitor_info) == 40, "pu_audio_monitor_info C layout changed");
+static_assert(offsetof(pu_audio_monitor_info, state) == 4, "monitor.state offset changed");
+static_assert(offsetof(pu_audio_monitor_info, running) == 8, "monitor.running offset changed");
+static_assert(offsetof(pu_audio_monitor_info, valid) == 12, "monitor.valid offset changed");
+static_assert(offsetof(pu_audio_monitor_info, peak) == 16, "monitor.peak offset changed");
+static_assert(offsetof(pu_audio_monitor_info, rms) == 20, "monitor.rms offset changed");
+static_assert(offsetof(pu_audio_monitor_info, frames) == 24, "monitor.frames offset changed");
+static_assert(offsetof(pu_audio_monitor_info, last_frame_ms) == 32,
+              "monitor.last_frame_ms offset changed");
+
 namespace {
 
 constexpr int kWidth = 640;
@@ -168,6 +203,9 @@ constexpr uint32_t kDefaultQueueCapacity = 256;
 // ICE 收集超时：本机回环只会有 host 候选，实测 20–80 ms 收完；3 秒是给
 // 「将来接 STUN/TURN」留的余量，超时也照发 SDP（里面带上当时已收集的候选）。
 constexpr int kGatherTimeoutMs = 3000;
+// v2.17：严格会话（发布会话 offer / 接收会话 answer）的候选收集上限。这些会话
+// 与主屏幕协商互不相关，不能被屏幕协商的停止标志打断，也不该等满 3s。
+constexpr int kSessionGatherTimeoutMs = 1500;
 constexpr int kSdpTimeoutMs = 10000;     // CreateOffer / CreateAnswer
 constexpr int kSetSdpTimeoutMs = 10000;  // SetLocal / SetRemote
 // 已投递的信令 JSON 保留多少条。见头文件 pu_signal_event 注释。
@@ -308,6 +346,14 @@ struct CandidateCopy {
   std::string mid;
   int mline_index = 0;
   std::string sdp;
+};
+
+// v2.17：每条严格会话（接收/发送）自己的候选集合。回调（signaling 线程）只往
+// 这里追加，控制线程在发 SDP 时取一份快照；用独立 mutex，绝不与会话锁共用，
+// 否则 Close 持锁等 signaling 线程、signaling 线程等锁 = 死锁。
+struct CandidateSink {
+  std::mutex mu;
+  std::vector<CandidateCopy> items;
 };
 
 // 一次异步 webrtc 操作的结果。回调只往里写，控制线程只从里读；绝不在回调里
@@ -587,6 +633,66 @@ class StatsCollector : public webrtc::RTCStatsCollectorCallback {
   std::shared_ptr<PcStatsState> state_;
 };
 
+// v2.17（B2b direct）：按**会话**统计真实 RTP。与 PcStatsState 的区别是它同时
+// 收集 outbound 与 inbound 的包计数：direct 停看必须证明「该会话不再收到/发出
+// RTP 包」，而 frames_delivered / frames_encoded 在编码或交付路径被暂停时无法
+// 区分「网络 RTP 停了」与「只是没解码」；ICE/DTLS 保活不会增加这两个计数。
+struct MediaRtpCounters {
+  std::atomic<uint64_t> packets_sent{0};
+  std::atomic<uint64_t> bytes_sent{0};
+  std::atomic<uint64_t> frames_encoded{0};
+  std::atomic<uint64_t> packets_received{0};
+  std::atomic<uint64_t> bytes_received{0};
+  std::atomic<uint64_t> frames_decoded{0};
+  std::atomic<uint32_t> reports{0};
+};
+
+// GetStats 回调：只读报告、只写原子量，不阻塞、不重入。
+class MediaRtpStatsCollector : public webrtc::RTCStatsCollectorCallback {
+ public:
+  explicit MediaRtpStatsCollector(std::shared_ptr<MediaRtpCounters> counters)
+      : counters_(std::move(counters)) {}
+
+  void OnStatsDelivered(
+      const webrtc::scoped_refptr<const webrtc::RTCStatsReport>& report) override {
+    if (report == nullptr || counters_ == nullptr) return;
+    uint64_t packets_sent = 0;
+    uint64_t bytes_sent = 0;
+    uint64_t frames_encoded = 0;
+    uint64_t packets_received = 0;
+    uint64_t bytes_received = 0;
+    uint64_t frames_decoded = 0;
+    bool any = false;
+    for (const webrtc::RTCOutboundRtpStreamStats* out :
+         report->GetStatsOfType<webrtc::RTCOutboundRtpStreamStats>()) {
+      if (out == nullptr || !out->packets_sent.has_value()) continue;
+      any = true;
+      packets_sent += *out->packets_sent;
+      if (out->bytes_sent.has_value()) bytes_sent += *out->bytes_sent;
+      if (out->frames_encoded.has_value()) frames_encoded += *out->frames_encoded;
+    }
+    for (const webrtc::RTCInboundRtpStreamStats* in :
+         report->GetStatsOfType<webrtc::RTCInboundRtpStreamStats>()) {
+      if (in == nullptr || !in->packets_received.has_value()) continue;
+      any = true;
+      packets_received += *in->packets_received;
+      if (in->bytes_received.has_value()) bytes_received += *in->bytes_received;
+      if (in->frames_decoded.has_value()) frames_decoded += *in->frames_decoded;
+    }
+    if (!any) return;  // PC 刚建好、还没有 RTP 统计
+    counters_->packets_sent.store(packets_sent, std::memory_order_relaxed);
+    counters_->bytes_sent.store(bytes_sent, std::memory_order_relaxed);
+    counters_->frames_encoded.store(frames_encoded, std::memory_order_relaxed);
+    counters_->packets_received.store(packets_received, std::memory_order_relaxed);
+    counters_->bytes_received.store(bytes_received, std::memory_order_relaxed);
+    counters_->frames_decoded.store(frames_decoded, std::memory_order_relaxed);
+    counters_->reports.fetch_add(1, std::memory_order_relaxed);
+  }
+
+ private:
+  std::shared_ptr<MediaRtpCounters> counters_;
+};
+
 // ---------------------------------------------------------------------------
 // 空音频设备模块（v2.2）：本版媒体核心不拥有任何音频硬件
 // ---------------------------------------------------------------------------
@@ -650,11 +756,12 @@ uint32_t VoicePeakThresholdFromEnv() {
 
 class AudioCountSink : public webrtc::AudioTrackSinkInterface {
  public:
+  // rms 可为 nullptr（远端轨只关心 peak/帧数）；本端电平传非空指针，得到真实 RMS。
   AudioCountSink(std::atomic<uint32_t>* frames, std::atomic<uint32_t>* peak,
                  std::atomic<int64_t>* last_ms, std::atomic<uint32_t>* max_peak,
-                 uint32_t threshold)
+                 std::atomic<uint32_t>* rms, uint32_t threshold)
       : frames_(frames), peak_(peak), last_ms_(last_ms), max_peak_(max_peak),
-        threshold_(threshold) {}
+        rms_(rms), threshold_(threshold) {}
 
   void OnData(const void* audio_data, int bits_per_sample, int sample_rate,
               size_t number_of_channels, size_t number_of_frames,
@@ -665,13 +772,20 @@ class AudioCountSink : public webrtc::AudioTrackSinkInterface {
     const int16_t* pcm = static_cast<const int16_t*>(audio_data);
     const size_t count = number_of_channels * number_of_frames;
     uint32_t peak = 0;
+    double sum_squares = 0.0;
     for (size_t i = 0; i < count; ++i) {
       const int32_t v = pcm[i] < 0 ? -static_cast<int32_t>(pcm[i]) : pcm[i];
       if (static_cast<uint32_t>(v) > peak) peak = static_cast<uint32_t>(v);
+      sum_squares += static_cast<double>(v) * static_cast<double>(v);
     }
     peak_->store(peak, std::memory_order_relaxed);
     if (max_peak_ != nullptr && peak > max_peak_->load(std::memory_order_relaxed)) {
       max_peak_->store(peak, std::memory_order_relaxed);
+    }
+    if (rms_ != nullptr && count > 0) {
+      const double rms = std::sqrt(sum_squares / static_cast<double>(count));
+      rms_->store(static_cast<uint32_t>(rms > 32767.0 ? 32767.0 : rms),
+                  std::memory_order_relaxed);
     }
     if (peak < threshold_) return;  // 静音帧/空槽：不计帧、不刷新时间戳
     frames_->fetch_add(1, std::memory_order_relaxed);
@@ -683,6 +797,7 @@ class AudioCountSink : public webrtc::AudioTrackSinkInterface {
   std::atomic<uint32_t>* peak_;
   std::atomic<int64_t>* last_ms_;
   std::atomic<uint32_t>* max_peak_;
+  std::atomic<uint32_t>* rms_;
   uint32_t threshold_;
 };
 
@@ -739,10 +854,86 @@ class MediaEngine {
   int AcquireFrame(const char* stream_id, pu_frame* out);
   void ReleaseFrame(pu_frame* frame);
 
+  // ---- v2.14：显式单流观看（目标 + 槽位 + 代次） ----
+  // WatchToken 在 arm 时固定下来，帧 sink 捕获的是**arm 时的** token，而不是回调时
+  // 去读当前全局状态——这正是「旧回调不能按新 epoch 重新贴标」的实现点。
+  struct WatchToken {
+    std::string target;
+    int32_t slot = -1;
+    uint64_t epoch = 0;
+    bool armed = false;
+    // v2.16：非 0 表示这一帧来自独立的接收会话（B2）；只与当前会话 token 比较，
+    // 不读全局 watch 状态，旧会话的 sink 因此无法把帧贴到新会话上。
+    uint32_t session_token = 0;
+  };
+  int WatchTarget(const char* sharer_id, int32_t slot, uint64_t generation, std::string* error);
+  int UnwatchTarget(const char* sharer_id, std::string* error);
+  int EngineCaps(uint32_t* caps);
+  // 把一条远端视频轨登记到 watch 过滤层；在 signaling 线程上调用。
+  void AttachRemoteVideoTrack(webrtc::VideoTrackInterface* track);
+  // 在 signaling 线程上按当前 watch 状态重建 sink（切源/停看时调用）。
+  void RebindVideoSinksLocked();
+  void DetachAllVideoSinksLocked();
+  bool TrackMatchesWatchLocked(const std::string& track_id) const;
+  bool FrameAccepted(const WatchToken& token) const;
+
+  // ---- v2.16（B2）：严格接收会话（独立 receive-only PC）----
+  // 一个引擎同时最多一条活动接收会话（一个 viewer 恰好一路）。open/close 在控制
+  // 线程串行；信令在控制线程应用（内部投 signaling 线程）。发布 PC 与语音完全不碰。
+  class ReceiveObserver;
+  struct ReceiveSession;
+  int OpenReceive(const char* session_id, uint32_t* out_token, std::string* error);
+  int CloseReceive(const char* session_id, std::string* error);
+  // 调用方必须持有 recv_mu_（open 换会话时用，避免自锁）。
+  void CloseReceiveLocked();
+  int SignalInReceive(const char* session_id, const char* payload, size_t len,
+                      std::string* error);
+  int ReceiveStats(const char* session_id, pu_receive_stats_info* out);
+  int PauseSend(bool paused, std::string* error);
+  // signaling 线程回调：把接收会话的远端视频轨登记并挂 sink。
+  int AttachReceiveVideoTrack(uint32_t token, webrtc::VideoTrackInterface* track);
+
+  // ---- v2.17（B2b direct）：共享者的 per-viewer 发送会话 ----
+  // 每次严格 watch 由共享者为**该 viewer** 新建一条 send-only PC（新 ICE/DTLS/
+  // SSRC），复用已存在的 track_/采集源。open 幂等、close 只关该会话。
+  class PublishObserver;
+  struct PublishSession;
+  int PublishOpen(const char* session_id, uint32_t* out_token, std::string* error);
+  int PublishSignalIn(const char* session_id, const char* payload, size_t len,
+                      std::string* error);
+  int PublishClose(const char* session_id, std::string* error);
+  int PublishStats(const char* session_id, pu_publish_stats_info* out);
+  int ReceiveRtpStats(const char* session_id, pu_rtp_stats_info* out);
+  // 关闭并释放全部发送会话（屏幕 stop / 引擎析构）。调用方必须持有 publish_mu_。
+  void CloseAllPublishSessionsLocked();
+  // 把指定 PC 的 outbound/inbound RTP 计数取一份（最多等 wait_ms）。
+  void RequestMediaRtpStats(webrtc::PeerConnectionInterface* pc,
+                            const std::shared_ptr<MediaRtpCounters>& counters);
+  bool WaitMediaRtpStats(webrtc::PeerConnectionInterface* pc,
+                         const std::shared_ptr<MediaRtpCounters>& counters, int wait_ms);
+
+  // ---- v2.15：音频设备（复用通话 ADM）与本端电平 ----
+  int AudioDevices(int32_t kind, pu_audio_device* out, uint32_t capacity, std::string* error);
+  int AudioStatus(pu_audio_status_info* out, std::string* error);
+  int SetAudioDevice(int32_t kind, int32_t index, std::string* error);
+  int VoiceLevel(pu_voice_level_info* out);
+  // v2.18（AUD02）：显式启停独立输入监测并读回状态（与 voice 共享同一条 ADM）。
+  int AudioMonitorStart(std::string* error);
+  /* AUD02 post-voice：共享 ADM 已不可用时，新建一块 platform ADM 并让 monitor 端口
+   * 改指向它。调用前提（由 AudioMonitorStart 保证）：不在语音会话中、monitor 未在采集。 */
+  int RebuildMonitorAdm(std::string* error);
+  int AudioMonitorStop(std::string* error);
+  int AudioMonitorStatus(pu_audio_monitor_info* out, std::string* error);
+  // 在 signaling 线程上把已保存的选择真正写进通话 ADM（voice.join 之前调用）。
+  int ApplySelectedAudioDevices(std::string* error);
+
   // ---- 远端帧三槽缓冲 ----
   // 解码线程写、UI 线程读。写入方只在「没被 acquire 占用」的槽里转换，转完再把
   // 它挂成 ready；读取方拿到 ready 槽并置 busy，直到 release 才允许复用 ——
   // 读到的永远是完整一帧，不会撕裂；也不需要每帧分配。
+  //
+  // v2.14：每帧额外记录它属于哪次 watch（target + epoch）。pu_frame_acquire 只交付
+  // 与当前 arm 一致的帧；切源/停看后，旧槽即使还没被覆盖也不会冒充新目标。
   struct FrameSlot {
     std::vector<uint8_t> bytes;  // BGRA8，按需扩容后复用
     uint32_t width = 0;
@@ -750,6 +941,8 @@ class MediaEngine {
     uint32_t stride = 0;         // 如实行步长（当前 == width*4，但不做假设）
     int64_t timestamp_us = 0;
     uint64_t seq = 0;
+    std::string watch_target;    // 产生该帧的 watch 目标（legacy 为空）
+    uint64_t watch_epoch = 0;    // 产生该帧的 arm 代次
     bool busy = false;
   };
   static constexpr int kFrameSlots = 3;
@@ -765,7 +958,7 @@ class MediaEngine {
   int PeerStats(pu_stats* out);
 
   // v2：远端视频轨的 sink 回调，解码线程（worker）上被调用
-  void OnRemoteFrame(const webrtc::VideoFrame& frame);
+  void OnRemoteFrame(const webrtc::VideoFrame& frame, const WatchToken& token);
 
  private:
   void PumpLoop();
@@ -807,14 +1000,22 @@ class MediaEngine {
   void NegotiationEmitLoop(std::string signal_type,
                            webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc);
   std::string BuildLocalSdpWithCandidates(webrtc::PeerConnectionInterface* pc);
+  // v2.17：按**指定会话**的候选集合构造带候选的本地 SDP（发布会话用；不能读
+  // 引擎级的 gathered_candidates_，那是主屏幕 PC 的）。
+  std::string BuildLocalSdpWithCandidatesFor(
+      webrtc::PeerConnectionInterface* pc, const std::vector<CandidateCopy>& candidates);
   // v2.10 第 2 步：media 是该信令所属会话（kMediaVoice / kMediaScreen）。
   // 事件里没有 media 字段（ABI 不变），它随队列项走到 Poll，再由 pu_signal_media 查回。
-  void EmitSignal(const char* media, const char* type, const std::string& payload, uint32_t kind);
+  void EmitSignal(const char* media, const char* type, const std::string& payload, uint32_t kind,
+                  uint32_t session_token = 0);
   void ApplyBufferedCandidates();
   std::vector<CandidateCopy> SnapshotCandidates() const;
   void ResetSignalingStateLocked();
   // 等一个 ICE 收集完成的时刻（轮询，最多 kGatherTimeoutMs）
   bool WaitIceGatheringComplete(webrtc::PeerConnectionInterface* pc);
+  // v2.17：带超时的候选收集等待（严格会话的 offer/answer 用；不读屏幕协商的
+  // 停止标志，否则一次 screen.stop 会把正在建立的发布会话的 SDP 打断）。
+  bool WaitIceGatheringFor(webrtc::PeerConnectionInterface* pc, int timeout_ms);
 
   // ---- v2.10 第 1 步：语音独立 PeerConnection 的协商 helper ----
   // 与上面那组屏幕 helper 一一对应，只是把 pc_ / cand_mu_ / gathered_candidates_ /
@@ -842,6 +1043,40 @@ class MediaEngine {
   // 且 ~MediaEngine 里「Terminate → 释放本引用 → 释放工厂」也在 signaling 线程上，
   // 那时三条线程都还活着（见 dtor）。
   webrtc::scoped_refptr<webrtc::AudioDeviceModule> voice_adm_;
+  // 引擎级 ADM 的生命周期守卫：吞掉语音引擎/PC 析构带来的 Terminate（voice_adm_ 指向它）。
+  webrtc::scoped_refptr<partyup::AdmLifetimeProxy> adm_proxy_;
+
+  // ---- v2.15：音频设备选择与热切（复用上面同一个 ADM / 同一条语音轨）----
+  // controller_ 只在 signaling 线程上使用（与 ADM 的创建/Terminate 同线程）。
+  // port_ 把 ADM 的枚举/选择/启停/静音映射成窄接口；probe_ 读取 Windows 系统默认
+  // 端点的稳定 ID（与 ADM kDefaultDevice 的 eConsole 角色一致）。
+  std::unique_ptr<partyup::AdmAudioDevicePort> audio_port_;
+  std::unique_ptr<partyup::WasapiDefaultEndpointProbe> audio_default_probe_;
+  std::unique_ptr<partyup::AudioDeviceController> audio_device_controller_;
+  // ---- v2.18（AUD02）：独立输入电平监测 ----
+  // 与 audio_device_controller_ 共用同一条 voice_adm_；observer wrapper 在 Init 里
+  // 包住生产 ADM。monitor_ 的 callback 目标必须活到 ADM wrapper 释放后（见 dtor）。
+  // AUD02 post-voice：共享 ADM 在语音引擎释放后无法再起采集时，用这块重建的
+  // platform ADM 接管 monitor 录音。同一时刻只有一条录音栈：语音占用时禁止重建。
+  webrtc::scoped_refptr<webrtc::AudioDeviceModule> monitor_rebuild_adm_;
+  std::unique_ptr<partyup::AdmAudioDevicePort> monitor_rebuild_port_;
+  std::unique_ptr<partyup::AudioDeviceController> monitor_rebuild_controller_;
+  int adm_rebuild_count_ = 0;
+  std::unique_ptr<partyup::AudioMonitor> audio_monitor_;
+  std::unique_ptr<partyup::AdmAudioMonitorPort> audio_monitor_port_;
+  // 共享 ADM 实例计数（验收用：join/leave/monitor 循环不应增加实例数）。
+  int adm_live_ = 0;
+  // MonitorStart/Stop 与 VoiceJoin/Leave 共享同一个录音方向：用一把窄锁把
+  // 「停 monitor -> voice 接管」与「检查 voice -> monitor 启动」串行化。
+  std::mutex capture_owner_mu_;
+  // 本端电平 sink（挂在 voice_track_ 上，和远端计数 sink 同一种实现）。
+  // 远端音轨 sink（每个远端音频轨一个，计 pcmFrames/peak）。本端语音电平不走这里：
+  // m152 的本地 audio track 从不回调 AddSink 注册的 sink（真机实测 calls=0），
+  // v2.19 起改由 AudioMonitor 的 ADM 采集 observer 计算（见 SetVoiceLevelEnabled）。
+  // v2.19：与内容无关的语音采集 liveness 计数在 ADM observer 层统计（AudioMonitor::
+  // OnCapturePcm），静音也增长，不是电平。
+  // 共享 ADM 实例代次：引擎内每新建一块 ADM +1（多次 join/leave 不变 = 复用）。
+  std::atomic<uint32_t> adm_instance_serial_{0};
 
   // ---- v2.6：语音（1:1 直连）----
   bool voice_joined_ = false;            // 只在控制线程读写
@@ -922,8 +1157,51 @@ class MediaEngine {
   // ---- v2：PeerConnection ----
   webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc_;
   PcObserver* pc_observer_ = nullptr;   // 必须比 pc_ 活得久（析构里最后删）
-  RemoteFrameSink* remote_sink_ = nullptr;
-  webrtc::scoped_refptr<webrtc::VideoTrackInterface> remote_track_;
+  // v2.14：屏幕会话的远端视频轨与「当前 watch」的 sink。track 全部登记，
+  // 但只有匹配当前 arm 的 track 才挂 sink——未点 watch 不解码、不交付帧。
+  std::mutex video_mu_;
+  std::vector<webrtc::scoped_refptr<webrtc::VideoTrackInterface>> remote_video_tracks_;
+  struct VideoSinkAttachment {
+    webrtc::scoped_refptr<webrtc::VideoTrackInterface> track;
+    RemoteFrameSink* sink = nullptr;
+  };
+  std::vector<VideoSinkAttachment> video_sink_attachments_;
+  // 已 RemoveSink 但可能仍有解码线程回调在飞的 sink：不在回调返回前 delete，
+  // 统一延迟到引擎析构（三条线程都停后）再释放。切换次数有限，内存有界。
+  std::vector<RemoteFrameSink*> retired_video_sinks_;
+
+  // ---- v2.16（B2）：严格接收会话 ----
+  // recv_mu_ 保护会话对象与「当前 token/target」；帧回调只读原子量，不阻塞。
+  // receive_sink_attachments_ 与发布/legacy 的 video_sink_attachments_ 分开：
+  // 停共享（ReleaseStreamObjects）不会摘掉正在观看的接收 sink。
+  std::mutex recv_mu_;
+  std::unique_ptr<ReceiveSession> recv_session_;
+  // v2.17：接收会话与发送会话共用**同一个** token 计数器（引擎内唯一）。客户端
+  // 只看 SIGNAL_OUT.reserved 决定落到哪条会话；两套计数器会让「接收 1 / 发送 1」
+  // 在同一个引擎里撞车，客户端无法区分。
+  std::atomic<uint32_t> session_token_seq_{0};
+  std::atomic<uint32_t> recv_token_{0};
+  std::atomic<bool> recv_active_{false};
+  std::atomic<uint32_t> recv_frames_{0};
+  std::atomic<int64_t> recv_last_frame_ms_{0};
+  std::string recv_target_;  // 当前接收会话的标识（session_id），受 recv_mu_ 保护
+  std::vector<VideoSinkAttachment> receive_sink_attachments_;
+  // ---- v2.17（B2b direct）：共享者的 per-viewer 发送会话 ----
+  // publish_mu_ 与 recv_mu_ 同构：串行化 open/signal/close；PC 的创建/关闭都经
+  // signaling BlockingCall，回调（OnIceCandidate）不取本锁，因此不会互相等待。
+  // 会话数受服务端 direct 1v1 策略约束（本 API 不做容量判断）。
+  std::mutex publish_mu_;
+  std::map<std::string, std::shared_ptr<PublishSession>> publish_sessions_;
+  // watch 状态受 watch_mu_ 保护；epoch 只在 arm/unwatch/stop 时递增。
+  mutable std::mutex watch_mu_;
+  std::string watch_target_;
+  int32_t watch_slot_ = -1;
+  uint64_t watch_generation_ = 0;
+  // 一旦调用过 watch/unwatch，就进入「显式模式」：未 arm 时也不再自动挂 legacy sink。
+  // v1 客户端从不调用这两个入口，因此保持自动观看。
+  bool watch_explicit_ = false;
+  uint64_t watch_epoch_ = 0;
+  bool watch_armed_ = false;
   std::thread negotiator_;
   std::atomic<bool> negotiator_stop_{false};
   bool sharing_ = false;               // 本引擎是 offerer（自己发 offer）
@@ -1008,12 +1286,46 @@ class MediaEngine {
 // 由引擎 new 出来、在三条 webrtc 线程都 Stop 之后才 delete（见析构函数）。
 class MediaEngine::RemoteFrameSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
  public:
-  explicit RemoteFrameSink(MediaEngine* engine) : engine_(engine) {}
+  // token 是**挂 sink 时**的 watch 状态快照。回调里只比较 token 与当前状态，
+  // 绝不读取「当前目标」再给这一帧贴标——旧目标的迟到帧因此不会被误认为新目标。
+  RemoteFrameSink(MediaEngine* engine, WatchToken token)
+      : engine_(engine), token_(std::move(token)) {}
 
-  void OnFrame(const webrtc::VideoFrame& frame) override { engine_->OnRemoteFrame(frame); }
+  void OnFrame(const webrtc::VideoFrame& frame) override {
+    engine_->OnRemoteFrame(frame, token_);
+  }
 
  private:
   MediaEngine* const engine_;
+  const WatchToken token_;
+};
+
+// v2.16：严格接收会话的状态。定义必须早于任何读取它成员的函数（AcquireFrame）。
+struct MediaEngine::ReceiveSession {
+  std::string id;
+  uint32_t token = 0;
+  webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc;
+  ReceiveObserver* observer = nullptr;
+  bool has_remote_description = false;
+  // v2.17：真实 inbound-rtp 计数（网络层包/字节），与 frames_delivered 分开。
+  std::shared_ptr<MediaRtpCounters> counters;
+  // v2.17：本会话的候选（answer SDP 里补全，native↔native direct 需要）。
+  std::shared_ptr<CandidateSink> candidates;
+};
+
+// v2.17（B2b direct）：共享者侧的一条 per-viewer 发送会话。
+struct MediaEngine::PublishSession {
+  std::string id;
+  uint32_t token = 0;
+  webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc;
+  PublishObserver* observer = nullptr;
+  webrtc::scoped_refptr<webrtc::RtpSenderInterface> sender;
+  bool has_remote_description = false;
+  std::shared_ptr<MediaRtpCounters> counters;
+  // 本会话自己的候选：回调追加，offer SDP 里补全（不 trickle，避免 candidate
+  // 早于 offer 到达对端后被丢弃）。
+  std::shared_ptr<CandidateSink> candidates;
+  bool closed = false;
 };
 
 // PeerConnection 的回调。这里只写原子量 / 记录候选 / 挂 sink，绝不做阻塞等待：
@@ -1103,17 +1415,19 @@ class MediaEngine::PcObserver : public webrtc::PeerConnectionObserver {
   // M152 的 VideoTrackInterface 已经没有 SetSink()，能用的是
   // VideoTrackInterface::AddOrUpdateSink（基类里是空实现，虚分派会走
   // VideoTrack::AddOrUpdateSink）。
+  //
+  // v2.14：这里不再无条件挂引擎级 sink。远端轨先登记；只有匹配当前 watch 的轨
+  // 才挂带 token 的 sink（未点 watch 不解码/不交付）。登记/挂载都在 signaling 线程。
   void AttachVideoSink(webrtc::scoped_refptr<webrtc::RtpReceiverInterface> receiver) {
-    if (engine_->remote_sink_ == nullptr || receiver == nullptr) return;
+    if (receiver == nullptr) return;
     if (receiver->media_type() != webrtc::MediaType::VIDEO) return;
     webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track = receiver->track();
     if (track == nullptr || track->kind() != webrtc::MediaStreamTrackInterface::kVideoKind) {
       return;
     }
     auto* video_track = static_cast<webrtc::VideoTrackInterface*>(track.get());
-    video_track->AddOrUpdateSink(engine_->remote_sink_, webrtc::VideoSinkWants());
-    engine_->remote_track_ = video_track;
-    engine_->Log(3, "remote video track -> sink: id=%s kind=%s", track->id().c_str(),
+    engine_->AttachRemoteVideoTrack(video_track);
+    engine_->Log(3, "remote video track registered: id=%s kind=%s", track->id().c_str(),
                  track->kind().c_str());
   }
 
@@ -1139,7 +1453,7 @@ class MediaEngine::PcObserver : public webrtc::PeerConnectionObserver {
     const uint32_t peak_threshold = VoicePeakThresholdFromEnv();
     stat->sink = std::make_unique<AudioCountSink>(&stat->frames, &stat->peak,
                                                   &stat->last_frame_ms, &stat->max_peak,
-                                                  peak_threshold);
+                                                  nullptr, peak_threshold);
     audio_track->AddSink(stat->sink.get());
     engine_->audio_tracks_.push_back(std::move(stat));
     engine_->Log(3, "remote audio track -> sink: id=%s (total tracks=%zu, peakThreshold=%u)",
@@ -1194,6 +1508,11 @@ MediaEngine::~MediaEngine() {
   ReleaseVoiceSession();
   Log(3, "dtor: ReleaseVoiceSession() returned");
 
+  // v2.16：严格接收会话独立于屏幕/语音，销毁引擎前必须显式关闭；顺序在
+  // ReleaseStreamObjects / ReleaseVoiceSession 之后、三条线程 Stop 之前。
+  CloseReceive(nullptr, nullptr);
+  Log(3, "dtor: CloseReceive() returned");
+
   // 工厂是 PeerConnectionFactoryProxy：它的析构会把内部 PeerConnectionFactory
   // 投递回 signaling 线程（并在控制线程上等待）。这里显式地在 signaling 线程上
   // 释放，把「webrtc 对象的归属线程」写成契约，而不是依赖 proxy 的实现细节；
@@ -1201,20 +1520,56 @@ MediaEngine::~MediaEngine() {
   if (signaling_ != nullptr) {
     signaling_->BlockingCall([this] {
       Log(3, "dtor: destroying factory (signaling thread)");
-      // 真 ADM 的生命周期契约：Terminate 与析构都必须与创建同线程（signaling）。
-      // 顺序：先 Terminate（停掉 WASAPI 采集/播放），再释放工厂（它持有一份引用），
-      // 最后释放本类持有的引用 —— 两条引用都在本线程释放，析构线程才是确定的。
-      if (voice_adm_ != nullptr) {
-        voice_adm_->Terminate();
-        Log(3, "dtor: voice ADM terminated");
+      // v2.18（AUD02）：monitor 的 observer 由 ADM wrapper 独占并持有 AudioMonitor
+      // 裸指针。顺序：停输入 -> Terminate -> 脱离端口 -> 释放工厂和ADM wrapper
+      // -> 销毁monitor及端口。不能在wrapper之前删掉它的callback目标。
+      if (audio_monitor_ != nullptr) {
+        std::string monitor_error;
+        (void)audio_monitor_->Stop(&monitor_error);
       }
+      // 真 ADM 的生命周期契约：Terminate 与析构都必须与创建同线程（signaling）。
+      if (voice_adm_ != nullptr) {
+        // 引擎析构是唯一真实终止点；先放开守卫再 Terminate 一次。
+        if (adm_proxy_ != nullptr) {
+          adm_proxy_->SetAllowTerminate(true);
+          Log(3, "dtor: ADM terminate calls=%d suppressed=%d", adm_proxy_->terminate_calls(),
+              adm_proxy_->suppressed_terminate_calls());
+        }
+        voice_adm_->Terminate();
+        --adm_live_;
+        Log(3, "dtor: voice ADM terminated");
+        Log(3, "dtor: ADM instances live=%d", adm_live_);
+      }
+      // Detach even after Stop/Terminate failure: monitor destruction must not
+      // retry into a terminated ADM, and late PCM must not touch a dead port.
+      if (audio_monitor_ != nullptr) audio_monitor_->Bind(nullptr);
+      // 重建出来的 monitor ADM 也要按自己的所有权终止（它不属于工厂）。
+      if (monitor_rebuild_adm_ != nullptr) {
+        (void)monitor_rebuild_adm_->StopRecording();
+        monitor_rebuild_adm_->Terminate();
+        --adm_live_;
+        Log(3, "dtor: rebuilt monitor ADM terminated");
+      }
+      audio_monitor_port_.reset();
+      monitor_rebuild_controller_.reset();
+      monitor_rebuild_port_.reset();
+      monitor_rebuild_adm_ = nullptr;
+      // Observer owns a raw monitor pointer. Keep its target alive until both
+      // factory and ADM references (and therefore the wrapper) are released.
       pc_factory_ = nullptr;
       voice_adm_ = nullptr;
+      adm_proxy_ = nullptr;
+      audio_monitor_.reset();
+      audio_device_controller_.reset();
+      audio_port_.reset();
+      audio_default_probe_.reset();
+      Log(3, "dtor: ADM instances live=%d (rebuilds=%d)", adm_live_, adm_rebuild_count_);
       Log(3, "dtor: voice ADM released");
     });
   } else {
     pc_factory_ = nullptr;
     voice_adm_ = nullptr;
+    adm_proxy_ = nullptr;
   }
   Log(3, "dtor: factory released");
 
@@ -1230,10 +1585,25 @@ MediaEngine::~MediaEngine() {
   network_.reset();
   Log(3, "dtor: thread objects destroyed");
 
-  // 三条 webrtc 线程都停了，才删「可能被它们回调」的对象：远端 sink（解码线程）
-  // 与 PC 观察者（signaling 线程）。这样即使有回调在飞也没有线程能再碰它们。
-  delete remote_sink_;
-  remote_sink_ = nullptr;  delete pc_observer_;
+  // 三条 webrtc 线程都停了，才删「可能被它们回调」的对象：PC 观察者（signaling 线程）。
+  // v2.14：远端视频 sink 在 ReleaseStreamObjects 里已按 track 摘除并释放；这里只需
+  // 保证兜底清空（release 失败路径也不会留下悬空 sink）。
+  {
+    std::lock_guard<std::mutex> lock(video_mu_);
+    for (auto& attachment : video_sink_attachments_) {
+      if (attachment.track != nullptr && attachment.sink != nullptr) {
+        attachment.track->RemoveSink(attachment.sink);
+      }
+      delete attachment.sink;
+    }
+    video_sink_attachments_.clear();
+    remote_video_tracks_.clear();
+    for (auto* sink : retired_video_sinks_) {
+      delete sink;
+    }
+    retired_video_sinks_.clear();
+  }
+  delete pc_observer_;
   pc_observer_ = nullptr;
   // v2.12：语音 observer 的常规回收在 dtor 上方那次 ReleaseVoiceSession()（v2.12 起
   // ReleaseStreamObjects 不再顺带收语音，所以那次调用是**必需**的，不是「可能已跑过」）。
@@ -1391,15 +1761,66 @@ bool MediaEngine::Init(const pu_config* cfg, std::string* error) {
   //     signaling 线程，且此刻三条线程都还没 Stop。
   signaling_->BlockingCall([&] {
     const webrtc::Environment adm_env = webrtc::CreateEnvironment();
-    voice_adm_ = webrtc::CreateAudioDeviceModule(
-        adm_env, webrtc::AudioDeviceModule::kPlatformDefaultAudio);
+    webrtc::scoped_refptr<webrtc::AudioDeviceModule> platform_adm =
+        webrtc::CreateAudioDeviceModule(adm_env,
+                                        webrtc::AudioDeviceModule::kPlatformDefaultAudio);
+    if (platform_adm == nullptr) return;
+    // v2.18（AUD02）：用官方 observer wrapper 包住生产 ADM。monitor 必须先创建，
+    // observer 只持有它的裸指针；monitor 必须活到 ADM wrapper 被释放之后。
+    // 这里不手工 Init：需要设备时由端口按 ADM 生命周期幂等补 Init
+    // （见 AdmAudioDevicePort::EnsureInitialized），避免破坏 ADM 状态机。
+    audio_monitor_ = std::make_unique<partyup::AudioMonitor>();
+    audio_monitor_->SetLogSink([this](int level, const std::string& message) {
+      Log(level, "%s", message.c_str());
+    });
+    // 引擎级 ADM 契约：platform ADM 由本引擎持有，factory/PC 只借用；语音引擎随 PC
+    // 析构时的 Terminate 被代理吞掉（否则 Windows ADM 之后无法再起采集 → 二次入会静默
+    // 失声）。真实 Terminate 只在引擎析构时发生一次。
+    adm_proxy_ = partyup::AdmLifetimeProxy::Create(webrtc::CreateAudioDeviceWithDataObserver(
+        std::move(platform_adm),
+        std::make_unique<partyup::AudioMonitorDataObserver>(audio_monitor_.get())));
+    voice_adm_ = adm_proxy_;
+    Log(3, "audio: voice ADM wrapper=%p (engine-owned ADM, lifetime guard=%p)",
+        static_cast<void*>(voice_adm_.get()), static_cast<void*>(adm_proxy_.get()));
+    ++adm_live_;
+    Log(3, "audio: ADM instances live=%d instance=%u", adm_live_,
+        adm_instance_serial_.fetch_add(1, std::memory_order_relaxed) + 1);
   });
   if (voice_adm_ == nullptr) {
-    *error = "CreateAudioDeviceModule(kPlatformDefaultAudio) returned null";
+    *error = "CreateAudioDeviceWithDataObserver(kPlatformDefaultAudio) returned null";
     SetLastError(*error);
     return false;
   }
   deps.adm = voice_adm_;
+  // v2.15：设备控制器与 ADM 同线程创建，之后所有枚举/选择/停启都在 signaling 线程。
+  // 端口直接复用上面这块 voice_adm_（不另建录音栈）；探针读 Windows 默认端点稳定 ID。
+  signaling_->BlockingCall([&] {
+    audio_port_ = std::make_unique<partyup::AdmAudioDevicePort>(voice_adm_.get());
+    audio_port_->SetLogSink([this](int level, const std::string& message) {
+      Log(level, "%s", message.c_str());
+    });
+    audio_default_probe_ = std::make_unique<partyup::WasapiDefaultEndpointProbe>();
+    audio_device_controller_ = std::make_unique<partyup::AudioDeviceController>();
+    audio_device_controller_->Init(audio_port_.get(), audio_default_probe_.get());
+    audio_device_controller_->SetLogSink([this](int level, const std::string& message) {
+      Log(level, "%s", message.c_str());
+    });
+    // 观测点：引擎刚建好时 ADM **尚未 Init()**——生产工厂要到第一个 PeerConnection
+    // 的 AudioState/WebRtcVoiceEngine::Init 才第一次调用 ADM::Init。m152 的
+    // AudioDeviceModuleImpl::RecordingDevices()/PlayoutDevices() 在未初始化时直接
+    // 返回 -1，所以这两行此刻应为 initialized=0 in=-1 out=-1。
+    Log(3, "audio: ADM before factory: initialized=%d devices(in=%d out=%d)",
+        voice_adm_->Initialized() ? 1 : 0, voice_adm_->RecordingDevices(),
+        voice_adm_->PlayoutDevices());
+    // AUD02：monitor 的端口只转发到上面同一块 controller/ADM；纯 Module 不依赖
+    // webrtc，fake 回归直接编译同一份 audio_monitor.cpp。
+    audio_monitor_port_ = std::make_unique<partyup::AdmAudioMonitorPort>(
+        voice_adm_.get(), audio_device_controller_.get(), signaling_.get());
+    audio_monitor_port_->SetLogSink([this](int level, const std::string& message) {
+      Log(level, "%s", message.c_str());
+    });
+    if (audio_monitor_ != nullptr) audio_monitor_->Bind(audio_monitor_port_.get());
+  });
   webrtc::EnableMedia(deps);
 
   pc_factory_ = webrtc::CreateModularPeerConnectionFactory(std::move(deps));
@@ -1407,6 +1828,14 @@ bool MediaEngine::Init(const pu_config* cfg, std::string* error) {
     *error = "CreateModularPeerConnectionFactory returned null";
     SetLastError(*error);
     return false;
+  }
+
+  // 共享 ADM 在语音会话期间由工厂的 WebRtcVoiceEngine 在 worker 线程上
+  // Init()/Terminate()；之后再从 signaling 线程调 InitRecording 会持续失败
+  // （真机实测 initialized=1/mic_initialized=1 仍 rc=-1）。把 monitor 的 ADM 调用
+  // 也投递到 worker 线程，与语音引擎同线程，避免跨线程驱动同一块 ADM。
+  if (audio_monitor_port_ != nullptr) {
+    audio_monitor_port_->SetAdmThread(worker_.get());
   }
 
   // 探一下媒体引擎真的装上了：拿不到视频发送编解码器就是 EnableMedia 没生效。
@@ -1429,10 +1858,10 @@ bool MediaEngine::Init(const pu_config* cfg, std::string* error) {
   }
   Log(3, "media engine ok, send video codecs:%s", codec_list.c_str());
 
-  // v2：远端帧 sink 与 PeerConnection 观察者提前建好。两者都比 PC 活得久：
-  // sink 可能被解码线程回调到最后一刻，observer 由 PC 在 signaling 线程上调用，
+  // v2：PeerConnection 观察者提前建好。observer 由 PC 在 signaling 线程上调用，
   // 所以只在析构函数里、三条线程都 Stop 之后才删。
-  remote_sink_ = new RemoteFrameSink(this);
+  // v2.14：远端视频 sink 改成按远端轨/按 watch 代次动态创建（见 AttachRemoteVideoTrack），
+  // 不再有引擎级单 sink——单 sink 会把多路远端视频混成一帧流，无法做目标归属。
   pc_observer_ = new PcObserver(this);
   // v2.10：语音会话有自己的 observer（voice=true → 状态/候选/本地 SDP 分流到语音那套成员）。
   // 它的生命周期跟 voice_pc_ 绑定，由 ReleaseVoiceSession() 释放；这里先建好，
@@ -1973,11 +2402,30 @@ void MediaEngine::ApplyVideoSenderParamsOnSignalingThread() {
 int MediaEngine::Stop() {
   std::lock_guard<std::mutex> control_lock(control_mu_);
   Log(3, "stop: enter (running=%d)", running_ ? 1 : 0);
+  // v2.14：停屏/换会话语义下先撤掉 watch（解绑远端 sink、清 ready 帧），
+  // 避免 stop 之后旧目标的迟到帧还被交付。仅对「显式观看」会话做，
+  // legacy（从未 watch）保持自动观看，Stop 不能把它永久切到手动模式。
+  {
+    bool need_unwatch = false;
+    {
+      std::lock_guard<std::mutex> lock(watch_mu_);
+      need_unwatch = watch_armed_ || watch_explicit_;
+    }
+    if (need_unwatch) UnwatchTarget(nullptr, nullptr);
+  }
   // v2：先停协商线程。它会在 ICE 收集完成后往事件队列推一条信令，必须在关闭 PC
   // 之前收掉，否则会出现「stop 之后还冒出一条 offer」。
   negotiator_stop_.store(true, std::memory_order_relaxed);
   if (negotiator_.joinable()) negotiator_.join();
   Log(3, "stop: negotiator joined");
+
+  // v2.17（B2b direct）：停共享/引擎收尾时关闭所有 per-viewer 发送会话。它们复用
+  // 本端视频轨与采集源，采集一停这些传输就没有意义；观看侧接收会话独立于此，
+  // 不在这里关闭（停看只关接收、停发只关发送，两条生命周期不互相牵连）。
+  {
+    std::lock_guard<std::mutex> publish_lock(publish_mu_);
+    CloseAllPublishSessionsLocked();
+  }
 
   if (!running_) {
     // 正常路径是幂等返回；但如果 start() 在中途抛异常，采集线程可能已经起来而
@@ -2036,18 +2484,14 @@ void MediaEngine::DetachAllAudioSinks() {
 }
 
 void MediaEngine::ReleaseStreamObjects() {
-  Log(3, "release: enter (pc=%d track=%d remote_track=%d)", pc_ != nullptr ? 1 : 0,
-      track_ != nullptr ? 1 : 0, remote_track_ != nullptr ? 1 : 0);
+  Log(3, "release: enter (pc=%d track=%d)", pc_ != nullptr ? 1 : 0, track_ != nullptr ? 1 : 0);
   // 顺序照抄 spike：先 Close()，再释放 track / pc；这三件事都必须在 signaling
   // 线程上做（VideoTrack 与 PeerConnection 的方法都有线程断言）。
   if (signaling_ != nullptr) {
     signaling_->BlockingCall([this] {
+      // v2.14：先摘掉所有远端视频 sink（它们可能仍在解码线程回调），再关 PC。
+      DetachAllVideoSinksLocked();
       if (pc_ != nullptr) {
-        // 摘远端 sink 要在释放 track / PC 之前，且只能在 signaling 线程。
-        if (remote_track_ != nullptr && remote_sink_ != nullptr) {
-          remote_track_->RemoveSink(remote_sink_);
-        }
-        remote_track_ = nullptr;
         // v2.12（第 4 步紧急修复）：这里**不再**调 DetachAllAudioSinks()。
         // 远端音频 sink 属于**语音会话**，和屏幕 PC 没有关系；屏幕停止时摘掉它们会让
         // 语音 PCM 计数直接归零（UI 上就是「一共享就没声」）。语音侧的摘除统一由
@@ -2063,7 +2507,10 @@ void MediaEngine::ReleaseStreamObjects() {
     track_ = nullptr;
     video_sender_ = nullptr;
     pc_ = nullptr;
-    remote_track_ = nullptr;
+  }
+  {
+    std::lock_guard<std::mutex> lock(video_mu_);
+    remote_video_tracks_.clear();
   }
   Log(3, "release: pc/track closed and released");
   {
@@ -2099,6 +2546,8 @@ void MediaEngine::ReleaseStreamObjects() {
 void MediaEngine::ReleaseVoiceSession() {
   Log(3, "release-voice: enter (pc=%d joined=%d)", voice_pc_ != nullptr ? 1 : 0,
       voice_joined_ ? 1 : 0);
+  // v2.19：会话结束就关掉语音电平表，免得下一段会话读到的还是上段的 peak/rms。
+  if (audio_monitor_ != nullptr) audio_monitor_->SetVoiceLevelEnabled(false);
   // 1) 协商线程先收掉。它会在 ICE 收集完成后往事件队列推 answer/offer ——
   //    「stop 之后还冒出一条信令」就是漏了这一 join。
   voice_negotiator_stop_.store(true, std::memory_order_relaxed);
@@ -2631,7 +3080,25 @@ bool MediaEngine::WaitIceGatheringComplete(webrtc::PeerConnectionInterface* pc) 
   return false;
 }
 
+bool MediaEngine::WaitIceGatheringFor(webrtc::PeerConnectionInterface* pc, int timeout_ms) {
+  if (pc == nullptr || signaling_ == nullptr) return false;
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  while (std::chrono::steady_clock::now() < deadline) {
+    const auto state =
+        signaling_->BlockingCall([pc] { return pc->ice_gathering_state(); });
+    if (state == webrtc::PeerConnectionInterface::kIceGatheringComplete) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  return false;
+}
+
 std::string MediaEngine::BuildLocalSdpWithCandidates(webrtc::PeerConnectionInterface* pc) {
+  return BuildLocalSdpWithCandidatesFor(pc, SnapshotCandidates());
+}
+
+std::string MediaEngine::BuildLocalSdpWithCandidatesFor(
+    webrtc::PeerConnectionInterface* pc, const std::vector<CandidateCopy>& candidates) {
   if (pc == nullptr) return {};
   const webrtc::SessionDescriptionInterface* local = pc->local_description();
   if (local == nullptr) return {};
@@ -2644,7 +3111,7 @@ std::string MediaEngine::BuildLocalSdpWithCandidates(webrtc::PeerConnectionInter
 
   int added = 0;
   int already = 0;
-  for (const CandidateCopy& candidate : SnapshotCandidates()) {
+  for (const CandidateCopy& candidate : candidates) {
     if (base.find(candidate.sdp) != std::string::npos) {
       ++already;
       continue;
@@ -2699,12 +3166,14 @@ void MediaEngine::NegotiationEmitLoop(
 }
 
 void MediaEngine::EmitSignal(const char* media, const char* type, const std::string& payload,
-                             uint32_t kind) {
+                             uint32_t kind, uint32_t session_token) {
   pu_event event = MakeEvent(PU_EVENT_SIGNAL_OUT);
   event.data.signal.payload = nullptr;  // 真正投递时才填，见 Poll
   event.data.signal.payload_len = static_cast<uint32_t>(payload.size());
   event.data.signal.kind = kind;
-  event.data.signal.reserved = 0;
+  // v2.16：reserved 复用为接收会话 token（0 = 旧会话/非接收会话）。客户端按它
+  // 把 answer 路由回正确的 receive session，迟到 answer 不会被贴到新会话上。
+  event.data.signal.reserved = session_token;
   stat_signal_out_.fetch_add(1, std::memory_order_relaxed);
   Log(3, "signal out [%s]: %s (%zu bytes)", media != nullptr ? media : "?", type, payload.size());
   PushEventWithPayload(event, payload, media != nullptr ? media : std::string());
@@ -3041,8 +3510,11 @@ int MediaEngine::PeerStats(pu_stats* out) {
       }
     }
     out->frames_received = total_frames;
-    Log(3, "voice stats: tracks=%zu active=%zu pcmFrames=%u peak=%u", tracks, active,
-        total_frames, max_peak);
+    Log(3, "voice stats: tracks=%zu active=%zu pcmFrames=%u peak=%u | voiceLevel frames=%u peak=%u rms=%u (ADM capture observer)", tracks, active,
+        total_frames, max_peak,
+        audio_monitor_ != nullptr ? audio_monitor_->VoiceLevelFrames() : 0,
+        audio_monitor_ != nullptr ? audio_monitor_->VoiceLevelPeak() : 0,
+        audio_monitor_ != nullptr ? audio_monitor_->VoiceLevelRms() : 0);
   }
   out->signal_out_count = stat_signal_out_.load(std::memory_order_relaxed);
   {
@@ -3066,18 +3538,21 @@ int MediaEngine::PeerStats(pu_stats* out) {
   return PU_OK;
 }
 
-void MediaEngine::OnRemoteFrame(const webrtc::VideoFrame& frame) {
-  const uint32_t received =
-      stat_frames_received_.fetch_add(1, std::memory_order_relaxed) + 1;
-  const uint64_t sequence = stat_remote_sequence_.fetch_add(1, std::memory_order_relaxed);
-  stat_remote_width_.store(frame.width(), std::memory_order_relaxed);
-  stat_remote_height_.store(frame.height(), std::memory_order_relaxed);
-  stat_last_remote_us_.store(NowUsSystem(), std::memory_order_relaxed);
-  if (received == 1) {
-    Log(3, "first remote frame: %dx%d ts=%lld", frame.width(), frame.height(),
-        static_cast<long long>(frame.timestamp_us()));
+void MediaEngine::OnRemoteFrame(const webrtc::VideoFrame& frame, const WatchToken& token) {
+  // v2.14：先做目标/代次归属判定。旧目标的迟到帧在这里被丢弃，不计数、不写帧槽、
+  // 也不发 REMOTE_FRAME 事件——上层不可能再看到它。
+  if (!FrameAccepted(token)) {
+    // watch_epoch_ 受 watch_mu_ 保护；日志读取也必须持锁，不能裸读（-race/数据竞争）。
+    uint64_t armed_epoch = 0;
+    {
+      std::lock_guard<std::mutex> lock(watch_mu_);
+      armed_epoch = watch_epoch_;
+    }
+    Log(3, "drop stale remote frame: token=%s/%llu armed_epoch=%llu", token.target.c_str(),
+        static_cast<unsigned long long>(token.epoch),
+        static_cast<unsigned long long>(armed_epoch));
+    return;
   }
-
   // v2.5：把解码后的 I420 转成 BGRA 存进三槽之一，供 pu_frame_acquire 取用。
   // 只在解码线程写：先挑一个没被 acquire 占用的槽（占用中的绝不碰），转换完成
   // 后再挂成 ready —— 读取方看到 ready 时像素一定是完整的。
@@ -3110,12 +3585,22 @@ void MediaEngine::OnRemoteFrame(const webrtc::VideoFrame& frame) {
                              i420->StrideU(), i420->DataV(), i420->StrideV(),
                              slot.bytes.data(), static_cast<int>(stride), width,
                              height);
+          // 转换期间可能已经 unwatch/换台：发布 ready 前再确认一次 token 仍被接受。
+          // 仅靠入口检查不够——旧回调在 Unwatch 清帧之后才写回 ready，会把旧画面重新
+          // 挂出来。AcquireFrame 侧还有 armed/epoch 兜底，这里是第二道防线。
+          if (!FrameAccepted(token)) {
+            Log(3, "drop remote frame finished after watch changed: token=%s/%llu",
+                token.target.c_str(), static_cast<unsigned long long>(token.epoch));
+            return;
+          }
           std::lock_guard<std::mutex> lock(frame_mu_);
           slot.width = static_cast<uint32_t>(width);
           slot.height = static_cast<uint32_t>(height);
           slot.stride = stride;
           slot.timestamp_us = frame.timestamp_us();
           slot.seq = ++frame_ready_seq_;
+          slot.watch_target = token.target;
+          slot.watch_epoch = token.epoch;
           frame_ready_slot_ = slot_index;
           frame_write_slot_ = (slot_index + 1) % kFrameSlots;
           picked_width = width;
@@ -3123,6 +3608,29 @@ void MediaEngine::OnRemoteFrame(const webrtc::VideoFrame& frame) {
       }
       static_cast<void>(picked_width);
     }
+  }
+
+  // 转换/发布期间可能已经 unwatch/换台：被丢弃的帧不计数、不发 REMOTE_FRAME 事件。
+  // 真正交付的像素由 AcquireFrame 再按 armed/epoch 校验（第二道，覆盖检查后的竞态）。
+  if (!FrameAccepted(token)) {
+    Log(3, "drop remote frame before publish/event: token=%s/%llu", token.target.c_str(),
+        static_cast<unsigned long long>(token.epoch));
+    return;
+  }
+  const uint32_t received =
+      stat_frames_received_.fetch_add(1, std::memory_order_relaxed) + 1;
+  // v2.16：接收会话计数只增自己的；旧会话关闭后它的计数不再变化，新会话从 0 起。
+  if (token.session_token != 0) {
+    recv_frames_.fetch_add(1, std::memory_order_relaxed);
+    recv_last_frame_ms_.store(NowUsSteady() / 1000, std::memory_order_relaxed);
+  }
+  const uint64_t sequence = stat_remote_sequence_.fetch_add(1, std::memory_order_relaxed);
+  stat_remote_width_.store(frame.width(), std::memory_order_relaxed);
+  stat_remote_height_.store(frame.height(), std::memory_order_relaxed);
+  stat_last_remote_us_.store(NowUsSystem(), std::memory_order_relaxed);
+  if (received == 1) {
+    Log(3, "first remote frame: %dx%d ts=%lld", frame.width(), frame.height(),
+        static_cast<long long>(frame.timestamp_us()));
   }
 
   pu_event event = MakeEvent(PU_EVENT_REMOTE_FRAME);
@@ -3142,23 +3650,73 @@ int MediaEngine::AcquireFrame(const char* stream_id, pu_frame* out) {
     SetLastError("pu_frame_acquire: out is null");
     return PU_ERR_INVALID_ARG;
   }
+  // 兼容约定（旧客户端签名/结构不变）：
+  //   * 空串与 "remote" 是**通配**：表示「当前选台」，交付当前 watch 目标（或 legacy）的帧；
+  //     C# 侧沿用 MediaEngine.RemoteStreamId == "remote"，不能因为 armed 后 target 非空
+  //     就被当成「未知流」拒绝——这正是显式观看永远取不到帧的原因。
+  //   * 其它字符串按**目标 member id**理解：必须与当前 arm 的目标一致，否则明确拒绝。
+  //     未 arm 时不存在任何目标，显式目标也没有一致语义，返回 INVALID_ARG。
   const std::string requested = stream_id != nullptr ? stream_id : "";
-  if (!requested.empty() && requested != "remote") {
-    SetLastError("pu_frame_acquire: unknown stream_id '" + requested + "'");
-    return PU_ERR_INVALID_ARG;
-  }
+  const bool current_stream = requested.empty() || requested == "remote";
   if (out->struct_size != 0 && out->struct_size < sizeof(pu_frame)) {
     SetLastError("pu_frame_acquire: pu_frame.struct_size is smaller than the ABI struct");
     return PU_ERR_INVALID_ARG;
   }
 
+  // v2.14：armed 时只交付当前目标/代次的帧。切源或停看之后，旧槽里的最后一帧
+  // 即使还没被覆盖也不能交出去——否则 UI 会把旧目标的画面贴到新目标上。
+  std::string current_target;
+  uint64_t current_epoch = 0;
+  bool armed = false;
+  bool explicit_mode = false;
+  {
+    std::lock_guard<std::mutex> watch_lock(watch_mu_);
+    current_target = watch_target_;
+    current_epoch = watch_epoch_;
+    armed = watch_armed_;
+    explicit_mode = watch_explicit_;
+  }
+  // v2.16：独立接收会话优先于 legacy watch 状态：它的帧按会话 token 归属。
+  if (recv_active_.load(std::memory_order_relaxed)) {
+    std::lock_guard<std::mutex> recv_lock(recv_mu_);
+    if (recv_session_ != nullptr && recv_active_.load(std::memory_order_relaxed)) {
+      armed = true;
+      explicit_mode = true;
+      current_target = recv_session_->id;
+      current_epoch = recv_session_->token;
+    }
+  }
+  if (!current_stream) {
+    if (!armed) {
+      SetLastError("pu_frame_acquire: no active watch target for stream_id '" + requested + "'");
+      return PU_ERR_INVALID_ARG;
+    }
+    if (requested != current_target) {
+      SetLastError("pu_frame_acquire: stream_id is not the currently watched target");
+      return PU_ERR_INVALID_ARG;
+    }
+  }
+
   std::lock_guard<std::mutex> lock(frame_mu_);
+  if (!armed && explicit_mode) {
+    // 显式观看模式下未 arm：即使 ready 槽里还有 legacy 遗留帧、或有 in-flight 的旧回调
+    // 刚刚写回一帧，也绝不交付。清掉 ready 让调用方继续等，而不是把旧画面贴出来。
+    frame_ready_slot_ = -1;
+    return PU_ERR_TIMEOUT;
+  }
   if (frame_ready_slot_ < 0 ||
       frame_slots_[frame_ready_slot_].seq <= frame_served_seq_) {
     // 还没比上次更新过的帧：这是「未就绪」，不是失败。
     return PU_ERR_TIMEOUT;
   }
   FrameSlot& slot = frame_slots_[frame_ready_slot_];
+  if (armed) {
+    if (slot.watch_epoch != current_epoch || slot.watch_target != current_target) {
+      // 旧代次/旧目标的帧：丢弃并清 ready，让调用方等下一帧（新目标到达后会覆盖）。
+      frame_ready_slot_ = -1;
+      return PU_ERR_TIMEOUT;
+    }
+  }
   slot.busy = true;
   frame_acquired_slot_ = frame_ready_slot_;
   frame_ready_slot_ = -1;
@@ -3170,7 +3728,9 @@ int MediaEngine::AcquireFrame(const char* stream_id, pu_frame* out) {
   out->stride = slot.stride;
   out->timestamp_us = slot.timestamp_us;
   out->pixels = slot.bytes.data();
-  out->stream_id = 1;  // 当前只有远端视频流
+  // stream_id 保持「不透明」：armed 时用 epoch 让调用方/测试能确认代次切换；
+  // legacy（从未 watch）仍是 1，与 v2 行为一致。
+  out->stream_id = armed ? (current_epoch == 0 ? 1 : current_epoch) : 1;
   return PU_OK;
 }
 
@@ -3186,6 +3746,1373 @@ void MediaEngine::ReleaseFrame(pu_frame* frame) {
   }
   frame_slots_[frame_acquired_slot_].busy = false;
   frame_acquired_slot_ = -1;
+}
+
+// ---------------------------------------------------------------------------
+// v2.14：显式单流观看（目标 + 槽位 + 代次）
+// ---------------------------------------------------------------------------
+bool MediaEngine::TrackMatchesWatchLocked(const std::string& track_id) const {
+  // 调用方必须持有 watch_mu_。
+  if (!watch_armed_) return false;
+  if (watch_slot_ < 0) return true;  // direct：远端 PC 只有一条视频轨
+  char expected[64] = {0};
+  std::snprintf(expected, sizeof(expected), "partyup-video-slot-%02d", watch_slot_);
+  return track_id == expected;
+}
+
+bool MediaEngine::FrameAccepted(const WatchToken& token) const {
+  // v2.16：独立接收会话的帧只认「产生它的会话 token」，与 legacy watch 状态无关。
+  // close 先置 active=false，再摘 sink；因此关闭后的迟到帧立即被拒。
+  if (token.session_token != 0) {
+    return recv_active_.load(std::memory_order_relaxed) &&
+           token.session_token == recv_token_.load(std::memory_order_relaxed);
+  }
+  std::lock_guard<std::mutex> lock(watch_mu_);
+  if (!watch_armed_) {
+    // 显式观看（调用过 watch/unwatch，或 pu_screen_unwatch 预先切到显式模式）在未 arm
+    // 时必须严格拒帧：不能因为旧 sink 的 token.armed=false / epoch=0 就当成 legacy 放行。
+    if (watch_explicit_) return false;
+    // 真正的 legacy（从未调用过显式观看）：只接受未 armed 时挂上的 sink 产出的帧。
+    return !token.armed && token.epoch == 0;
+  }
+  return token.armed && token.epoch == watch_epoch_ && token.target == watch_target_;
+}
+
+void MediaEngine::AttachRemoteVideoTrack(webrtc::VideoTrackInterface* track) {
+  if (track == nullptr) return;
+  webrtc::scoped_refptr<webrtc::VideoTrackInterface> track_ref(track);
+  const std::string id = track_ref->id();
+  std::lock_guard<std::mutex> video_lock(video_mu_);
+  for (const auto& existing : remote_video_tracks_) {
+    if (existing != nullptr && existing->id() == id) return;
+  }
+  remote_video_tracks_.push_back(track_ref);
+
+  WatchToken token;
+  bool matched = false;
+  bool armed = false;
+  bool explicit_mode = false;
+  int32_t armed_slot = -1;
+  {
+    std::lock_guard<std::mutex> watch_lock(watch_mu_);
+    armed = watch_armed_;
+    explicit_mode = watch_explicit_;
+    armed_slot = watch_slot_;
+    if (armed) {
+      matched = TrackMatchesWatchLocked(id);
+      if (matched) {
+        token.target = watch_target_;
+        token.slot = watch_slot_;
+        token.epoch = watch_epoch_;
+        token.armed = true;
+      }
+    }
+  }
+  if (armed && !matched) {
+    // 已 arm，但这路 track 不是当前目标（例如 relay 的另一个槽）：登记但绝不挂 sink。
+    Log(3, "remote video track %s registered but not watched (slot=%d)", id.c_str(),
+        static_cast<int>(armed_slot));
+    return;
+  }
+  if (!armed && explicit_mode) {
+    // 新客户端（显式观看）尚未 arm：不自动挂 sink；等 pu_screen_watch_ex 后由
+    // RebindVideoSinksLocked 统一挂上。注意不能写成「只要 explicit 就 return」：
+    // watch 先到、OnTrack 后到时 armed && matched 也必须在这里挂 sink。
+    Log(3, "remote video track %s registered (explicit mode, not watched)", id.c_str());
+    return;
+  }
+  // legacy（从未调用过 watch/unwatch）或「watch 先到、track 后到」：都要挂 sink。
+  // token 已在上面按 arm 时状态固定；旧回调不会读当前全局 epoch 重新贴标。
+  auto* sink = new RemoteFrameSink(this, token);
+  track->AddOrUpdateSink(sink, webrtc::VideoSinkWants());
+  VideoSinkAttachment attachment;
+  attachment.track = track_ref;
+  attachment.sink = sink;
+  video_sink_attachments_.push_back(std::move(attachment));
+  Log(3, "remote video sink attached: id=%s armed=%d target=%s epoch=%llu", id.c_str(),
+      token.armed ? 1 : 0, token.target.c_str(),
+      static_cast<unsigned long long>(token.epoch));
+}
+
+void MediaEngine::DetachAllVideoSinksLocked() {
+  // 调用方必须保证在 signaling 线程且没有持 watch_mu_。
+  std::lock_guard<std::mutex> lock(video_mu_);
+  for (auto& attachment : video_sink_attachments_) {
+    if (attachment.track != nullptr && attachment.sink != nullptr) {
+      attachment.track->RemoveSink(attachment.sink);
+    }
+    retired_video_sinks_.push_back(attachment.sink);
+  }
+  video_sink_attachments_.clear();
+}
+
+void MediaEngine::RebindVideoSinksLocked() {
+  // 调用方必须保证在 signaling 线程。
+  DetachAllVideoSinksLocked();
+  std::lock_guard<std::mutex> video_lock(video_mu_);
+  WatchToken token;
+  {
+    std::lock_guard<std::mutex> watch_lock(watch_mu_);
+    if (!watch_armed_) return;
+    token.target = watch_target_;
+    token.slot = watch_slot_;
+    token.epoch = watch_epoch_;
+    token.armed = true;
+  }
+  for (const auto& track : remote_video_tracks_) {
+    if (track == nullptr) continue;
+    {
+      std::lock_guard<std::mutex> watch_lock(watch_mu_);
+      if (!TrackMatchesWatchLocked(track->id())) continue;
+    }
+    auto* sink = new RemoteFrameSink(this, token);
+    track->AddOrUpdateSink(sink, webrtc::VideoSinkWants());
+    VideoSinkAttachment attachment;
+    attachment.track = track;
+    attachment.sink = sink;
+    video_sink_attachments_.push_back(std::move(attachment));
+    Log(3, "remote video sink rebound: id=%s target=%s epoch=%llu", track->id().c_str(),
+        token.target.c_str(), static_cast<unsigned long long>(token.epoch));
+  }
+}
+
+int MediaEngine::WatchTarget(const char* sharer_id, int32_t slot, uint64_t generation,
+                             std::string* error) {
+  const std::string target = sharer_id != nullptr ? sharer_id : "";
+  if (target.empty()) {
+    if (error != nullptr) *error = "pu_screen_watch: sharer_id is empty";
+    return PU_ERR_INVALID_ARG;
+  }
+  if (slot < -1 || slot >= 2) {
+    if (error != nullptr) *error = "pu_screen_watch: slot must be -1..1";
+    return PU_ERR_INVALID_ARG;
+  }
+  {
+    std::lock_guard<std::mutex> lock(watch_mu_);
+    if (generation != 0 && watch_armed_ && generation < watch_generation_) {
+      if (error != nullptr) *error = "pu_screen_watch: stale generation";
+      return PU_ERR_STATE;
+    }
+    watch_target_ = target;
+    watch_slot_ = slot;
+    watch_generation_ = generation;
+    ++watch_epoch_;
+    watch_armed_ = true;
+    watch_explicit_ = true;
+  }
+  {
+    // 切换目标后旧帧不能留在 ready 槽里被下一次 acquire 取走。
+    std::lock_guard<std::mutex> lock(frame_mu_);
+    frame_ready_slot_ = -1;
+    frame_served_seq_ = frame_ready_seq_;
+    for (auto& slot : frame_slots_) {
+      slot.watch_target.clear();
+      slot.watch_epoch = 0;
+    }
+  }
+  if (signaling_ != nullptr) {
+    if (signaling_->IsCurrent()) {
+      RebindVideoSinksLocked();
+    } else {
+      signaling_->BlockingCall([this] { RebindVideoSinksLocked(); });
+    }
+  }
+  Log(3, "watch armed: target=%s slot=%d generation=%llu", target.c_str(),
+      static_cast<int>(slot), static_cast<unsigned long long>(generation));
+  return PU_OK;
+}
+
+int MediaEngine::UnwatchTarget(const char* sharer_id, std::string* error) {
+  const std::string requested = sharer_id != nullptr ? sharer_id : "";
+  {
+    std::lock_guard<std::mutex> lock(watch_mu_);
+    if (!requested.empty() && watch_armed_ && requested != watch_target_) {
+      // 目标已经切换：不要把新目标停掉（幂等，不报错）。
+      return PU_OK;
+    }
+    watch_armed_ = false;
+    watch_target_.clear();
+    watch_slot_ = -1;
+    ++watch_epoch_;
+    watch_explicit_ = true;
+  }
+  {
+    std::lock_guard<std::mutex> lock(frame_mu_);
+    frame_ready_slot_ = -1;
+    frame_served_seq_ = frame_ready_seq_;
+    for (auto& slot : frame_slots_) {
+      slot.watch_target.clear();
+      slot.watch_epoch = 0;
+    }
+  }
+  if (signaling_ != nullptr) {
+    if (signaling_->IsCurrent()) {
+      RebindVideoSinksLocked();
+    } else {
+      signaling_->BlockingCall([this] { RebindVideoSinksLocked(); });
+    }
+  }
+  Log(3, "watch cleared: requested=%s", requested.c_str());
+  if (error != nullptr) error->clear();
+  return PU_OK;
+}
+
+// ---------------------------------------------------------------------------
+// v2.16（B2）：严格接收会话（独立 receive-only PeerConnection）
+// ---------------------------------------------------------------------------
+
+class MediaEngine::ReceiveObserver : public webrtc::PeerConnectionObserver {
+ public:
+  ReceiveObserver(MediaEngine* engine, uint32_t token, std::shared_ptr<CandidateSink> candidates)
+      : engine_(engine), token_(token), candidates_(std::move(candidates)) {}
+
+  void OnSignalingChange(
+      webrtc::PeerConnectionInterface::SignalingState /*state*/) override {}
+
+  void OnIceConnectionChange(
+      webrtc::PeerConnectionInterface::IceConnectionState state) override {
+    engine_->Log(3, "receive[%u] ice_connection_state=%s", token_,
+                 std::string(webrtc::PeerConnectionInterface::AsString(state)).c_str());
+  }
+
+  void OnConnectionChange(
+      webrtc::PeerConnectionInterface::PeerConnectionState state) override {
+    engine_->Log(3, "receive[%u] peer_connection_state=%s", token_,
+                 std::string(webrtc::PeerConnectionInterface::AsString(state)).c_str());
+  }
+
+  void OnIceGatheringChange(
+      webrtc::PeerConnectionInterface::IceGatheringState /*state*/) override {}
+
+  void OnIceCandidate(const webrtc::IceCandidate* candidate) override {
+    // 收集本会话候选，answer SDP 里补全（不单独 trickle：candidate 可能早于
+    // answer 到达对端，对端此时没有 remote description，会直接丢弃）。
+    if (candidate == nullptr || candidates_ == nullptr) return;
+    CandidateCopy copy;
+    copy.mid = candidate->sdp_mid();
+    copy.mline_index = candidate->sdp_mline_index();
+    copy.sdp = candidate->ToString();
+    {
+      std::lock_guard<std::mutex> lock(candidates_->mu);
+      candidates_->items.push_back(copy);
+    }
+    engine_->Log(3, "receive[%u] candidate collected: %s", token_, copy.sdp.c_str());
+  }
+
+  void OnTrack(webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver) override {
+    if (transceiver == nullptr) return;
+    Attach(transceiver->receiver());
+  }
+
+  void OnAddTrack(
+      webrtc::scoped_refptr<webrtc::RtpReceiverInterface> receiver,
+      const std::vector<webrtc::scoped_refptr<webrtc::MediaStreamInterface>>&) override {
+    Attach(std::move(receiver));
+  }
+
+  void OnRenegotiationNeeded() override {}
+  void OnDataChannel(webrtc::scoped_refptr<webrtc::DataChannelInterface>) override {}
+
+ private:
+  void Attach(webrtc::scoped_refptr<webrtc::RtpReceiverInterface> receiver) {
+    if (receiver == nullptr || receiver->media_type() != webrtc::MediaType::VIDEO) return;
+    webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track = receiver->track();
+    if (track == nullptr || track->kind() != webrtc::MediaStreamTrackInterface::kVideoKind) {
+      return;
+    }
+    engine_->AttachReceiveVideoTrack(token_,
+                                     static_cast<webrtc::VideoTrackInterface*>(track.get()));
+  }
+
+  MediaEngine* const engine_;
+  const uint32_t token_;
+  std::shared_ptr<CandidateSink> candidates_;
+};
+// 只做两件事：把本地候选按会话 token trickle 出去；记录连接状态用于日志。
+// 不取 publish_mu_、不做阻塞调用——回调在 signaling 线程上。
+// v2.17（B2b direct）：共享者侧 per-viewer 发送会话的 PeerConnection 回调。
+// 只收集本地候选（offer SDP 里补全）并记录连接状态。不取 publish_mu_、不做
+// 阻塞调用——回调在 signaling 线程上。
+class MediaEngine::PublishObserver : public webrtc::PeerConnectionObserver {
+ public:
+  PublishObserver(MediaEngine* engine, uint32_t token, std::shared_ptr<CandidateSink> candidates)
+      : engine_(engine), token_(token), candidates_(std::move(candidates)) {}
+
+  void OnSignalingChange(
+      webrtc::PeerConnectionInterface::SignalingState /*state*/) override {}
+
+  void OnIceConnectionChange(
+      webrtc::PeerConnectionInterface::IceConnectionState state) override {
+    engine_->Log(3, "publish[%u] ice_connection_state=%s", token_,
+                 std::string(webrtc::PeerConnectionInterface::AsString(state)).c_str());
+  }
+
+  void OnConnectionChange(
+      webrtc::PeerConnectionInterface::PeerConnectionState state) override {
+    engine_->Log(3, "publish[%u] peer_connection_state=%s", token_,
+                 std::string(webrtc::PeerConnectionInterface::AsString(state)).c_str());
+  }
+
+  void OnIceGatheringChange(
+      webrtc::PeerConnectionInterface::IceGatheringState /*state*/) override {}
+
+  void OnIceCandidate(const webrtc::IceCandidate* candidate) override {
+    if (candidate == nullptr || candidates_ == nullptr) return;
+    CandidateCopy copy;
+    copy.mid = candidate->sdp_mid();
+    copy.mline_index = candidate->sdp_mline_index();
+    copy.sdp = candidate->ToString();
+    {
+      std::lock_guard<std::mutex> lock(candidates_->mu);
+      candidates_->items.push_back(copy);
+    }
+    engine_->Log(3, "publish[%u] candidate collected: %s", token_, copy.sdp.c_str());
+  }
+
+  // 本端只发不收：远端 track 一律忽略（direct 会话里 viewer 没有发送轨）。
+  void OnTrack(webrtc::scoped_refptr<webrtc::RtpTransceiverInterface>) override {}
+  void OnAddTrack(
+      webrtc::scoped_refptr<webrtc::RtpReceiverInterface>,
+      const std::vector<webrtc::scoped_refptr<webrtc::MediaStreamInterface>>&) override {}
+  void OnRenegotiationNeeded() override {}
+  void OnDataChannel(webrtc::scoped_refptr<webrtc::DataChannelInterface>) override {}
+
+ private:
+  MediaEngine* const engine_;
+  const uint32_t token_;
+  std::shared_ptr<CandidateSink> candidates_;
+};
+
+int MediaEngine::OpenReceive(const char* session_id, uint32_t* out_token, std::string* error) {
+  const std::string id = session_id != nullptr ? session_id : "";
+  if (id.empty() || id.size() > 96) {
+    if (error != nullptr) *error = "pu_screen_receive_open: session_id must be 1..96 bytes";
+    return PU_ERR_INVALID_ARG;
+  }
+  std::lock_guard<std::mutex> lock(recv_mu_);
+  if (recv_session_ != nullptr && recv_session_->id == id) {
+    if (out_token != nullptr) *out_token = recv_session_->token;
+    return PU_OK;  // 幂等：同一会话重复 open 不换 token
+  }
+  // 一次一路：旧会话（若存在）先真正关闭，再建新传输。
+  if (recv_session_ != nullptr) {
+    CloseReceiveLocked();
+  }
+  if (signaling_ == nullptr || pc_factory_ == nullptr) {
+    if (error != nullptr) *error = "pu_screen_receive_open: engine is not initialised";
+    return PU_ERR_STATE;
+  }
+
+  uint32_t token = session_token_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (token == 0) token = session_token_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
+  auto candidates = std::make_shared<CandidateSink>();
+  auto* observer = new ReceiveObserver(this, token, candidates);
+  webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc;
+  std::string create_error;
+  signaling_->BlockingCall([this, &pc, &create_error, observer] {
+    webrtc::PeerConnectionInterface::RTCConfiguration config;
+    ApplyIceServersToConfig(&config);
+    webrtc::PeerConnectionDependencies dependencies(observer);
+    auto created = pc_factory_->CreatePeerConnectionOrError(config, std::move(dependencies));
+    if (!created.ok()) {
+      create_error = std::string("CreatePeerConnection(receive) failed: ") +
+                     created.error().message();
+      return;
+    }
+    pc = created.value();
+  });
+  if (pc == nullptr) {
+    delete observer;
+    if (error != nullptr) *error = create_error;
+    return PU_ERR_STATE;
+  }
+
+  recv_session_.reset(new ReceiveSession());
+  recv_session_->id = id;
+  recv_session_->token = token;
+  recv_session_->pc = pc;
+  recv_session_->observer = observer;
+  recv_session_->candidates = candidates;
+  recv_session_->counters = std::make_shared<MediaRtpCounters>();
+  recv_target_ = id;
+  recv_token_.store(token, std::memory_order_relaxed);
+  recv_active_.store(true, std::memory_order_relaxed);
+  recv_frames_.store(0, std::memory_order_relaxed);
+  recv_last_frame_ms_.store(0, std::memory_order_relaxed);
+  if (out_token != nullptr) *out_token = token;
+  Log(3, "receive open: session=%s token=%u", id.c_str(), token);
+  return PU_OK;
+}
+
+int MediaEngine::CloseReceive(const char* session_id, std::string* error) {
+  std::lock_guard<std::mutex> lock(recv_mu_);
+  if (recv_session_ == nullptr) {
+    if (error != nullptr) error->clear();
+    return PU_OK;
+  }
+  if (session_id != nullptr && session_id[0] != '\0' && recv_session_->id != session_id) {
+    // 旧会话的 close 不能误关新会话（幂等）。
+    if (error != nullptr) error->clear();
+    return PU_OK;
+  }
+  CloseReceiveLocked();
+  if (error != nullptr) error->clear();
+  return PU_OK;
+}
+
+void MediaEngine::CloseReceiveLocked() {
+  if (recv_session_ == nullptr) return;
+  recv_active_.store(false, std::memory_order_relaxed);
+  std::unique_ptr<ReceiveSession> session = std::move(recv_session_);
+  recv_token_.store(0, std::memory_order_relaxed);
+  recv_target_.clear();
+  const uint32_t token = session->token;
+  if (signaling_ != nullptr && session->pc != nullptr) {
+    signaling_->BlockingCall([this, &session, token] {
+      // 先摘 sink（RemoveSink 有线程断言），再关 PC；sink 释放延后到引擎析构。
+      std::lock_guard<std::mutex> video_lock(video_mu_);
+      for (auto it = receive_sink_attachments_.begin();
+           it != receive_sink_attachments_.end();) {
+        if (it->track != nullptr && it->sink != nullptr) {
+          it->track->RemoveSink(it->sink);
+          retired_video_sinks_.push_back(it->sink);
+        }
+        it = receive_sink_attachments_.erase(it);
+      }
+      if (session->pc != nullptr) {
+        session->pc->Close();
+        session->pc = nullptr;  // 必须在 signaling 线程上放掉引用
+      }
+    });
+  }
+  if (session->pc != nullptr) session->pc = nullptr;
+  delete session->observer;
+  session->observer = nullptr;
+  {
+    std::lock_guard<std::mutex> frame_lock(frame_mu_);
+    frame_ready_slot_ = -1;
+    frame_served_seq_ = frame_ready_seq_;
+    for (auto& slot : frame_slots_) {
+      slot.watch_target.clear();
+      slot.watch_epoch = 0;
+    }
+  }
+  Log(3, "receive closed: token=%u", token);
+}
+
+int MediaEngine::AttachReceiveVideoTrack(uint32_t token,
+                                         webrtc::VideoTrackInterface* track) {
+  if (track == nullptr) return PU_ERR_INVALID_ARG;
+  if (!recv_active_.load(std::memory_order_relaxed) ||
+      token != recv_token_.load(std::memory_order_relaxed)) {
+    Log(3, "receive track dropped: token=%u (stale session)", token);
+    return PU_OK;
+  }
+  webrtc::scoped_refptr<webrtc::VideoTrackInterface> track_ref(track);
+  WatchToken watch_token;
+  watch_token.armed = true;
+  watch_token.session_token = token;
+  watch_token.epoch = token;
+  {
+    std::lock_guard<std::mutex> lock(recv_mu_);
+    if (recv_session_ != nullptr) watch_token.target = recv_session_->id;
+  }
+  auto* sink = new RemoteFrameSink(this, watch_token);
+  track->AddOrUpdateSink(sink, webrtc::VideoSinkWants());
+  {
+    std::lock_guard<std::mutex> lock(video_mu_);
+    // 加锁后再确认一次会话没被换掉：Close 先置 active=false 再等 signaling 线程，
+    // 这里若已过期就立刻摘掉，绝不把旧会话的轨挂进新会话。
+    if (!recv_active_.load(std::memory_order_relaxed) ||
+        token != recv_token_.load(std::memory_order_relaxed)) {
+      track->RemoveSink(sink);
+      retired_video_sinks_.push_back(sink);
+      return PU_OK;
+    }
+    VideoSinkAttachment attachment;
+    attachment.track = track_ref;
+    attachment.sink = sink;
+    receive_sink_attachments_.push_back(std::move(attachment));
+  }
+  Log(3, "receive video track attached: token=%u id=%s", token, track_ref->id().c_str());
+  return PU_OK;
+}
+
+int MediaEngine::SignalInReceive(const char* session_id, const char* payload, size_t len,
+                                 std::string* error) {
+  const std::string id = session_id != nullptr ? session_id : "";
+  if (id.empty() || payload == nullptr || len == 0) {
+    if (error != nullptr) *error = "pu_signal_in_session: session_id/payload is empty";
+    return PU_ERR_INVALID_ARG;
+  }
+  recv_mu_.lock();
+  if (recv_session_ == nullptr || recv_session_->id != id || recv_session_->pc == nullptr) {
+    recv_mu_.unlock();
+    if (error != nullptr) *error = "pu_signal_in_session: receive session is closed or stale";
+    return PU_ERR_STATE;
+  }
+  // 复制一份 pc 引用，避免在应用 SDP（可能耗时）期间持锁阻塞 close。
+  auto pc = recv_session_->pc;
+  const uint32_t token = recv_session_->token;
+  bool has_remote = recv_session_->has_remote_description;
+  // v2.17：answer 里要带上本会话的候选；快照在锁外取（CandidateSink 有自己的锁）。
+  auto candidates = recv_session_->candidates;
+  recv_mu_.unlock();
+
+  SignalMessage message;
+  if (!ParseSignal(payload, len, &message, error)) {
+    if (error != nullptr) *error = "pu_signal_in_session: " + *error;
+    return PU_ERR_INVALID_ARG;
+  }
+  if (message.type == "answer") {
+    if (error != nullptr) *error = "pu_signal_in_session: answer is generated locally";
+    return PU_ERR_INVALID_ARG;
+  }
+  std::string local_error;
+  if (message.type == "offer") {
+    if (has_remote) {
+      Log(3, "receive[%u] renegotiation offer", token);
+    }
+    if (!ApplyRemoteDescription(signaling_.get(), pc.get(), webrtc::SdpType::kOffer,
+                                message.sdp, &local_error)) {
+      if (error != nullptr) *error = "pu_signal_in_session: " + local_error;
+      return PU_ERR_MEDIA;
+    }
+    {
+      std::lock_guard<std::mutex> lock(recv_mu_);
+      if (recv_session_ != nullptr && recv_session_->id == id) {
+        recv_session_->has_remote_description = true;
+      } else {
+        if (error != nullptr) *error = "pu_signal_in_session: session closed during offer";
+        return PU_ERR_STATE;
+      }
+    }
+    AsyncResult create;
+    webrtc::scoped_refptr<webrtc::CreateSessionDescriptionObserver> observer(
+        new webrtc::RefCountedObject<CreateSdpObserver>(&create));
+    signaling_->BlockingCall([&] {
+      webrtc::PeerConnectionInterface::RTCOfferAnswerOptions options;
+      pc->CreateAnswer(observer.get(), options);
+    });
+    if (!WaitAsync(&create, kSdpTimeoutMs) || !create.ok) {
+      if (error != nullptr) {
+        *error = "pu_signal_in_session: CreateAnswer failed: " +
+                 (create.done ? create.error : std::string("timeout"));
+      }
+      return PU_ERR_MEDIA;
+    }
+    if (!ApplyLocalDescription(signaling_.get(), pc.get(), webrtc::SdpType::kAnswer,
+                               create.sdp, &local_error)) {
+      if (error != nullptr) *error = "pu_signal_in_session: " + local_error;
+      return PU_ERR_MEDIA;
+    }
+    // v2.17：等有界的候选收集，把候选一起放进 answer。direct 的对端是另一个
+    // native 引擎（没有服务端转发的 offer 候选兜底），缺候选会连不上；即使
+    // 等待超时也只是少几条候选，不改变会话身份。
+    if (!WaitIceGatheringFor(pc.get(), kSessionGatherTimeoutMs)) {
+      Log(2, "receive[%u] answer ICE gathering timed out; emitting partial candidates", token);
+    }
+    std::vector<CandidateCopy> collected;
+    if (candidates != nullptr) {
+      std::lock_guard<std::mutex> cand_lock(candidates->mu);
+      collected = candidates->items;
+    }
+    const std::string answer_sdp = BuildLocalSdpWithCandidatesFor(pc.get(), collected);
+    EmitSignal(kMediaScreen, "answer", MakeSdpEnvelope("answer", answer_sdp),
+               PU_SIGNAL_ANSWER, token);
+    Log(3, "receive[%u] answer emitted (%zu bytes, %zu candidates)", token, answer_sdp.size(),
+        collected.size());
+    if (error != nullptr) error->clear();
+    return PU_OK;
+  }
+  if (message.type == "candidate") {
+    if (message.candidate.empty()) {
+      if (error != nullptr) error->clear();
+      return PU_OK;
+    }
+    bool applied = false;
+    signaling_->BlockingCall([&] {
+      std::unique_ptr<webrtc::IceCandidate> parsed =
+          webrtc::IceCandidate::Create(message.mid, message.mline, message.candidate, nullptr);
+      if (parsed != nullptr) applied = pc->AddIceCandidate(parsed.get());
+    });
+    if (!applied) Log(2, "receive[%u] AddIceCandidate rejected: %s", token,
+                      message.candidate.c_str());
+    if (error != nullptr) error->clear();
+    return PU_OK;
+  }
+  if (error != nullptr) *error = "pu_signal_in_session: unsupported signal type";
+  return PU_ERR_INVALID_ARG;
+}
+
+int MediaEngine::ReceiveStats(const char* session_id, pu_receive_stats_info* out) {
+  if (out == nullptr) return PU_ERR_INVALID_ARG;
+  if (out->struct_size != 0 && out->struct_size < sizeof(pu_receive_stats_info)) {
+    return PU_ERR_INVALID_ARG;
+  }
+  const std::string id = session_id != nullptr ? session_id : "";
+  std::lock_guard<std::mutex> lock(recv_mu_);
+  const bool active = recv_active_.load(std::memory_order_relaxed) &&
+                      recv_session_ != nullptr && recv_session_->id == id;
+  if (!active) {
+    out->active = 0;
+    out->token = 0;
+    out->video_tracks = 0;
+    out->frames_delivered = 0;
+    out->last_frame_ms = 0;
+    return PU_OK;
+  }
+  out->active = 1;
+  out->token = recv_session_->token;
+  {
+    std::lock_guard<std::mutex> video_lock(video_mu_);
+    out->video_tracks = static_cast<uint32_t>(receive_sink_attachments_.size());
+  }
+  out->frames_delivered = recv_frames_.load(std::memory_order_relaxed);
+  out->last_frame_ms = static_cast<uint64_t>(recv_last_frame_ms_.load(std::memory_order_relaxed));
+  out->reserved = 0;
+  out->struct_size = static_cast<uint32_t>(sizeof(pu_receive_stats_info));
+  return PU_OK;
+}
+
+// ---------------------------------------------------------------------------
+// v2.17（B2b direct）：共享者的 per-viewer 发送会话
+// ---------------------------------------------------------------------------
+
+int MediaEngine::PublishOpen(const char* session_id, uint32_t* out_token, std::string* error) {
+  const std::string id = session_id != nullptr ? session_id : "";
+  if (id.empty() || id.size() > 96) {
+    if (error != nullptr) *error = "pu_screen_publish_open: session_id must be 1..96 bytes";
+    return PU_ERR_INVALID_ARG;
+  }
+  std::lock_guard<std::mutex> lock(publish_mu_);
+  if (auto it = publish_sessions_.find(id);
+      it != publish_sessions_.end() && !it->second->closed) {
+    if (out_token != nullptr) *out_token = it->second->token;
+    return PU_OK;  // 幂等：同一会话重复 open 不换 token、不重建传输
+  }
+  if (signaling_ == nullptr || pc_factory_ == nullptr || track_ == nullptr) {
+    if (error != nullptr) *error = "pu_screen_publish_open: screen capture is not running";
+    return PU_ERR_STATE;
+  }
+
+  uint32_t token = session_token_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (token == 0) token = session_token_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
+  auto candidates = std::make_shared<CandidateSink>();
+  auto* observer = new PublishObserver(this, token, candidates);
+  webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc;
+  webrtc::scoped_refptr<webrtc::RtpSenderInterface> sender;
+  std::string create_error;
+  // 复用已存在的视频轨：不新建采集、不换 content_hint、不改 screen.state。
+  webrtc::scoped_refptr<webrtc::VideoTrackInterface> track = track_;
+  signaling_->BlockingCall([&] {
+    webrtc::PeerConnectionInterface::RTCConfiguration config;
+    ApplyIceServersToConfig(&config);
+    webrtc::PeerConnectionDependencies dependencies(observer);
+    auto created = pc_factory_->CreatePeerConnectionOrError(config, std::move(dependencies));
+    if (!created.ok()) {
+      create_error = std::string("CreatePeerConnection(publish) failed: ") +
+                     created.error().message();
+      return;
+    }
+    pc = created.value();
+    auto added = pc->AddTrack(track, {"partyup-screen"});
+    if (!added.ok()) {
+      create_error = std::string("AddTrack(publish video) failed: ") + added.error().message();
+      pc = nullptr;
+      return;
+    }
+    sender = added.value();
+  });
+  if (pc == nullptr) {
+    delete observer;
+    if (error != nullptr) {
+      *error = create_error.empty() ? "publish peer connection failed" : create_error;
+    }
+    return PU_ERR_STATE;
+  }
+
+  auto session = std::make_shared<PublishSession>();
+  session->id = id;
+  session->token = token;
+  session->pc = pc;
+  session->observer = observer;
+  session->sender = sender;
+  session->candidates = candidates;
+  session->counters = std::make_shared<MediaRtpCounters>();
+
+  AsyncResult create;
+  webrtc::scoped_refptr<webrtc::CreateSessionDescriptionObserver> sdp_observer(
+      new webrtc::RefCountedObject<CreateSdpObserver>(&create));
+  signaling_->BlockingCall([&] {
+    webrtc::PeerConnectionInterface::RTCOfferAnswerOptions options;
+    pc->CreateOffer(sdp_observer.get(), options);
+  });
+  if (!WaitAsync(&create, kSdpTimeoutMs) || !create.ok) {
+    signaling_->BlockingCall([&] {
+      if (pc != nullptr) pc->Close();
+    });
+    delete observer;
+    if (error != nullptr) {
+      *error = "pu_screen_publish_open: CreateOffer failed: " +
+               (create.done ? create.error : std::string("timeout"));
+    }
+    return PU_ERR_MEDIA;
+  }
+  std::string local_error;
+  if (!ApplyLocalDescription(signaling_.get(), pc.get(), webrtc::SdpType::kOffer, create.sdp,
+                             &local_error)) {
+    signaling_->BlockingCall([&] {
+      if (pc != nullptr) pc->Close();
+    });
+    delete observer;
+    if (error != nullptr) *error = "pu_screen_publish_open: " + local_error;
+    return PU_ERR_MEDIA;
+  }
+
+  // 已登记：之后 close 一定能找到它并释放 observer/PC。
+  publish_sessions_[id] = session;
+  if (!WaitIceGatheringFor(pc.get(), kSessionGatherTimeoutMs)) {
+    Log(2, "publish[%u] ICE gathering timed out; emitting partial candidates", token);
+  }
+  std::vector<CandidateCopy> collected;
+  {
+    std::lock_guard<std::mutex> cand_lock(candidates->mu);
+    collected = candidates->items;
+  }
+  const std::string offer_sdp = BuildLocalSdpWithCandidatesFor(pc.get(), collected);
+  EmitSignal(kMediaScreen, "offer", MakeSdpEnvelope("offer", offer_sdp), PU_SIGNAL_OFFER,
+             token);
+  if (out_token != nullptr) *out_token = token;
+  Log(3, "publish session open: session=%s token=%u candidates=%zu", id.c_str(), token,
+      collected.size());
+  return PU_OK;
+}
+
+int MediaEngine::PublishSignalIn(const char* session_id, const char* payload, size_t len,
+                                 std::string* error) {
+  const std::string id = session_id != nullptr ? session_id : "";
+  if (id.empty() || payload == nullptr || len == 0) {
+    if (error != nullptr) *error = "pu_screen_publish_signal_in: session_id/payload is empty";
+    return PU_ERR_INVALID_ARG;
+  }
+  SignalMessage message;
+  if (!ParseSignal(payload, len, &message, error)) {
+    if (error != nullptr) *error = "pu_screen_publish_signal_in: " + *error;
+    return PU_ERR_INVALID_ARG;
+  }
+  if (message.type == "offer") {
+    if (error != nullptr) *error = "pu_screen_publish_signal_in: local side is the offerer";
+    return PU_ERR_INVALID_ARG;
+  }
+  std::lock_guard<std::mutex> lock(publish_mu_);
+  auto it = publish_sessions_.find(id);
+  if (it == publish_sessions_.end() || it->second->closed || it->second->pc == nullptr) {
+    if (error != nullptr) *error = "pu_screen_publish_signal_in: session is closed or stale";
+    return PU_ERR_STATE;
+  }
+  std::shared_ptr<PublishSession> session = it->second;
+  std::string local_error;
+  if (message.type == "answer") {
+    if (!ApplyRemoteDescription(signaling_.get(), session->pc.get(), webrtc::SdpType::kAnswer,
+                                message.sdp, &local_error)) {
+      if (error != nullptr) *error = "pu_screen_publish_signal_in: " + local_error;
+      return PU_ERR_MEDIA;
+    }
+    session->has_remote_description = true;
+    Log(3, "publish[%u] answer applied", session->token);
+    if (error != nullptr) error->clear();
+    return PU_OK;
+  }
+  if (message.type == "candidate") {
+    if (message.candidate.empty()) {
+      if (error != nullptr) error->clear();
+      return PU_OK;
+    }
+    bool applied = false;
+    signaling_->BlockingCall([&] {
+      std::unique_ptr<webrtc::IceCandidate> parsed =
+          webrtc::IceCandidate::Create(message.mid, message.mline, message.candidate, nullptr);
+      if (parsed != nullptr) applied = session->pc->AddIceCandidate(parsed.get());
+    });
+    if (!applied) {
+      Log(2, "publish[%u] AddIceCandidate rejected: %s", session->token,
+          message.candidate.c_str());
+    }
+    if (error != nullptr) error->clear();
+    return PU_OK;
+  }
+  if (error != nullptr) *error = "pu_screen_publish_signal_in: unsupported signal type";
+  return PU_ERR_INVALID_ARG;
+}
+
+int MediaEngine::PublishClose(const char* session_id, std::string* error) {
+  std::lock_guard<std::mutex> lock(publish_mu_);
+  const std::string id = session_id != nullptr ? session_id : "";
+  auto it = publish_sessions_.find(id);
+  if (it == publish_sessions_.end()) {
+    if (error != nullptr) error->clear();
+    return PU_OK;  // 幂等：已关闭/未知会话不误关别的会话
+  }
+  std::shared_ptr<PublishSession> session = it->second;
+  session->closed = true;
+  publish_sessions_.erase(it);
+  if (signaling_ != nullptr && session->pc != nullptr) {
+    signaling_->BlockingCall([&session] {
+      if (session->pc != nullptr) {
+        session->pc->Close();
+        session->pc = nullptr;
+      }
+    });
+  }
+  delete session->observer;
+  session->observer = nullptr;
+  session->sender = nullptr;
+  Log(3, "publish session closed: session=%s token=%u", id.c_str(), session->token);
+  if (error != nullptr) error->clear();
+  return PU_OK;
+}
+
+void MediaEngine::CloseAllPublishSessionsLocked() {
+  if (publish_sessions_.empty()) return;
+  std::vector<std::shared_ptr<PublishSession>> closing;
+  closing.reserve(publish_sessions_.size());
+  for (auto& entry : publish_sessions_) {
+    entry.second->closed = true;
+    closing.push_back(entry.second);
+  }
+  publish_sessions_.clear();
+  for (auto& session : closing) {
+    if (signaling_ != nullptr && session->pc != nullptr) {
+      signaling_->BlockingCall([&session] {
+        if (session->pc != nullptr) {
+          session->pc->Close();
+          session->pc = nullptr;
+        }
+      });
+    }
+    delete session->observer;
+    session->observer = nullptr;
+    session->sender = nullptr;
+  }
+  Log(3, "all publish sessions closed (%zu)", closing.size());
+}
+
+int MediaEngine::PublishStats(const char* session_id, pu_publish_stats_info* out) {
+  if (out == nullptr) return PU_ERR_INVALID_ARG;
+  if (out->struct_size != 0 && out->struct_size < sizeof(pu_publish_stats_info)) {
+    return PU_ERR_INVALID_ARG;
+  }
+  const std::string id = session_id != nullptr ? session_id : "";
+  webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc;
+  std::shared_ptr<MediaRtpCounters> counters;
+  uint32_t token = 0;
+  bool has_remote = false;
+  {
+    std::lock_guard<std::mutex> lock(publish_mu_);
+    auto it = publish_sessions_.find(id);
+    if (it != publish_sessions_.end() && !it->second->closed) {
+      pc = it->second->pc;
+      counters = it->second->counters;
+      token = it->second->token;
+      has_remote = it->second->has_remote_description;
+    }
+  }
+  if (pc == nullptr || counters == nullptr) {
+    out->active = 0;
+    out->token = 0;
+    out->packets_sent = 0;
+    out->bytes_sent = 0;
+    out->frames_encoded = 0;
+    out->has_remote = 0;
+    out->reserved = 0;
+    out->struct_size = static_cast<uint32_t>(sizeof(pu_publish_stats_info));
+    return PU_OK;
+  }
+  WaitMediaRtpStats(pc.get(), counters, 300);
+  out->active = 1;
+  out->token = token;
+  out->packets_sent = static_cast<uint32_t>(
+      std::min<uint64_t>(counters->packets_sent.load(std::memory_order_relaxed), 0xFFFFFFFFu));
+  out->bytes_sent = counters->bytes_sent.load(std::memory_order_relaxed);
+  out->frames_encoded = counters->frames_encoded.load(std::memory_order_relaxed);
+  out->has_remote = has_remote ? 1u : 0u;
+  out->reserved = 0;
+  out->struct_size = static_cast<uint32_t>(sizeof(pu_publish_stats_info));
+  return PU_OK;
+}
+
+int MediaEngine::ReceiveRtpStats(const char* session_id, pu_rtp_stats_info* out) {
+  if (out == nullptr) return PU_ERR_INVALID_ARG;
+  if (out->struct_size != 0 && out->struct_size < sizeof(pu_rtp_stats_info)) {
+    return PU_ERR_INVALID_ARG;
+  }
+  const std::string id = session_id != nullptr ? session_id : "";
+  webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc;
+  std::shared_ptr<MediaRtpCounters> counters;
+  {
+    std::lock_guard<std::mutex> lock(recv_mu_);
+    if (recv_session_ != nullptr && recv_session_->id == id) {
+      pc = recv_session_->pc;
+      counters = recv_session_->counters;
+    }
+  }
+  if (pc == nullptr || counters == nullptr) {
+    out->active = 0;
+    out->packets_received = 0;
+    out->bytes_received = 0;
+    out->frames_decoded = 0;
+    out->reserved = 0;
+    out->struct_size = static_cast<uint32_t>(sizeof(pu_rtp_stats_info));
+    return PU_OK;
+  }
+  WaitMediaRtpStats(pc.get(), counters, 300);
+  out->active = 1;
+  out->packets_received = static_cast<uint32_t>(
+      std::min<uint64_t>(counters->packets_received.load(std::memory_order_relaxed),
+                         0xFFFFFFFFu));
+  out->bytes_received = counters->bytes_received.load(std::memory_order_relaxed);
+  out->frames_decoded = counters->frames_decoded.load(std::memory_order_relaxed);
+  out->reserved = 0;
+  out->struct_size = static_cast<uint32_t>(sizeof(pu_rtp_stats_info));
+  return PU_OK;
+}
+
+void MediaEngine::RequestMediaRtpStats(webrtc::PeerConnectionInterface* pc,
+                                       const std::shared_ptr<MediaRtpCounters>& counters) {
+  if (pc == nullptr || signaling_ == nullptr || counters == nullptr) return;
+  std::shared_ptr<MediaRtpCounters> counters_copy = counters;
+  // 任务自己揣着 pc 的引用：即使引擎收摊，队列里这一条也不会打到悬空指针上。
+  signaling_->PostTask([pc_ref = webrtc::scoped_refptr<webrtc::PeerConnectionInterface>(pc),
+                        counters_copy] {
+    pc_ref->GetStats(new webrtc::RefCountedObject<MediaRtpStatsCollector>(counters_copy));
+  });
+}
+
+bool MediaEngine::WaitMediaRtpStats(webrtc::PeerConnectionInterface* pc,
+                                   const std::shared_ptr<MediaRtpCounters>& counters,
+                                   int wait_ms) {
+  if (pc == nullptr || counters == nullptr) return false;
+  const uint32_t before = counters->reports.load(std::memory_order_relaxed);
+  RequestMediaRtpStats(pc, counters);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (counters->reports.load(std::memory_order_relaxed) > before) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  return counters->reports.load(std::memory_order_relaxed) > before;
+}
+
+int MediaEngine::PauseSend(bool paused, std::string* error) {
+  if (signaling_ == nullptr || pc_ == nullptr || video_sender_ == nullptr || track_ == nullptr) {
+    if (error != nullptr) *error = "pu_screen_pause_send: no screen sender is available";
+    return PU_ERR_STATE;
+  }
+  bool ok = false;
+  signaling_->BlockingCall([&] {
+    ok = video_sender_->SetTrack(paused ? nullptr : track_.get());
+  });
+  if (!ok) {
+    if (error != nullptr) *error = "pu_screen_pause_send: SetTrack failed";
+    return PU_ERR_MEDIA;
+  }
+  Log(3, "screen send %s (capture/track/publish state kept)", paused ? "paused" : "resumed");
+  if (error != nullptr) error->clear();
+  return PU_OK;
+}
+
+int MediaEngine::EngineCaps(uint32_t* caps) {
+  if (caps == nullptr) return PU_ERR_INVALID_ARG;
+  // bit4（v2.15）= 通话中真实设备热切 + 稳定 ID 选择 + 系统默认跟随/热插拔回退。
+  // bit5（v2.16/B2）= 独立 receive-only 接收会话 + 按会话信令/统计 + 发送暂停。
+  // bit6（v2.17/B2b direct）= per-viewer 发送会话 + 真实 RTP 包计数。
+  // bit7（v2.18/AUD02）= 独立本端输入电平（同一条 ADM 的 Start/Stop/Status）。
+  // 旧 DLL 只返回低位，托管层据此判断「不能把 SetAudioDevice 当热切用」、
+  // 「direct 严格观看不能只靠 pause_send」、「没有独立输入监测」。
+  *caps = 0x1u | 0x2u | 0x4u | 0x8u | 0x10u | 0x20u | 0x40u | 0x80u;
+  return PU_OK;
+}
+
+// ---------------------------------------------------------------------------
+// v2.15：音频设备（通话中的真实热切 / 系统默认跟随 / 热插拔回退）
+// ---------------------------------------------------------------------------
+// 所有 ADM 访问都在 signaling 线程（与 ADM 的创建/Terminate 同线程）；控制逻辑在
+// AudioDeviceController 里，fake ADM 回归测试编译并驱动同一份实现。
+int MediaEngine::ApplySelectedAudioDevices(std::string* error) {
+  if (audio_device_controller_ == nullptr) {
+    if (error != nullptr) *error = "audio device module is not created";
+    return PU_ERR_STATE;
+  }
+  return audio_device_controller_->ApplyBeforeJoin(error);
+}
+
+int MediaEngine::AudioDevices(int32_t kind, pu_audio_device* out, uint32_t capacity,
+                              std::string* error) {
+  if (kind != 0 && kind != 1) {
+    if (error != nullptr) *error = "pu_audio_devices: kind must be 0 (input) or 1 (output)";
+    return PU_ERR_INVALID_ARG;
+  }
+  if (signaling_ == nullptr || audio_device_controller_ == nullptr) return 0;
+  const partyup::AudioDeviceDirection dir = kind == 0
+                                                ? partyup::AudioDeviceDirection::kInput
+                                                : partyup::AudioDeviceDirection::kOutput;
+  int count = 0;
+  std::string failure;
+  signaling_->BlockingCall([&] {
+    std::vector<partyup::AudioDeviceEntry> entries;
+    const int rc = audio_device_controller_->EnumerateDevices(dir, &entries, &failure);
+    if (rc < 0) {
+      count = 0;
+      return;
+    }
+    if (out == nullptr || capacity == 0) {
+      count = rc;
+      return;
+    }
+    const int limit = std::min<int>(rc, static_cast<int>(capacity));
+    for (int i = 0; i < limit; ++i) {
+      pu_audio_device& item = out[i];
+      if (item.struct_size < sizeof(pu_audio_device)) {
+        count = -1;  // 结构太小：明确拒绝，避免半写
+        return;
+      }
+      std::memset(&item, 0, sizeof(item));
+      item.struct_size = static_cast<uint32_t>(sizeof(pu_audio_device));
+      item.index = entries[i].index;
+      item.is_default = entries[i].is_default ? 1 : 0;
+      std::snprintf(item.name, sizeof(item.name), "%s", entries[i].name.c_str());
+      std::snprintf(item.guid, sizeof(item.guid), "%s", entries[i].guid.c_str());
+    }
+    count = limit;
+  });
+  if (count == -1) {
+    if (error != nullptr) *error = "pu_audio_devices: pu_audio_device.struct_size too small";
+    return PU_ERR_INVALID_ARG;
+  }
+  return count;
+}
+
+int MediaEngine::AudioStatus(pu_audio_status_info* out, std::string* error) {
+  if (out == nullptr) {
+    if (error != nullptr) *error = "pu_audio_status: out is null";
+    return PU_ERR_INVALID_ARG;
+  }
+  if (out->struct_size < sizeof(pu_audio_status_info)) {
+    if (error != nullptr) *error = "pu_audio_status: struct_size too small";
+    return PU_ERR_INVALID_ARG;
+  }
+  if (signaling_ == nullptr || audio_device_controller_ == nullptr) return PU_ERR_STATE;
+  // ABI 约定：调用方把上一次的 generation 放在 out->generation 里带进来，用来算 changed。
+  const uint32_t previous_generation = out->generation;
+  int rc = PU_OK;
+  std::string failure;
+  partyup::AudioDeviceController::Snapshot snapshot;
+  bool input_started = false;
+  // 注意：pu_audio_status **不是只读快照**。Refresh 会推进真实重新选择/回退：
+  //   * 选中设备被拔掉 -> 真正切回系统默认（通话中执行 Stop->Set->Init->Start）；
+  //   * 跟随默认且系统默认端点变了 -> 真正重新选择并重启该方向。
+  signaling_->BlockingCall([&] {
+    rc = audio_device_controller_->Refresh(&failure);
+    snapshot = audio_device_controller_->GetSnapshot(previous_generation);
+    // AUD02：Refresh/SetDevice 可能停掉/重启输入方向；把实测 running 交给 monitor
+    // 协调（只更新状态/置故障，绝不自动重新开采集）。
+    input_started = audio_port_ != nullptr &&
+                    audio_port_->IsStarted(partyup::AudioDeviceDirection::kInput);
+  });
+  if (audio_monitor_ != nullptr) {
+    audio_monitor_->ReconcileInputRunning(input_started);
+    // 代次变化说明 Refresh 推进了真实重新选择/重启；旧输入的电平不能继续显示。
+    if (rc == PU_OK && snapshot.changed != 0 && input_started) {
+      audio_monitor_->OnInputRestarted();
+    }
+  }
+  const uint32_t struct_size = out->struct_size;
+  std::memset(out, 0, sizeof(*out));
+  out->struct_size = struct_size;
+  out->input_index = snapshot.input_index;
+  out->output_index = snapshot.output_index;
+  out->input_count = snapshot.input_count;
+  out->output_count = snapshot.output_count;
+  out->generation = snapshot.generation;
+  out->changed = snapshot.changed;
+  out->fallback = snapshot.fallback;
+  // reserved（旧 ABI 的保留字段，旧客户端只当 0 忽略）：bit0/bit1 = 该方向因设备切换/
+  // 回退失败而没有在运行。用 0 表示「没有失败」，不复用为其它含义。
+  out->reserved = snapshot.fault;
+  std::snprintf(out->input_name, sizeof(out->input_name), "%s", snapshot.input_name.c_str());
+  std::snprintf(out->output_name, sizeof(out->output_name), "%s", snapshot.output_name.c_str());
+  if (rc != PU_OK && error != nullptr) *error = "pu_audio_status: " + failure;
+  return rc;
+}
+
+int MediaEngine::SetAudioDevice(int32_t kind, int32_t index, std::string* error) {
+  if (kind != 0 && kind != 1) {
+    if (error != nullptr) *error = "pu_audio_set_device: kind must be 0 or 1";
+    return PU_ERR_INVALID_ARG;
+  }
+  if (index < -1) {
+    if (error != nullptr) *error = "pu_audio_set_device: index must be >= -1";
+    return PU_ERR_INVALID_ARG;
+  }
+  if (signaling_ == nullptr || audio_device_controller_ == nullptr) {
+    if (error != nullptr) *error = "pu_audio_set_device: audio device module is not created";
+    return PU_ERR_STATE;
+  }
+  const partyup::AudioDeviceDirection dir = kind == 0
+                                                ? partyup::AudioDeviceDirection::kInput
+                                                : partyup::AudioDeviceDirection::kOutput;
+  int rc = PU_OK;
+  std::string failure;
+  // 通话中由控制器执行 Stop->SetDevice->Init->Start 事务；返回 PU_OK 时新设备已经
+  // 真正在跑，不再只是「登记到下次 join」。
+  signaling_->BlockingCall(
+      [&] { rc = audio_device_controller_->SetDevice(dir, index, &failure); });
+  if (rc == PU_OK && kind == 0 && audio_monitor_ != nullptr) {
+    // 输入设备事务成功（可能已真正重启输入）：推进代次并清掉旧设备电平。
+    audio_monitor_->OnInputRestarted();
+  }
+  if (rc != PU_OK && error != nullptr) *error = "pu_audio_set_device: " + failure;
+  return rc;
+}
+
+int MediaEngine::VoiceLevel(pu_voice_level_info* out) {
+  if (out == nullptr) {
+    SetLastError("pu_voice_level: out is null");
+    return PU_ERR_INVALID_ARG;
+  }
+  // v2.19：结构体尾部追加了 7 个字段。老调用方按旧的 32 字节 struct_size 调用必须继续
+  // 可用，所以这里只要求覆盖到 v2.18 的最后一个字段，并且**只写 min(struct_size, sizeof)**。
+  constexpr size_t kMinStructSize =
+      offsetof(pu_voice_level_info, last_frame_ms) + sizeof(uint64_t);
+  if (out->struct_size < kMinStructSize) {
+    SetLastError("pu_voice_level: struct_size too small");
+    return PU_ERR_INVALID_ARG;
+  }
+  const uint32_t struct_size = out->struct_size;
+  const size_t fill = struct_size < sizeof(*out) ? struct_size : sizeof(*out);
+  std::memset(out, 0, fill);
+  out->struct_size = struct_size;
+
+  // 共享 ADM 状态与实例代次：证明多次 join/leave 复用的是同一块 ADM（不重建）。
+  int adm_initialized = 0;
+  int adm_recording = 0;
+  int adm_recording_initialized = 0;
+  if (signaling_ != nullptr) {
+    signaling_->BlockingCall([&] {
+      webrtc::AudioDeviceModule* adm = voice_adm_.get();
+      if (adm == nullptr) return;
+      adm_initialized = adm->Initialized() ? 1 : 0;
+      adm_recording = adm->Recording() ? 1 : 0;
+      adm_recording_initialized = adm->RecordingIsInitialized() ? 1 : 0;
+    });
+  }
+  // 尾部字段只在调用方缓冲区覆盖到它时才写（向后兼容）。
+  if (struct_size >= offsetof(pu_voice_level_info, capture_frames) + 4) {
+    out->capture_frames =
+        audio_monitor_ != nullptr ? audio_monitor_->RawCallbackCount() : 0;
+  }
+  if (struct_size >= offsetof(pu_voice_level_info, capture_bytes) + 8) {
+    out->capture_bytes = audio_monitor_ != nullptr ? audio_monitor_->RawBytes() : 0;
+  }
+  if (struct_size >= offsetof(pu_voice_level_info, last_cb_ms) + 8) {
+    out->last_cb_ms = static_cast<uint64_t>(
+        audio_monitor_ != nullptr ? audio_monitor_->RawLastCallbackMs() : 0);
+  }
+  if (struct_size >= offsetof(pu_voice_level_info, adm_initialized) + 4) {
+    out->adm_initialized = static_cast<uint32_t>(adm_initialized);
+  }
+  if (struct_size >= offsetof(pu_voice_level_info, adm_recording) + 4) {
+    out->adm_recording = static_cast<uint32_t>(adm_recording);
+  }
+  if (struct_size >= offsetof(pu_voice_level_info, adm_recording_initialized) + 4) {
+    out->adm_recording_initialized = static_cast<uint32_t>(adm_recording_initialized);
+  }
+  if (struct_size >= offsetof(pu_voice_level_info, adm_instance) + 4) {
+    out->adm_instance = adm_instance_serial_.load(std::memory_order_relaxed);
+  }
+
+  if (!voice_joined_) {
+    // 未在语音：没有可用的本端电平。valid=0，绝不用 0 冒充有效静音。
+    return PU_OK;
+  }
+
+  int track_level = -1;
+  bool track_ok = false;
+  if (signaling_ != nullptr) {
+    signaling_->BlockingCall([&] {
+      if (voice_track_ != nullptr) {
+        int level = 0;
+        track_ok = voice_track_->GetSignalLevel(&level);
+        if (track_ok) track_level = level;
+      }
+    });
+  }
+  const uint32_t peak = audio_monitor_ != nullptr ? audio_monitor_->VoiceLevelPeak() : 0;
+  const uint32_t rms = audio_monitor_ != nullptr ? audio_monitor_->VoiceLevelRms() : 0;
+  const uint32_t frames = audio_monitor_ != nullptr ? audio_monitor_->VoiceLevelFrames() : 0;
+  const int64_t last_ms = audio_monitor_ != nullptr ? audio_monitor_->VoiceLevelLastMs() : 0;
+  const int64_t now_ms = NowUsSteady() / 1000;
+
+  out->frames = frames;
+  // 优先用通话音频轨 PCM sink 的实测值：它同时有 peak 和真实 RMS，且是新鲜数据时
+  // 比 GetSignalLevel 更完整。GetSignalLevel 只返回一个 level，没有 RMS，不能把
+  // level 同时填进 peak/rms 冒充测量（见头文件 source 字段约定）。
+  if (frames > 0 && last_ms != 0 && now_ms - last_ms <= 1000) {
+    out->valid = 1;
+    out->source = 2;  // 通话音频轨 PCM sink 的实测峰值/RMS
+    out->peak = peak;
+    out->rms = rms;
+    out->last_frame_ms = static_cast<uint64_t>(last_ms);
+    return PU_OK;
+  }
+  if (track_ok && track_level >= 0) {
+    out->valid = 1;
+    out->source = 1;  // AudioTrackInterface::GetSignalLevel 实际返回了值
+    out->peak = static_cast<uint32_t>(std::min(track_level, 32767));
+    // GetSignalLevel 没有 RMS：保持 0 并在头文件说明「只有 source==2 时 rms 才是实测」。
+    out->rms = 0;
+    out->last_frame_ms = last_ms > 0 ? static_cast<uint64_t>(last_ms) : 0;
+    return PU_OK;
+  }
+  // GetSignalLevel 失败且没有新鲜的 PCM：明确 valid=0，不填 0 当有效电平。
+  out->valid = 0;
+  out->source = 0;
+  return PU_OK;
+}
+
+// ---------------------------------------------------------------------------
+// v2.18（AUD02）：独立输入电平监测（必须与 voice 共享同一条 ADM 的录音方向）
+// ---------------------------------------------------------------------------
+int MediaEngine::RebuildMonitorAdm(std::string* error) {
+  if (signaling_ == nullptr || audio_monitor_ == nullptr) {
+    if (error != nullptr) *error = "audio monitor: rebuild needs a live engine/monitor";
+    return PU_ERR_STATE;
+  }
+  int rc = PU_ERR_MEDIA;
+  std::string detail = "audio monitor: rebuild failed to create a platform ADM";
+  signaling_->BlockingCall([&] {
+    const webrtc::Environment env = webrtc::CreateEnvironment();
+    webrtc::scoped_refptr<webrtc::AudioDeviceModule> platform = webrtc::CreateAudioDeviceModule(
+        env, webrtc::AudioDeviceModule::kPlatformDefaultAudio);
+    if (platform == nullptr) {
+      detail = "audio monitor: CreateAudioDeviceModule returned null";
+      return;
+    }
+    webrtc::scoped_refptr<webrtc::AudioDeviceModule> wrapper =
+        webrtc::CreateAudioDeviceWithDataObserver(
+            std::move(platform),
+            std::make_unique<partyup::AudioMonitorDataObserver>(audio_monitor_.get()));
+    if (wrapper == nullptr) {
+      detail = "audio monitor: CreateAudioDeviceWithDataObserver returned null";
+      return;
+    }
+    auto port = std::make_unique<partyup::AdmAudioDevicePort>(wrapper.get());
+    port->SetLogSink([this](int level, const std::string& message) {
+      Log(level, "%s", message.c_str());
+    });
+    auto controller = std::make_unique<partyup::AudioDeviceController>();
+    controller->SetLogSink([this](int level, const std::string& message) {
+      Log(level, "%s", message.c_str());
+    });
+    // 不传默认端点探针：重建只要求「跟随系统默认」，ADM 的 kDefaultDevice 已足够，
+    // 也避免在 signaling 线程复用另一个端点探针实例。
+    controller->Init(port.get(), nullptr);
+    // 退休上一块重建 ADM（同为 signaling 线程）：先停采集再 Terminate。
+    if (monitor_rebuild_adm_ != nullptr) {
+      (void)monitor_rebuild_adm_->StopRecording();
+      monitor_rebuild_adm_->Terminate();
+      --adm_live_;
+      Log(3, "audio monitor: retired rebuilt ADM=%p", static_cast<void*>(monitor_rebuild_adm_.get()));
+    }
+    monitor_rebuild_port_ = std::move(port);
+    monitor_rebuild_controller_ = std::move(controller);
+    monitor_rebuild_adm_ = wrapper;
+    if (audio_monitor_port_ != nullptr) {
+      audio_monitor_port_->Rebind(monitor_rebuild_adm_.get(),
+                                 monitor_rebuild_controller_.get(), worker_.get());
+    }
+    ++adm_rebuild_count_;
+    ++adm_live_;
+    Log(3, "audio monitor: rebuilt ADM=%p (rebuild #%d, ADM instances live=%d instance=%u)",
+        static_cast<void*>(monitor_rebuild_adm_.get()), adm_rebuild_count_, adm_live_,
+        adm_instance_serial_.fetch_add(1, std::memory_order_relaxed) + 1);
+    rc = PU_OK;
+  });
+  if (rc != PU_OK && error != nullptr) *error = detail;
+  return rc;
+}
+
+int MediaEngine::AudioMonitorStart(std::string* error) {
+  if (signaling_ == nullptr || audio_monitor_ == nullptr) {
+    if (error != nullptr) *error = "pu_audio_monitor_start: the audio monitor is not created";
+    return PU_ERR_STATE;
+  }
+  std::lock_guard<std::mutex> owner_lock(capture_owner_mu_);
+  // 不能只查 voice_joined_ 的瞬间：正在加入（PC/发送轨已建）或上一轮残留的会话
+  // 同样占着录音方向。所有语音对象都只在控制线程读写，这里与 VoiceJoin 串行。
+  if (voice_joined_ || voice_pc_ != nullptr || voice_sender_ != nullptr ||
+      voice_track_ != nullptr || voice_source_ != nullptr) {
+    if (error != nullptr) {
+      *error = "pu_audio_monitor_start: the voice session owns the capture device";
+    }
+    return PU_ERR_STATE;
+  }
+  int monitor_rc = audio_monitor_->Start(error);
+  Log(3, "audio monitor: engine start rc=%d err=%s", monitor_rc,
+      (error == nullptr || error->empty()) ? "-" : error->c_str());
+  if (monitor_rc != PU_OK) {
+    // AUD02 post-voice：语音引擎释放共享 ADM 后，平台 ADM 无法再起采集（真机实证：
+    // InitRecording/StartRecording 持续失败）。此时按需重建一块 platform ADM 并重试一次；
+    // 本函数持有 capture_owner_mu_ 且已确认不在语音会话中，重建期间 voice 不会启动。
+    const std::string first_error = (error == nullptr) ? std::string() : *error;
+    std::string rebuild_error;
+    const int rebuild_rc = RebuildMonitorAdm(&rebuild_error);
+    if (rebuild_rc == PU_OK) {
+      monitor_rc = audio_monitor_->Start(error);
+      Log(3, "audio monitor: engine start after ADM rebuild rc=%d err=%s", monitor_rc,
+          (error == nullptr || error->empty()) ? "-" : error->c_str());
+    } else {
+      Log(1, "audio monitor: ADM rebuild failed rc=%d err=%s (first start error=%s)", rebuild_rc,
+          rebuild_error.empty() ? "-" : rebuild_error.c_str(),
+          first_error.empty() ? "-" : first_error.c_str());
+      if (rebuild_rc != PU_ERR_STATE && error != nullptr) {
+        *error = first_error.empty() ? rebuild_error : (first_error + "; " + rebuild_error);
+      }
+    }
+  }
+  return monitor_rc;
+}
+
+int MediaEngine::AudioMonitorStop(std::string* error) {
+  if (audio_monitor_ == nullptr) {
+    if (error != nullptr) *error = "pu_audio_monitor_stop: the audio monitor is not created";
+    return PU_ERR_STATE;
+  }
+  // 与 VoiceJoin 串行：如果 voice 已接管，monitor 的 Stop 幂等成功且不会碰录音。
+  std::lock_guard<std::mutex> owner_lock(capture_owner_mu_);
+  const int monitor_rc = audio_monitor_->Stop(error);
+  Log(3, "audio monitor: engine stop rc=%d err=%s", monitor_rc,
+      (error == nullptr || error->empty()) ? "-" : error->c_str());
+  return monitor_rc;
+}
+
+int MediaEngine::AudioMonitorStatus(pu_audio_monitor_info* out, std::string* error) {
+  if (out == nullptr) {
+    if (error != nullptr) *error = "pu_audio_monitor_status: out is null";
+    return PU_ERR_INVALID_ARG;
+  }
+  if (out->struct_size < sizeof(pu_audio_monitor_info)) {
+    if (error != nullptr) *error = "pu_audio_monitor_status: struct_size too small";
+    return PU_ERR_INVALID_ARG;
+  }
+  if (audio_monitor_ == nullptr) {
+    if (error != nullptr) *error = "pu_audio_monitor_status: the audio monitor is not created";
+    return PU_ERR_STATE;
+  }
+  // 只读快照：不推进设备事务、不启动/停止采集。
+  audio_monitor_->Status(out);
+  return PU_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -3844,6 +5771,25 @@ PU_API int pu_peer_stats(pu_engine* e, pu_stats* out) {
 namespace partyup {
 namespace {
 
+// AUD02：VoiceJoin 在确认 monitor 停止后临时声明「voice 拥有采集」。任何提前返回
+// （设备失败、建 PC/轨失败、offer 失败）都会释放声明，让 monitor 可以再次 Start；
+// 成功加入后 Keep()，由 VoiceLeave 显式释放。
+class ScopedVoiceCaptureClaim {
+ public:
+  ~ScopedVoiceCaptureClaim() {
+    if (held_ && monitor_ != nullptr) monitor_->SetVoiceOwnsCapture(false);
+  }
+  void Claim(AudioMonitor* monitor) {
+    monitor_ = monitor;
+    held_ = monitor != nullptr;
+  }
+  void Keep() { held_ = false; }
+
+ private:
+  AudioMonitor* monitor_ = nullptr;
+  bool held_ = false;
+};
+
 int MediaEngine::VoiceJoin(const pu_voice_params* params, std::string* error) {
   if (params == nullptr || params->struct_size < sizeof(pu_voice_params)) {
     if (error != nullptr) *error = "pu_voice_params.struct_size too small";
@@ -3853,11 +5799,48 @@ int MediaEngine::VoiceJoin(const pu_voice_params* params, std::string* error) {
     if (error != nullptr) *error = "voice relay mode not implemented: SFU 未接";
     return PU_NOT_IMPLEMENTED;
   }
+  // Serialize the entire ownership transition, including all PC/track writes.
+  // A claim alone does not protect MonitorStart from racing those raw fields.
+  std::lock_guard<std::mutex> owner_lock(capture_owner_mu_);
   if (voice_joined_) return PU_OK;
   // v2.6：flags bit0 = 1 表示「被动加入」——只接不发 offer，等对方 offer 后回 answer。
   // 1:1 场景里后加入的一方走这条路（双方都发 offer 会 glare，SignalIn 会直接报角色冲突）。
   // 字段本身是预留 u32，不涉及 ABI 布局变更。
   const bool passive = (params->flags & 1u) != 0;
+
+  // AUD02：monitor 和 voice 共享同一个录音方向。进入语音前必须先停掉 monitor；
+  // monitor 无法确认停止（Faulted/仍在跑/未知）时拒绝 join，绝不抢同一块 ADM。
+  ScopedVoiceCaptureClaim voice_claim;
+  {
+    if (audio_monitor_ != nullptr) {
+      std::string monitor_error;
+      const int monitor_rc = audio_monitor_->Stop(&monitor_error);
+      if (monitor_rc != PU_OK) {
+        const std::string message =
+            "voice join refused: the input monitor could not be stopped: " + monitor_error;
+        if (error != nullptr) *error = message;
+        SetLastError(message);
+        return PU_ERR_STATE;
+      }
+      audio_monitor_->SetVoiceOwnsCapture(true);
+      voice_claim.Claim(audio_monitor_.get());
+    }
+  }
+
+  // v2.15：设备选择必须在建 PC / 音频启动之前真正写进 ADM（显式选择 > 系统默认）。
+  // 已经不按 NVIDIA/Broadcast 名字猜“物理麦”，也不把「缓存到下次 join」当实现；
+  // 设备消失时这里会回落系统默认，两种都失败则明确报错，不继续用未生效的设备。
+  {
+    int device_rc = PU_OK;
+    std::string device_error;
+    signaling_->BlockingCall(
+        [&] { device_rc = ApplySelectedAudioDevices(&device_error); });
+    if (device_rc != PU_OK) {
+      if (error != nullptr) *error = device_error;
+      SetLastError(device_error);
+      return PU_ERR_MEDIA;
+    }
+  }
 
   // v2.10 第 1 步：语音改用**自己的** PeerConnection（voice_pc_），不再借用屏幕的 pc_。
   // for_sending = !passive：主动加入的一方是 offerer，被动加入（1:1 的后加入者 / relay 下
@@ -3887,34 +5870,26 @@ int MediaEngine::VoiceJoin(const pu_voice_params* params, std::string* error) {
     if (error != nullptr) *error = add_error;
     return PU_ERR_STATE;
   }
-  // v2.6：显式选一个**物理**录音设备。默认设备可能是 NVIDIA Broadcast 这类虚拟麦，
-  // 无输入时输出数字静音，mute 的音频效果就没法验证。
-  signaling_->BlockingCall([&] {
-    if (voice_adm_ == nullptr) return;
-    const int16_t count = voice_adm_->RecordingDevices();
-    for (int16_t i = 0; i < count; ++i) {
-      char name[webrtc::kAdmMaxDeviceNameSize] = {0};
-      char guid[webrtc::kAdmMaxGuidSize] = {0};
-      if (voice_adm_->RecordingDeviceName(i, name, guid) != 0) continue;
-      const std::string n(name);
-      if (n.find("NVIDIA") != std::string::npos ||
-          n.find("Broadcast") != std::string::npos) {
-        continue;
-      }
-      if (voice_adm_->SetRecordingDevice(i) == 0) {
-        Log(3, "voice: recording device -> [%d] %s", static_cast<int>(i), name);
-        return;
-      }
-    }
-    Log(2, "voice: no physical recording device found (count=%d), keeping default",
-        static_cast<int>(count));
-  });
+  // v2.19：本端电平不再挂在通话音频轨的 sink 上——真机实测 m152 的**本地** audio track
+  // 从不调用 AddSink 注册的 sink（`localSink calls=0`，而远端音轨 sink 正常），所以那套
+  // 路径永远拿不到 PCM。改为从**同一条 ADM 的采集 observer**（AudioMonitor::OnCapturePcm）
+  // 计算 peak/rms：不额外开录音栈、不影响 monitor，且与 monitor 用同一个 ADM。
+  if (audio_monitor_ != nullptr) {
+    audio_monitor_->SetVoiceLevelEnabled(true);
+    Log(3, "voice level: enabled (source=ADM capture observer; local AudioTrack sink unused)");
+  }
   voice_channel_id_ = params->channel_id != nullptr ? params->channel_id : "";
   voice_mode_ = params->mode;
   voice_muted_ = false;
   voice_deafened_ = false;
+  // v2.15：设备热切会重启 ADM 的录音/播放，控制器按这里同步的镜像重新施加静音/闭音；
+  // 进入通话时镜像归零（false 不主动写 ADM，避免把系统里刚改的状态又改回去）。
+  if (audio_device_controller_ != nullptr) {
+    signaling_->BlockingCall([this] { audio_device_controller_->SetMuteState(false, false); });
+  }
   voice_joined_ = true;
   if (passive) {
+    voice_claim.Keep();
     Log(3, "voice: joined passive (waiting for the peer's offer)");
     return PU_OK;
   }
@@ -3932,17 +5907,21 @@ int MediaEngine::VoiceJoin(const pu_voice_params* params, std::string* error) {
     }
   }
   VoiceStartNegotiationEmit("offer");
+  voice_claim.Keep();
   Log(3, "voice: joined channel=%s mode=direct", voice_channel_id_.c_str());
   return PU_OK;
 }
 
 int MediaEngine::VoiceLeave() {
+  std::lock_guard<std::mutex> owner_lock(capture_owner_mu_);
   // v2.10 第 1 步：语音会话有自己的 PC，释放它不再依赖屏幕是否在跑。
   // 旧代码用 !running_ 判据是因为语音/屏幕共用一个 pc_（共享中不能拆）；现在两条 PC
   // 独立，恒拆即可——重进频道也从干净会话开始，不会留下「同一会话重协商」的旧 DTLS。
   voice_joined_ = false;
   voice_channel_id_.clear();
   ReleaseVoiceSession();
+  // AUD02：voice 释放录音方向，monitor 才能再次 Start（但它不会自动开始）。
+  if (audio_monitor_ != nullptr) audio_monitor_->SetVoiceOwnsCapture(false);
   Log(3, "voice: left (voice session released)");
   return PU_OK;
 }
@@ -3967,16 +5946,30 @@ int MediaEngine::VoiceSetMute(bool muted) {
   }
   int rc = PU_OK;
   bool adm_muted = false;
+  std::string mute_error;
+  // voice_muted_/voice_deafened_ 是控制线程状态；进 signaling 线程前先快照。
+  const bool deafened_now = voice_deafened_;
   // ADM 有线程归属：所有调用都投 signaling 线程（创建/Terminate 也在这条线程）。
   signaling_->BlockingCall([&] {
-    if (voice_adm_ == nullptr) {
+    if (voice_adm_ == nullptr || audio_device_controller_ == nullptr) {
       rc = PU_ERR_STATE;
+      mute_error = "audio device module is not created";
       return;
     }
-    rc = voice_adm_->SetMicrophoneMute(muted) == 0 ? PU_OK : PU_ERR_STATE;
-    voice_adm_->MicrophoneMute(&adm_muted);
+    // 只对输入方向执行真实的 SetMuted + 读回；另一个方向只更新镜像。这样本次
+    // 只改麦克风时，不会因为扬声器方向的重新施加失败而误报/误停。
+    rc = audio_device_controller_->SetMuteStateFor(AudioDeviceDirection::kInput, muted,
+                                                   muted, deafened_now, &mute_error);
+    if (rc == PU_OK) {
+      // 控制器已经读回确认；这里用请求值做日志，不再发一次可能失败的查询。
+      adm_muted = muted;
+    }
   });
-  if (rc == PU_OK) voice_muted_ = muted;
+  if (rc == PU_OK) {
+    voice_muted_ = muted;
+  } else {
+    SetLastError("pu_voice_set_mute: " + mute_error);
+  }
   Log(3, "voice: mute=%d rc=%d adm_muted=%d", muted ? 1 : 0, rc, adm_muted ? 1 : 0);
   return rc;
 }
@@ -3987,14 +5980,22 @@ int MediaEngine::VoiceSetDeafen(bool deafened) {
     return PU_ERR_STATE;
   }
   int rc = PU_OK;
+  std::string mute_error;
+  const bool muted_now = voice_muted_;
   signaling_->BlockingCall([&] {
-    if (voice_adm_ == nullptr) {
+    if (voice_adm_ == nullptr || audio_device_controller_ == nullptr) {
       rc = PU_ERR_STATE;
+      mute_error = "audio device module is not created";
       return;
     }
-    rc = voice_adm_->SetSpeakerMute(deafened) == 0 ? PU_OK : PU_ERR_STATE;
+    rc = audio_device_controller_->SetMuteStateFor(
+        AudioDeviceDirection::kOutput, deafened, muted_now, deafened, &mute_error);
   });
-  if (rc == PU_OK) voice_deafened_ = deafened;
+  if (rc == PU_OK) {
+    voice_deafened_ = deafened;
+  } else {
+    SetLastError("pu_voice_set_deafen: " + mute_error);
+  }
   Log(3, "voice: deafen=%d rc=%d", deafened ? 1 : 0, rc);
   return rc;
 }
@@ -4082,17 +6083,345 @@ PU_API int pu_screen_sources(pu_engine* e, pu_source_list* out) {
 }
 
 PU_API int pu_screen_watch(pu_engine* e, const char* sharer_id) {
-  static_cast<void>(sharer_id);
   if (e == nullptr) return PU_ERR_INVALID_ARG;
-  e->core.SetLastError("pu_screen_watch: not implemented in ABI v2");
-  return PU_NOT_IMPLEMENTED;
+  try {
+    std::string error;
+    const int rc = e->core.WatchTarget(sharer_id, -1, 0, &error);
+    if (rc != PU_OK) e->core.SetLastError(error.empty() ? "pu_screen_watch failed" : error);
+    return rc;
+  } catch (const std::exception& ex) {
+    e->core.SetLastError(std::string("pu_screen_watch exception: ") + ex.what());
+    return PU_ERR_INTERNAL;
+  } catch (...) {
+    e->core.SetLastError("pu_screen_watch: unknown exception");
+    return PU_ERR_INTERNAL;
+  }
+}
+
+/* v2.14：带服务端槽位/代次的观看入口（relay 用它做目标级帧归属）。 */
+PU_API int pu_screen_watch_ex(pu_engine* e, const char* sharer_id, int32_t slot,
+                              uint64_t generation) {
+  if (e == nullptr) return PU_ERR_INVALID_ARG;
+  try {
+    std::string error;
+    const int rc = e->core.WatchTarget(sharer_id, slot, generation, &error);
+    if (rc != PU_OK) e->core.SetLastError(error.empty() ? "pu_screen_watch_ex failed" : error);
+    return rc;
+  } catch (const std::exception& ex) {
+    e->core.SetLastError(std::string("pu_screen_watch_ex exception: ") + ex.what());
+    return PU_ERR_INTERNAL;
+  } catch (...) {
+    e->core.SetLastError("pu_screen_watch_ex: unknown exception");
+    return PU_ERR_INTERNAL;
+  }
 }
 
 PU_API int pu_screen_unwatch(pu_engine* e, const char* sharer_id) {
-  static_cast<void>(sharer_id);
   if (e == nullptr) return PU_ERR_INVALID_ARG;
-  e->core.SetLastError("pu_screen_unwatch: not implemented in ABI v2");
-  return PU_NOT_IMPLEMENTED;
+  try {
+    std::string error;
+    const int rc = e->core.UnwatchTarget(sharer_id, &error);
+    if (rc != PU_OK) e->core.SetLastError(error.empty() ? "pu_screen_unwatch failed" : error);
+    return rc;
+  } catch (const std::exception& ex) {
+    e->core.SetLastError(std::string("pu_screen_unwatch exception: ") + ex.what());
+    return PU_ERR_INTERNAL;
+  } catch (...) {
+    e->core.SetLastError("pu_screen_unwatch: unknown exception");
+    return PU_ERR_INTERNAL;
+  }
+}
+
+PU_API int pu_engine_caps(pu_engine* e, uint32_t* caps) {
+  if (e == nullptr) return PU_ERR_INVALID_ARG;
+  return e->core.EngineCaps(caps);
+}
+
+PU_API int pu_audio_devices(pu_engine* e, int32_t kind, pu_audio_device* out,
+                            uint32_t capacity) {
+  if (e == nullptr) return PU_ERR_INVALID_ARG;
+  try {
+    std::string error;
+    const int rc = e->core.AudioDevices(kind, out, capacity, &error);
+    if (rc < 0) e->core.SetLastError(error.empty() ? "pu_audio_devices failed" : error);
+    return rc;
+  } catch (const std::exception& ex) {
+    e->core.SetLastError(std::string("pu_audio_devices exception: ") + ex.what());
+    return PU_ERR_INTERNAL;
+  } catch (...) {
+    e->core.SetLastError("pu_audio_devices: unknown exception");
+    return PU_ERR_INTERNAL;
+  }
+}
+
+PU_API int pu_audio_status(pu_engine* e, pu_audio_status_info* out) {
+  if (e == nullptr) return PU_ERR_INVALID_ARG;
+  try {
+    std::string error;
+    const int rc = e->core.AudioStatus(out, &error);
+    if (rc != PU_OK) e->core.SetLastError(error.empty() ? "pu_audio_status failed" : error);
+    return rc;
+  } catch (const std::exception& ex) {
+    e->core.SetLastError(std::string("pu_audio_status exception: ") + ex.what());
+    return PU_ERR_INTERNAL;
+  } catch (...) {
+    e->core.SetLastError("pu_audio_status: unknown exception");
+    return PU_ERR_INTERNAL;
+  }
+}
+
+PU_API int pu_audio_set_device(pu_engine* e, int32_t kind, int32_t index) {
+  if (e == nullptr) return PU_ERR_INVALID_ARG;
+  try {
+    std::string error;
+    const int rc = e->core.SetAudioDevice(kind, index, &error);
+    if (rc != PU_OK) e->core.SetLastError(error.empty() ? "pu_audio_set_device failed" : error);
+    return rc;
+  } catch (const std::exception& ex) {
+    e->core.SetLastError(std::string("pu_audio_set_device exception: ") + ex.what());
+    return PU_ERR_INTERNAL;
+  } catch (...) {
+    e->core.SetLastError("pu_audio_set_device: unknown exception");
+    return PU_ERR_INTERNAL;
+  }
+}
+
+PU_API int pu_voice_level(pu_engine* e, pu_voice_level_info* out) {
+  if (e == nullptr) return PU_ERR_INVALID_ARG;
+  try {
+    return e->core.VoiceLevel(out);
+  } catch (const std::exception& ex) {
+    e->core.SetLastError(std::string("pu_voice_level exception: ") + ex.what());
+    return PU_ERR_INTERNAL;
+  } catch (...) {
+    e->core.SetLastError("pu_voice_level: unknown exception");
+    return PU_ERR_INTERNAL;
+  }
+}
+
+/* v2.18（AUD02）：独立本端输入电平。三个导出都是加法式，旧布局/默认行为不变。 */
+PU_API int pu_audio_monitor_start(pu_engine* e) {
+  if (e == nullptr) return PU_ERR_INVALID_ARG;
+  try {
+    std::string error;
+    const int rc = e->core.AudioMonitorStart(&error);
+    if (rc != PU_OK) {
+      e->core.SetLastError(error.empty() ? "pu_audio_monitor_start failed" : error);
+    }
+    return rc;
+  } catch (const std::exception& ex) {
+    e->core.SetLastError(std::string("pu_audio_monitor_start exception: ") + ex.what());
+    return PU_ERR_INTERNAL;
+  } catch (...) {
+    e->core.SetLastError("pu_audio_monitor_start: unknown exception");
+    return PU_ERR_INTERNAL;
+  }
+}
+
+PU_API int pu_audio_monitor_stop(pu_engine* e) {
+  if (e == nullptr) return PU_ERR_INVALID_ARG;
+  try {
+    std::string error;
+    const int rc = e->core.AudioMonitorStop(&error);
+    if (rc != PU_OK) {
+      e->core.SetLastError(error.empty() ? "pu_audio_monitor_stop failed" : error);
+    }
+    return rc;
+  } catch (const std::exception& ex) {
+    e->core.SetLastError(std::string("pu_audio_monitor_stop exception: ") + ex.what());
+    return PU_ERR_INTERNAL;
+  } catch (...) {
+    e->core.SetLastError("pu_audio_monitor_stop: unknown exception");
+    return PU_ERR_INTERNAL;
+  }
+}
+
+PU_API int pu_audio_monitor_status(pu_engine* e, pu_audio_monitor_info* out) {
+  if (e == nullptr) return PU_ERR_INVALID_ARG;
+  try {
+    std::string error;
+    const int rc = e->core.AudioMonitorStatus(out, &error);
+    if (rc != PU_OK) {
+      e->core.SetLastError(error.empty() ? "pu_audio_monitor_status failed" : error);
+    }
+    return rc;
+  } catch (const std::exception& ex) {
+    e->core.SetLastError(std::string("pu_audio_monitor_status exception: ") + ex.what());
+    return PU_ERR_INTERNAL;
+  } catch (...) {
+    e->core.SetLastError("pu_audio_monitor_status: unknown exception");
+    return PU_ERR_INTERNAL;
+  }
+}
+
+PU_API int pu_screen_receive_open(pu_engine* e, const char* session_id, uint32_t* out_token) {
+  if (e == nullptr || session_id == nullptr) return PU_ERR_INVALID_ARG;
+  try {
+    std::string error;
+    const int rc = e->core.OpenReceive(session_id, out_token, &error);
+    if (rc != PU_OK) e->core.SetLastError(error.empty() ? "pu_screen_receive_open failed" : error);
+    return rc;
+  } catch (const std::exception& ex) {
+    e->core.SetLastError(std::string("pu_screen_receive_open exception: ") + ex.what());
+    return PU_ERR_INTERNAL;
+  } catch (...) {
+    e->core.SetLastError("pu_screen_receive_open: unknown exception");
+    return PU_ERR_INTERNAL;
+  }
+}
+
+PU_API int pu_screen_receive_close(pu_engine* e, const char* session_id) {
+  if (e == nullptr) return PU_ERR_INVALID_ARG;
+  try {
+    std::string error;
+    const int rc = e->core.CloseReceive(session_id, &error);
+    if (rc != PU_OK) e->core.SetLastError(error.empty() ? "pu_screen_receive_close failed" : error);
+    return rc;
+  } catch (const std::exception& ex) {
+    e->core.SetLastError(std::string("pu_screen_receive_close exception: ") + ex.what());
+    return PU_ERR_INTERNAL;
+  } catch (...) {
+    e->core.SetLastError("pu_screen_receive_close: unknown exception");
+    return PU_ERR_INTERNAL;
+  }
+}
+
+PU_API int pu_signal_in_session(pu_engine* e, const char* media, const char* session_id,
+                                const char* payload, size_t len) {
+  if (e == nullptr) return PU_ERR_INVALID_ARG;
+  try {
+    const bool is_voice = media != nullptr && std::strcmp(media, "voice") == 0;
+    if (is_voice || session_id == nullptr || session_id[0] == '\0') {
+      // 空 session / voice：保持 pu_signal_in_media 的旧路由。
+      std::string error;
+      const int rc = e->core.SignalIn(media, payload, len, &error);
+      if (rc != PU_OK) e->core.SetLastError(error.empty() ? "pu_signal_in_session failed" : error);
+      return rc;
+    }
+    std::string error;
+    const int rc = e->core.SignalInReceive(session_id, payload, len, &error);
+    if (rc != PU_OK) e->core.SetLastError(error.empty() ? "pu_signal_in_session failed" : error);
+    return rc;
+  } catch (const std::exception& ex) {
+    e->core.SetLastError(std::string("pu_signal_in_session exception: ") + ex.what());
+    return PU_ERR_INTERNAL;
+  } catch (...) {
+    e->core.SetLastError("pu_signal_in_session: unknown exception");
+    return PU_ERR_INTERNAL;
+  }
+}
+
+PU_API int pu_screen_receive_stats(pu_engine* e, const char* session_id,
+                                   pu_receive_stats_info* out) {
+  if (e == nullptr || out == nullptr) return PU_ERR_INVALID_ARG;
+  try {
+    return e->core.ReceiveStats(session_id, out);
+  } catch (const std::exception& ex) {
+    e->core.SetLastError(std::string("pu_screen_receive_stats exception: ") + ex.what());
+    return PU_ERR_INTERNAL;
+  } catch (...) {
+    e->core.SetLastError("pu_screen_receive_stats: unknown exception");
+    return PU_ERR_INTERNAL;
+  }
+}
+
+PU_API int pu_screen_pause_send(pu_engine* e, int32_t paused) {
+  if (e == nullptr) return PU_ERR_INVALID_ARG;
+  try {
+    std::string error;
+    const int rc = e->core.PauseSend(paused != 0, &error);
+    if (rc != PU_OK) e->core.SetLastError(error.empty() ? "pu_screen_pause_send failed" : error);
+    return rc;
+  } catch (const std::exception& ex) {
+    e->core.SetLastError(std::string("pu_screen_pause_send exception: ") + ex.what());
+    return PU_ERR_INTERNAL;
+  } catch (...) {
+    e->core.SetLastError("pu_screen_pause_send: unknown exception");
+    return PU_ERR_INTERNAL;
+  }
+}
+
+PU_API int pu_screen_publish_open(pu_engine* e, const char* session_id, uint32_t* out_token) {
+  if (e == nullptr || session_id == nullptr) return PU_ERR_INVALID_ARG;
+  try {
+    std::string error;
+    const int rc = e->core.PublishOpen(session_id, out_token, &error);
+    if (rc != PU_OK) {
+      e->core.SetLastError(error.empty() ? "pu_screen_publish_open failed" : error);
+    }
+    return rc;
+  } catch (const std::exception& ex) {
+    e->core.SetLastError(std::string("pu_screen_publish_open exception: ") + ex.what());
+    return PU_ERR_INTERNAL;
+  } catch (...) {
+    e->core.SetLastError("pu_screen_publish_open: unknown exception");
+    return PU_ERR_INTERNAL;
+  }
+}
+
+PU_API int pu_screen_publish_signal_in(pu_engine* e, const char* session_id,
+                                       const char* payload, size_t len) {
+  if (e == nullptr) return PU_ERR_INVALID_ARG;
+  try {
+    std::string error;
+    const int rc = e->core.PublishSignalIn(session_id, payload, len, &error);
+    if (rc != PU_OK) {
+      e->core.SetLastError(error.empty() ? "pu_screen_publish_signal_in failed" : error);
+    }
+    return rc;
+  } catch (const std::exception& ex) {
+    e->core.SetLastError(std::string("pu_screen_publish_signal_in exception: ") + ex.what());
+    return PU_ERR_INTERNAL;
+  } catch (...) {
+    e->core.SetLastError("pu_screen_publish_signal_in: unknown exception");
+    return PU_ERR_INTERNAL;
+  }
+}
+
+PU_API int pu_screen_publish_close(pu_engine* e, const char* session_id) {
+  if (e == nullptr) return PU_ERR_INVALID_ARG;
+  try {
+    std::string error;
+    const int rc = e->core.PublishClose(session_id, &error);
+    if (rc != PU_OK) {
+      e->core.SetLastError(error.empty() ? "pu_screen_publish_close failed" : error);
+    }
+    return rc;
+  } catch (const std::exception& ex) {
+    e->core.SetLastError(std::string("pu_screen_publish_close exception: ") + ex.what());
+    return PU_ERR_INTERNAL;
+  } catch (...) {
+    e->core.SetLastError("pu_screen_publish_close: unknown exception");
+    return PU_ERR_INTERNAL;
+  }
+}
+
+PU_API int pu_screen_publish_stats(pu_engine* e, const char* session_id,
+                                   pu_publish_stats_info* out) {
+  if (e == nullptr || out == nullptr) return PU_ERR_INVALID_ARG;
+  try {
+    return e->core.PublishStats(session_id, out);
+  } catch (const std::exception& ex) {
+    e->core.SetLastError(std::string("pu_screen_publish_stats exception: ") + ex.what());
+    return PU_ERR_INTERNAL;
+  } catch (...) {
+    e->core.SetLastError("pu_screen_publish_stats: unknown exception");
+    return PU_ERR_INTERNAL;
+  }
+}
+
+PU_API int pu_screen_receive_rtp_stats(pu_engine* e, const char* session_id,
+                                       pu_rtp_stats_info* out) {
+  if (e == nullptr || out == nullptr) return PU_ERR_INVALID_ARG;
+  try {
+    return e->core.ReceiveRtpStats(session_id, out);
+  } catch (const std::exception& ex) {
+    e->core.SetLastError(std::string("pu_screen_receive_rtp_stats exception: ") + ex.what());
+    return PU_ERR_INTERNAL;
+  } catch (...) {
+    e->core.SetLastError("pu_screen_receive_rtp_stats: unknown exception");
+    return PU_ERR_INTERNAL;
+  }
 }
 
 PU_API int pu_frame_acquire(pu_engine* e, const char* stream_id, pu_frame* out) {

@@ -91,8 +91,6 @@ int CheckUnimplementedSurface(pu_engine* engine) {
       {"pu_voice_set_deafen(idle)", pu_voice_set_deafen(engine, 1), PU_ERR_STATE},
       // v2.7：未加入语音时按轨查询返回 0（也是「先问条数再分配」的用法）。
       {"pu_voice_tracks(idle)", pu_voice_tracks(engine, nullptr, 0), 0},
-      {"pu_screen_watch", pu_screen_watch(engine, "peer-1"), PU_NOT_IMPLEMENTED},
-      {"pu_screen_unwatch", pu_screen_unwatch(engine, "peer-1"), PU_NOT_IMPLEMENTED},
   };
 
   int failures = 0;
@@ -140,6 +138,70 @@ int CheckFrameSurface(pu_engine* engine) {
   pu_frame_release(engine, &frame);  // 不配对：void，必须能调用
   std::printf("frame surface: acquire(idle)=%d acquire(bad-stream)=%d, unpaired release ok\n",
               idle_rc, bad_rc);
+  return failures;
+}
+
+// v2.14：显式单流观看与音频能力的最小合同（不建 PC、不采屏、不录音）。
+//   * pu_engine_caps 必须明确广告 watch/slots/audio/level 四位；
+//   * watch 空目标/非法槽位必须拒绝；合法 arm 在无 PC 时也可成功（只是没有轨可挂）；
+//   * 旧代次必须被拒绝；unwatch 幂等；
+//   * 未加入语音时 pu_voice_level 返回 valid=0，而不是把 0 当有效电平。
+int CheckWatchAndAudioSurface(pu_engine* engine) {
+  int failures = 0;
+  uint32_t caps = 0;
+  if (pu_engine_caps(engine, &caps) != PU_OK || (caps & 0xFu) != 0xFu) {
+    std::printf("FAIL: pu_engine_caps = %u, want at least 0xF\n", caps);
+    ++failures;
+  } else {
+    std::printf("engine caps: 0x%x\n", caps);
+  }
+
+  if (pu_screen_watch_ex(engine, "peer-1", 2, 1) != PU_ERR_INVALID_ARG) {
+    std::printf("FAIL: watch_ex accepted slot=2\n");
+    ++failures;
+  }
+  if (pu_screen_watch(engine, "") != PU_ERR_INVALID_ARG) {
+    std::printf("FAIL: watch accepted an empty target\n");
+    ++failures;
+  }
+  if (pu_screen_watch_ex(engine, "peer-1", 0, 5) != PU_OK) {
+    std::printf("FAIL: watch_ex(peer-1, slot=0, gen=5) failed: %s\n", pu_last_error(engine));
+    ++failures;
+  }
+  if (pu_screen_watch_ex(engine, "peer-1", 0, 4) != PU_ERR_STATE) {
+    std::printf("FAIL: watch_ex accepted stale generation 4 after gen 5\n");
+    ++failures;
+  }
+  if (pu_screen_unwatch(engine, "peer-1") != PU_OK ||
+      pu_screen_unwatch(engine, "peer-1") != PU_OK) {
+    std::printf("FAIL: unwatch is not idempotent\n");
+    ++failures;
+  }
+
+  // 设备枚举：数量可以为 0（无声卡环境），但必须不是负数/崩溃。
+  const int inputs = pu_audio_devices(engine, 0, nullptr, 0);
+  const int outputs = pu_audio_devices(engine, 1, nullptr, 0);
+  if (inputs < 0 || outputs < 0) {
+    std::printf("FAIL: pu_audio_devices counts = %d/%d, want >= 0\n", inputs, outputs);
+    ++failures;
+  } else {
+    std::printf("audio devices: input=%d output=%d\n", inputs, outputs);
+  }
+  pu_audio_status_info status;
+  std::memset(&status, 0, sizeof(status));
+  status.struct_size = 0;
+  if (pu_audio_status(engine, &status) != PU_ERR_INVALID_ARG) {
+    std::printf("FAIL: pu_audio_status accepted struct_size=0\n");
+    ++failures;
+  }
+  pu_voice_level_info level;
+  std::memset(&level, 0, sizeof(level));
+  level.struct_size = sizeof(level);
+  if (pu_voice_level(engine, &level) != PU_OK || level.valid != 0) {
+    std::printf("FAIL: pu_voice_level(idle) valid=%d, want 0\n", level.valid);
+    ++failures;
+  }
+  std::printf("watch/audio surface: %d unexpected\n", failures);
   return failures;
 }
 
@@ -537,6 +599,7 @@ int main() {
   const int source_failures = CheckScreenSources(engine);
   const int surface_failures = CheckUnimplementedSurface(engine);
   const int frame_failures = CheckFrameSurface(engine);
+  const int watch_audio_failures = CheckWatchAndAudioSurface(engine);
 
   // pu_last_error 的指针在 destroy 之后失效，先拷出来。
   // 未经 stop 直接 destroy 也必须干净收尾（UI 直接退出的路径）。
@@ -643,6 +706,10 @@ int main() {
   if (frame_failures != 0) {
     std::printf("FAIL: pu_frame_acquire/release contract check found %d problem(s)\n",
                 frame_failures);
+    return 1;
+  }
+  if (watch_audio_failures != 0) {
+    std::printf("FAIL: watch/audio surface check found %d problem(s)\n", watch_audio_failures);
     return 1;
   }
   if (!peer_connected) {

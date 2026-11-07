@@ -83,11 +83,21 @@ type Room struct {
 // New 构造一个房间。send 负责把服务端产出的信令送给成员；
 // onChange 在「槽位 → 成员」映射变化时被调用（hub 用它重播 voice.state）。
 func New(channelID string, log *slog.Logger, send SignalSender, onChange func()) (*Room, error) {
+	return NewWithICE(channelID, log, send, onChange, ICEConfig{})
+}
+
+// NewWithICE 与 New 相同，但把媒体 ICE 的端口范围/对外 IP 配置注入 Pion。
+// 生产路径由 hub 传入 CLI 解析出的配置；New 保留为「不限制」的便捷入口
+// （既有测试与不关心部署细节的调用方继续可用）。
+func NewWithICE(channelID string, log *slog.Logger, send SignalSender, onChange func(), ice ICEConfig) (*Room, error) {
 	media := &webrtc.MediaEngine{}
 	if err := media.RegisterDefaultCodecs(); err != nil {
 		return nil, fmt.Errorf("register default codecs: %w", err)
 	}
-	api := webrtc.NewAPI(webrtc.WithMediaEngine(media))
+	api, err := newAPIWithICE(media, ice)
+	if err != nil {
+		return nil, fmt.Errorf("webrtc api: %w", err)
+	}
 	if log == nil {
 		log = slog.Default()
 	}

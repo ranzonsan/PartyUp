@@ -60,12 +60,12 @@ func (h *Hub) ensureRoom(channelID string) (*sfu.Room, error) {
 	}
 	h.mu.RUnlock()
 
-	room, err := sfu.New(channelID, h.log, func(memberID, kind, payload string) {
+	room, err := sfu.NewWithICE(channelID, h.log, func(memberID, kind, payload string) {
 		h.deliverVoiceSignal(channelID, memberID, kind, payload)
 	}, func() {
 		// 发布者首次发声 → 槽位分配完成 → 广播新的槽位映射。
 		h.broadcastVoiceState(channelID)
-	})
+	}, h.iceConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -130,7 +130,9 @@ func (h *Hub) broadcastVoiceState(channelID string) {
 	}
 	targets := make([]*conn, 0, len(h.subs[channelID]))
 	for peer := range h.subs[channelID] {
-		targets = append(targets, peer)
+		if peer.authed {
+			targets = append(targets, peer)
+		}
 	}
 	room := h.rooms[channelID]
 	transport, transportReason := h.channelTransportLocked(channelID)
@@ -172,9 +174,7 @@ func (h *Hub) broadcastVoiceState(channelID string) {
 		return
 	}
 	for _, peer := range targets {
-		if peer.authed {
-			peer.enqueueBytes(data)
-		}
+		peer.enqueueBytes(data)
 	}
 }
 
@@ -207,9 +207,43 @@ func (h *Hub) detachVoiceMemberLocked(channelID, memberID string) (leave, close 
 	return nil, nil
 }
 
-// leaveVoiceChannel 让成员离开某个频道的语音（退订/断线/显式 leave 都用这条）。
-func (h *Hub) leaveVoiceChannel(memberID, channelID string) {
+// addVoiceOwnerLocked 记录 c 对 (channel, member) 语音状态的持有。调用方必须持 h.mu。
+func (h *Hub) addVoiceOwnerLocked(c *conn, channelID string) {
+	if h.voiceOwners[channelID] == nil {
+		h.voiceOwners[channelID] = make(map[string]map[*conn]struct{}, 4)
+	}
+	owners := h.voiceOwners[channelID][c.member.ID]
+	if owners == nil {
+		owners = make(map[*conn]struct{}, 2)
+		h.voiceOwners[channelID][c.member.ID] = owners
+	}
+	owners[c] = struct{}{}
+	c.voiceChannels[channelID] = struct{}{}
+}
+
+// leaveVoiceForConn 让**一条连接**释放它在某频道的语音持有权。
+//
+// 语音状态按 member_id 存在，但同一成员可能有多条连接（甚至同一频道）。只有该成员
+// 在这个频道已无任何持有连接时，才真正把成员移出语音、释放 SFU 房间槽位。退订、
+// 显式 voice.leave、断线都走这条，因此单连接断开不会清掉另一条连接的语音。
+func (h *Hub) leaveVoiceForConn(c *conn, channelID string) {
 	h.mu.Lock()
+	memberID := c.member.ID
+	delete(c.voiceChannels, channelID)
+	owners := h.voiceOwners[channelID][memberID]
+	if owners != nil {
+		delete(owners, c)
+		if len(owners) == 0 {
+			delete(h.voiceOwners[channelID], memberID)
+		}
+	}
+	if len(h.voiceOwners[channelID]) == 0 {
+		delete(h.voiceOwners, channelID)
+	}
+	if len(owners) > 0 {
+		h.mu.Unlock()
+		return
+	}
 	leave, closeRoom := h.detachVoiceMemberLocked(channelID, memberID)
 	h.mu.Unlock()
 
@@ -222,36 +256,20 @@ func (h *Hub) leaveVoiceChannel(memberID, channelID string) {
 	if leave != nil || closeRoom != nil {
 		h.log.Info("voice: member left", "channel", channelID, "member", memberID)
 		h.broadcastVoiceState(channelID)
+		h.broadcastMemberState()
 	}
 }
 
-// leaveVoiceEverywhere 在连接断开时清掉该成员在所有频道的语音状态。
-func (h *Hub) leaveVoiceEverywhere(memberID string) {
-	h.mu.Lock()
-	type change struct {
-		channelID string
-		leave     *sfu.Room
-		closeRoom *sfu.Room
+// leaveVoiceConnEverywhere 连接断开时释放它在所有频道的语音持有权。
+func (h *Hub) leaveVoiceConnEverywhere(c *conn) {
+	h.mu.RLock()
+	channels := make([]string, 0, len(c.voiceChannels))
+	for channelID := range c.voiceChannels {
+		channels = append(channels, channelID)
 	}
-	changes := make([]change, 0, 2)
-	for channelID := range h.voice {
-		if _, ok := h.voice[channelID][memberID]; !ok {
-			continue
-		}
-		leave, closeRoom := h.detachVoiceMemberLocked(channelID, memberID)
-		changes = append(changes, change{channelID: channelID, leave: leave, closeRoom: closeRoom})
-	}
-	h.mu.Unlock()
-
-	for _, ch := range changes {
-		if ch.leave != nil {
-			ch.leave.Leave(memberID)
-		}
-		if ch.closeRoom != nil {
-			ch.closeRoom.Close()
-		}
-		h.log.Info("voice: member dropped", "channel", ch.channelID, "member", memberID)
-		h.broadcastVoiceState(ch.channelID)
+	h.mu.RUnlock()
+	for _, channelID := range channels {
+		h.leaveVoiceForConn(c, channelID)
 	}
 }
 
@@ -351,18 +369,20 @@ func (c *conn) handleVoiceJoin(env protocol.Envelope) {
 			TransportReason: transportReason,
 		}
 	}
+	// 无论是否首次加入，这条连接都成为该成员语音状态的一个持有者。
+	h.addVoiceOwnerLocked(c, channelID)
 	h.mu.Unlock()
 
 	if transport == "relay" {
 		room, err := h.ensureRoom(channelID)
 		if err != nil {
-			// 加入失败要回滚刚写进 voice 表的成员，避免幽灵成员。
-			c.hub.leaveVoiceChannel(memberID, channelID)
+			// 加入失败要回滚**这条连接**的持有权；若其他连接仍持有，语音状态保留。
+			c.hub.leaveVoiceForConn(c, channelID)
 			c.replyError(env.Type, protocol.CodeInternal, "create relay room: "+err.Error(), env.ID)
 			return
 		}
 		if err := room.Join(memberID); err != nil {
-			c.hub.leaveVoiceChannel(memberID, channelID)
+			c.hub.leaveVoiceForConn(c, channelID)
 			c.replyError(env.Type, protocol.CodeInternal, "join relay room: "+err.Error(), env.ID)
 			return
 		}
@@ -378,6 +398,7 @@ func (c *conn) handleVoiceJoin(env protocol.Envelope) {
 	if !already {
 		h.log.Info("voice: joined", "channel", channelID, "member", memberID, "transport", transport)
 		h.broadcastVoiceState(channelID)
+		h.broadcastMemberState()
 	}
 }
 
@@ -402,7 +423,7 @@ func (c *conn) handleVoiceLeave(env protocol.Envelope) {
 		c.replyError(env.Type, protocol.CodeInvalidArgument, "channel_id is required", env.ID)
 		return
 	}
-	c.hub.leaveVoiceChannel(c.member.ID, channelID)
+	c.hub.leaveVoiceForConn(c, channelID)
 	c.replyOK(env, protocol.VoiceJoinOK{ChannelID: channelID})
 }
 
@@ -591,9 +612,9 @@ func (h *Hub) ensureVideoRoom(channelID string) (*sfu.VideoRoom, error) {
 	}
 	h.mu.RUnlock()
 
-	room, err := sfu.NewVideo(channelID, h.log, func(memberID, kind, payload string) {
+	room, err := sfu.NewVideoWithICE(channelID, h.log, func(memberID, kind, payload string) {
 		h.deliverScreenSignal(channelID, memberID, kind, payload)
-	}, nil)
+	}, nil, h.iceConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -609,7 +630,10 @@ func (h *Hub) ensureVideoRoom(channelID string) (*sfu.VideoRoom, error) {
 
 // joinVideoRoom 在**订阅**频道时把成员接进视频房间（仅 screen_mode=relay）。
 // 观看者必须提前就绪，才能在共享开始的瞬间就收到槽位；direct 模式不建视频 PC。
-func (h *Hub) joinVideoRoom(channelID, memberID string) {
+//
+// manual=true（新客户端声明 screen.watch.v1）：建 PC 但**不自动绑定任何共享**，
+// 只有 screen.watch 才绑定目标——未点不接收。manual=false 保持 v1 自动观看。
+func (h *Hub) joinVideoRoom(channelID, memberID string, manual bool) {
 	h.mu.RLock()
 	mode := h.screenMode
 	h.mu.RUnlock()
@@ -623,10 +647,17 @@ func (h *Hub) joinVideoRoom(channelID, memberID string) {
 	}
 	// Join 里有 ICE gathering（几十毫秒），放在 goroutine 里避免阻塞 subscribe 应答。
 	go func() {
-		if err := room.Join(memberID); err != nil {
+		if err := room.JoinWithMode(memberID, manual); err != nil {
 			h.log.Error("join video room", "channel", channelID, "member", memberID, "err", err)
 		}
 	}()
+}
+
+// videoRoom 返回频道当前的视频中继房间（没有则 nil）。
+func (h *Hub) videoRoom(channelID string) *sfu.VideoRoom {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.videoRooms[channelID]
 }
 
 // leaveVideoRoom 让成员离开视频房间；频道空了就关房间（仅 relay）。
@@ -646,10 +677,30 @@ func (h *Hub) leaveVideoRoom(channelID, memberID string) {
 	h.mu.Unlock()
 }
 
-// leaveVideoRoomsEverywhere 在连接断开时把该成员从所有视频房间摘掉。
-func (h *Hub) leaveVideoRoomsEverywhere(memberID string, channels []string) {
+// leaveVideoRoomForConn 在**这条连接**退出频道后发现成员是否还被同一成员的其他连接
+// 订阅着；只有都不再订阅时才真正把成员从视频房间摘掉。多 WebSocket 下不能被单连接
+// 断开误清另一条连接的视频 PC。
+func (h *Hub) leaveVideoRoomForConn(c *conn, channelID string) {
+	h.mu.RLock()
+	memberID := c.member.ID
+	stillSubscribed := false
+	for peer := range h.subs[channelID] {
+		if peer != c && peer.authed && peer.member.ID == memberID {
+			stillSubscribed = true
+			break
+		}
+	}
+	h.mu.RUnlock()
+	if stillSubscribed {
+		return
+	}
+	h.leaveVideoRoom(channelID, memberID)
+}
+
+// leaveVideoRoomsForConn 在连接断开时释放它在这些频道里的视频成员资格。
+func (h *Hub) leaveVideoRoomsForConn(c *conn, channels []string) {
 	for _, ch := range channels {
-		h.leaveVideoRoom(ch, memberID)
+		h.leaveVideoRoomForConn(c, ch)
 	}
 }
 
@@ -704,6 +755,50 @@ func (h *Hub) StopVideoShare(channelID, memberID string) {
 }
 
 // deliverScreenSignal 把服务端视频 PC 的信令投递给某个成员（media.signal, media=screen, target=sfu）。
+// notifyDirectViewerClosed / Arm 是 B2 的 direct（P2P 1v1）会话控制：
+// 观看者停看/重看时通知共享者停止/恢复向该 viewer 的发送传输。共享者保留
+// capture/source/track 与 screen.state 的发布状态，不能因此全局 screen.stop。
+// relay 不使用它：接收传输在服务端，关接收 PC 即停转发。
+func (h *Hub) notifyDirectViewerClosed(channelID, sharerID, viewerID string) {
+	h.notifyDirectViewerControl(channelID, sharerID, viewerID, protocol.MediaSignalKindViewerClose)
+}
+
+func (h *Hub) notifyDirectViewerArm(channelID, sharerID, viewerID string) {
+	h.notifyDirectViewerControl(channelID, sharerID, viewerID, protocol.MediaSignalKindViewerArm)
+}
+
+func (h *Hub) notifyDirectViewerControl(channelID, sharerID, viewerID, kind string) {
+	if sharerID == "" || viewerID == "" {
+		return
+	}
+	h.mu.RLock()
+	targets := make([]*conn, 0, 2)
+	for c := range h.subs[channelID] {
+		if c.authed && c.member.ID == sharerID {
+			targets = append(targets, c)
+		}
+	}
+	h.mu.RUnlock()
+	if len(targets) == 0 {
+		return
+	}
+	data, err := protocol.MustNew(protocol.TypeMediaSignal, protocol.MediaSignalPush{
+		ChannelID: channelID,
+		From:      viewerID,
+		Media:     "screen",
+		Kind:      kind,
+	}).Marshal()
+	if err != nil {
+		h.log.Error("marshal direct viewer control", "kind", kind, "err", err)
+		return
+	}
+	for _, target := range targets {
+		target.enqueueBytes(data)
+	}
+	h.log.Info("direct viewer control sent", "channel", channelID, "sharer", sharerID,
+		"viewer", viewerID, "kind", kind)
+}
+
 func (h *Hub) deliverScreenSignal(channelID, memberID, kind, payload string) {
 	h.mu.RLock()
 	var target *conn

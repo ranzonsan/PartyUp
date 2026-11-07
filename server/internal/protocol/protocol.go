@@ -17,6 +17,62 @@ import (
 // Version 是信封的 v 字段。docs/PROTOCOL.md §0：当前恒为 1。
 const Version = 1
 
+// 能力协商字符串（加法式，不改变信封版本）。
+//
+// 旧客户端不认识它们：auth 请求里不带 capabilities，服务端按 v1 行为处理
+// （订阅即自动观看全部共享）。新客户端带 CapabilityScreenWatch 表示「我会用
+// screen.watch / screen.unwatch 显式选台，未选台时不要给我绑定任何视频」。
+const (
+	// CapabilityScreenWatch 是**客户端 → 服务端**的 opt-in，也是服务端 → 客户端
+	// 的能力广告（auth.ok.server.capabilities）。它同时要求媒体核心有显式的
+	// watch/帧代次能力（由 pu_screen_watch_caps 探测，不能只看导出是否存在）。
+	CapabilityScreenWatch = "screen.watch.v1"
+	// CapabilityScreenWatchSlots 表示服务端会在 screen.watch.ok 里下发 relay
+	// 槽位号与单调 generation，供原生把帧归属绑定到「目标 + 代次」。
+	CapabilityScreenWatchSlots = "screen.watch.slots.v1"
+	// CapabilityScreenWatchIsolated 是 B2 严格接收传输的显式 opt-in：
+	// 客户端在 auth 里声明它 + 媒体核心有 receive-only 会话能力后，screen.watch
+	// 必须带 receive_id；服务端为每次 watch 新建一条**只接收**的 PeerConnection
+	//（新 ICE/DTLS/SSRC、session + nonce），不再复用发布 PC 上的观看槽。
+	//
+	// 它独立于 CapabilityScreenWatch：只声明旧能力、不声明本能力的客户端继续走
+	// v1.1 的混合 PC 槽位路径，行为不变。旧服务端/旧 DLL 不广告本能力时客户端
+	// 必须明确报不支持，不能退回「换槽/贴代次」冒充严格隔离。
+	CapabilityScreenWatchIsolated = "screen.watch.isolated.v1"
+	// CapabilityScreenPublishSessions 是**客户端 → 服务端**的 opt-in（B2b direct）：
+	// 本连接（作为共享者）能为单个 viewer 建立**独立的发送传输/会话**——新
+	// PeerConnection（新 ICE/DTLS/SSRC），复用已存在的采集源与视频轨，per-viewer
+	// open/close，不重启采集、不全局 screen.stop。
+	//
+	// direct 严格 watch 必须同时满足：viewer 声明 CapabilityScreenWatchIsolated +
+	// 共享者的**发布连接**声明本能力。共享者不具备时服务端明确 NOT_IMPLEMENTED，
+	// 绝不悄悄退回旧共享 PC 的暂停/恢复冒充隔离。relay 不使用本能力（接收传输在
+	// 服务端 SFU）。
+	CapabilityScreenPublishSessions = "screen.publish.sessions.v1"
+)
+
+// MediaSignalKind 是 media.signal.kind 的取值。
+const (
+	MediaSignalKindOffer     = "offer"
+	MediaSignalKindAnswer    = "answer"
+	MediaSignalKindCandidate = "candidate"
+	// MediaSignalKindViewerClose / ViewerArm 是服务端 → 共享者的**会话控制**，
+	// 只用于 direct（P2P 1v1）：观看者停看/重看时通知共享者停止或恢复向该
+	// viewer 的发送传输。共享者保留采集源、视频轨与 screen.state 的发布状态，
+	// 绝不等价于全局 screen.stop。
+	//
+	// 两种载荷形态（用 session_id 区分）：
+	//   - 空 session_id：legacy 观看者，共享者只暂停/恢复既有 PC 对该 viewer 的发送；
+	//   - 非空 session_id：B2b 严格观看者，共享者建立/关闭**该会话自己的发送传输**
+	//     （新 PC），session_nonce/generation 来自服务端 arm，不能由客户端自报。
+	MediaSignalKindViewerClose = "viewer_close"
+	MediaSignalKindViewerArm   = "viewer_arm"
+	// MediaSignalKindReceiveClose 是服务端 → 观看者的**会话控制**（B2b direct）：
+	// 共享者停发/断线/会话被撤销时，通知观看者关闭对应 receive 会话。观看者只
+	// 销毁自己的接收传输，不碰发布、采集或语音。
+	MediaSignalKindReceiveClose = "receive_close"
+)
+
 // 载荷上限。骨架先用固定值，后续按 PROTOCOL.md §8 的扩展位调整。
 const (
 	MaxBodyBytes     = 4096  // text.send.body 的 UTF-8 字节上限
@@ -42,6 +98,45 @@ const (
 	// PROTOCOL.md 的第一批里没有它，而 HTTP 400 与 WS 参数错误需要一个稳定名字，
 	// 建议下一版文档补入（见 spike 文档）。
 	CodeInvalidArgument = "INVALID_ARGUMENT"
+
+	// CodeSessionReplaced 表示这个 token 已被该账号**更新的一次登录**撤销
+	// （单端登录：新登录踢掉旧会话）。与 UNAUTHENTICATED 分开是为了让客户端能
+	// 把「账号已在另一处登录」和「token 是乱填的/已过期」区分开提示用户。
+	// 见 PROTOCOL.md §1.1 的 auth.err 码表与 §1.2 的 session.replaced。
+	CodeSessionReplaced = "SESSION_REPLACED"
+
+	// 身份/权限第一批错误码（2026-11-07，规格 `.docs/identity-and-onboarding-20261107.md` §9）。
+	// 与既有码一样用 UPPER_SNAKE；规格里的 member_banned 等小写名是同一批码的口语写法。
+	//
+	// CodeMemberBanned：该账号已被封禁（登录/WS 鉴权//api/me 一律拒绝）。
+	CodeMemberBanned = "MEMBER_BANNED"
+	// CodeOwnerOnly：该操作只有 owner 能做（任免管理员、危险设置、转让所有权）。
+	CodeOwnerOnly = "OWNER_ONLY"
+	// CodeAdminOnly：该操作至少需要 admin（普通用户访问管理端点）。
+	CodeAdminOnly = "ADMIN_ONLY"
+	// CodeNotBootstrapped：服务器还没有 owner（未初始化），需要先 bootstrap。
+	CodeNotBootstrapped = "NOT_BOOTSTRAPPED"
+	// CodeAlreadyBootstrapped：服务器已初始化，bootstrap 被拒绝。
+	CodeAlreadyBootstrapped = "ALREADY_BOOTSTRAPPED"
+)
+
+// WebSocket 关闭码（RFC 6455 §7.4.2：4000–4999 是应用私有段）。
+//
+// 关闭码与 session.replaced 的 reason 一一对应，客户端可以只按码做兜底、
+// 也可以按应用层 reason 显示更准确的文案（两处都提供是为了排障友好）：
+//
+//	4001 login_elsewhere —— 同一账号在别处登录，旧会话被替换（batch 1 已验收，语义不变）
+//	4002 kicked          —— 被管理员踢下线（2026-11-07 补）
+//	4003 banned          —— 被管理员封禁（2026-11-07 补）
+const (
+	// CloseSessionReplaced：连接因会话被替换或主动退出而由服务端结束。
+	// 这一帧之前服务端一定先发过一条 session.replaced 应用层消息——客户端应以
+	// 应用层消息的 reason 决定提示文案，关闭码只用于诊断与兜底。
+	CloseSessionReplaced = 4001
+	// CloseSessionKicked：被管理员踢下线（会话已撤销，不能自动重连）。
+	CloseSessionKicked = 4002
+	// CloseSessionBanned：被管理员封禁（账号级，之后登录会被 403 MEMBER_BANNED）。
+	CloseSessionBanned = 4003
 )
 
 // 消息类型（type 字段）。命名规则 `<域>.<动作>`，响应为 `+".ok"` / `+".err"`。
@@ -58,12 +153,21 @@ const (
 	TypeTextHistory    = "text.history"
 	TypePresence       = "presence"
 	TypeMemberRegister = "member.register"
+	// 全服务器名册：member.list 是认证后的请求，members.state 是变化推送。
+	// presence 仍是频道内订阅者列表（兼容旧客户端），两者不互相替代。
+	TypeMemberList   = "member.list"
+	TypeMembersState = "members.state"
 
 	// 屏幕共享与媒体信令（PROTOCOL.md §4.2 / §5）。
 	TypeScreenStart = "screen.start"
 	TypeScreenStop  = "screen.stop"
 	TypeScreenState = "screen.state"
 	TypeMediaSignal = "media.signal"
+	// v1.1：观看者显式选择/停止一路共享（一次一路）。
+	// 旧客户端不发这两条消息 = 保留 v1 自动观看行为；新客户端在 auth 里声明
+	// CapabilityScreenWatch 后，服务端只为它绑定已 watch 的目标。
+	TypeScreenWatch   = "screen.watch"
+	TypeScreenUnwatch = "screen.unwatch"
 
 	// 语音（PROTOCOL.md §4）。relay 模式由服务端 SFU 中继，direct 模式走 media.signal 直连。
 	TypeVoiceJoin      = "voice.join"
@@ -79,7 +183,46 @@ const (
 	// TypeVoiceTransportFailed 是客户端**上报事实**的消息（PROTOCOL.md §4.4）：
 	// 「我这边直连 ICE 失败/超时」。是否有必要降级、怎么降级，由服务端决定。
 	TypeVoiceTransportFailed = "voice.transport_failed"
+
+	// TypeSessionReplaced 是**服务端 → 客户端**的会话终止通知（单端登录/踢下线/
+	// 封禁/主动退出，PROTOCOL.md §1.2）：这条连接所属的 token 已被撤销，服务端
+	// 发送本消息后立即关闭连接（关闭码见 CloseCodeForSessionReason）。
+	//
+	// 单向通知、没有 .ok/.err 响应，客户端不应回包。收到后应停止重连循环并按
+	// reason 提示用户（login_elsewhere = 「账号已在另一处登录」、kicked =
+	// 「已被管理员移出」、banned = 「账号已被封禁」），否则会被下一次登录/鉴权
+	// 再次踢掉。
+	TypeSessionReplaced = "session.replaced"
 )
+
+// session.replaced 的 reason 取值（PROTOCOL.md §1.2）。
+const (
+	// SessionReasonLoginElsewhere：同一账号在别处登录成功，本会话被替换。
+	SessionReasonLoginElsewhere = "login_elsewhere"
+	// SessionReasonLogout：用户调用 POST /api/logout **主动退出**，同一 token 的
+	// 所有连接都会收到。客户端按「主动退出」处理，不提示被顶号。
+	SessionReasonLogout = "logout"
+	// SessionReasonKicked：被管理员踢下线（POST /api/admin/members/{id}/kick）。
+	SessionReasonKicked = "kicked"
+	// SessionReasonBanned：被管理员封禁（POST /api/admin/members/{id}/ban）。
+	SessionReasonBanned = "banned"
+)
+
+// CloseCodeForSessionReason 把 session.replaced 的 reason 映射成 WebSocket 关闭码。
+//
+// 未知 reason 回退到 4001（旧客户端只认这一个码，不能让它们因为新 reason 拿不到
+// 已知关闭语义）。主动退出（logout）沿用 4001：它同样是「这条连接所属的会话结束」，
+// 客户端本来就在退出流程里，不需要区分。
+func CloseCodeForSessionReason(reason string) int {
+	switch reason {
+	case SessionReasonKicked:
+		return CloseSessionKicked
+	case SessionReasonBanned:
+		return CloseSessionBanned
+	default:
+		return CloseSessionReplaced
+	}
+}
 
 // TypeOK 返回请求类型对应的成功响应类型：`text.send` → `text.send.ok`。
 func TypeOK(reqType string) string { return reqType + ".ok" }
@@ -170,7 +313,14 @@ func (e Envelope) DecodePayload(out any) error {
 type Member struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
-	// Admin 标记是否由 bootstrap 创建。骨架里只有它影响邀请码管理入口。
+	// DisplayName 是展示名，独立于唯一的登录名 Name（2026-11-06 补入）。
+	// 旧库/未设置显示名时等于 Name；客户端应优先显示它，但**不得**把它当身份 ID。
+	DisplayName string `json:"display_name"`
+	// Role 是服务端唯一权限真源（2026-11-07）："owner" | "admin" | "user"。
+	// 旧客户端忽略未知字段即可；新客户端用它决定「服务器管理」入口。
+	Role string `json:"role"`
+	// Admin 是旧协议的布尔兼容位，恒等于 role 是 admin 或 owner。
+	// 新代码一律读 Role；保留它是为了让旧客户端仍能工作。
 	Admin bool `json:"admin"`
 }
 
@@ -226,15 +376,20 @@ type TextMessage struct {
 	Seq        int64  `json:"seq"`
 	MemberID   string `json:"member_id"`
 	MemberName string `json:"member_name"`
-	Body       string `json:"body"`
-	TS         int64  `json:"ts"`
+	// MemberDisplayName 是展示名（2026-11-06 补入）。MemberName 仍是唯一登录名，
+	// 两者都下发，旧客户端继续读 member_name，新客户端优先显示 display 名。
+	MemberDisplayName string `json:"member_display_name"`
+	Body              string `json:"body"`
+	TS                int64  `json:"ts"`
 }
 
 // PresenceMember 是 presence 里的成员条目。
 type PresenceMember struct {
 	MemberID string `json:"member_id"`
 	Name     string `json:"name"`
-	State    string `json:"state"` // online | voice | sharing
+	// DisplayName 与 name 同时下发：name 保持唯一登录名语义，display_name 仅用于展示。
+	DisplayName string `json:"display_name"`
+	State       string `json:"state"` // online | voice | sharing
 }
 
 // ------------------------------------------------------------------
@@ -244,12 +399,27 @@ type PresenceMember struct {
 // AuthRequest 是 auth 的载荷。
 type AuthRequest struct {
 	Token string `json:"token"`
+	// Capabilities 是客户端的**加法式**能力声明。旧客户端省略 = 空数组，
+	// 服务端按 v1 兼容行为处理；新客户端用 CapabilityScreenWatch 声明
+	// 「我会显式 screen.watch，未选台时不要自动观看」。
+	Capabilities []string `json:"capabilities,omitempty"`
 }
 
 // AuthOK 是 auth.ok 的载荷。
 type AuthOK struct {
 	Member Member     `json:"member"`
 	Server ServerInfo `json:"server"`
+}
+
+// SessionReplacedPayload 是 session.replaced 的载荷（服务端 → 客户端单向通知）。
+//
+// 字段刻意只有一个 reason：客户端不需要（也不应该）根据服务端下发的任何 id
+// 决定是否断开——收到这条消息本身就意味着「当前连接所属的会话已经失效」。
+type SessionReplacedPayload struct {
+	// Reason 是失效原因，取值见 SessionReasonLoginElsewhere / SessionReasonKicked /
+	// SessionReasonBanned（主动退出为 SessionReasonLogout）。关闭码由
+	// CloseCodeForSessionReason 给出同义映射。
+	Reason string `json:"reason"`
 }
 
 // ChannelListOK 是 channel.list.ok 的载荷。
@@ -310,9 +480,40 @@ type TextHistoryOK struct {
 }
 
 // PresencePayload 是 presence 推送的载荷。
+//
+// 注意这是**频道范围**列表（频道当前订阅者），语义与 v1 一致；全服务器名册见
+// MemberListOK / MembersStatePayload。两者刻意分开：旧客户端只消费 presence，
+// 不会因为收到全服数据而把「频道内成员」显示成全服名单。
 type PresencePayload struct {
 	ChannelID string           `json:"channel_id"`
 	Members   []PresenceMember `json:"members"`
+}
+
+// MemberRosterEntry 是全服务器名册（含离线）的一项。
+//
+// Online 按 member_id 聚合该成员的所有 WebSocket；State 由服务端推导：
+//   - offline：没有任何已鉴权连接；
+//   - idle：在线，但不在任何频道的语音里（「空闲」不等于没有键盘活动）；
+//   - voice：在线且至少在一个频道的语音里。
+//
+// VoiceChannelIDs 是**实际**语音频道集合，按 id 排序。它可能多于一项（同一成员
+// 可通过多条连接分别进入不同频道），因此不能用单个字段冒充唯一频道。
+// 文字订阅是另一套状态，不在这里、也不能拿来推断语音位置。
+type MemberRosterEntry struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	DisplayName string `json:"display_name"`
+	// Role 与 Member.Role 同义；Admin 是兼容位（role ∈ {owner,admin}）。
+	Role            string   `json:"role"`
+	Admin           bool     `json:"admin"`
+	Online          bool     `json:"online"`
+	State           string   `json:"state"` // offline | idle | voice
+	VoiceChannelIDs []string `json:"voice_channel_ids"`
+}
+
+// MemberListOK 既是 member.list.ok 的载荷，也是 members.state 推送的载荷。
+type MemberListOK struct {
+	Members []MemberRosterEntry `json:"members"`
 }
 
 // ------------------------------------------------------------------
@@ -340,6 +541,71 @@ type ScreenStatePayload struct {
 	Shares []ShareState `json:"shares"`
 }
 
+// ScreenWatchRequest 是 screen.watch 的载荷：观看者显式选择一路共享。
+//
+// 一次一路：同一成员在同意频道再次 watch 会替换旧目标（服务端先解绑旧槽）。
+// SharerID 必须当前正在共享且与观看者同频道；不能 watch 自己。
+type ScreenWatchRequest struct {
+	ChannelID string `json:"channel_id"`
+	SharerID  string `json:"sharer_id"`
+	// ReceiveID 是严格接收传输的客户端会话标识（B2，随机 16–64 字节的
+	// URL-safe 字符串）。客户端必须在发出本请求**之前**用它建好 native 的
+	// receive-only 会话，服务端的 offer 才能落到同一条接收 PC 上。
+	//
+	// 只有声明了 CapabilityScreenWatchIsolated 的连接才允许/必须带它：
+	// 省略时按旧 v1.1 混合槽位路径处理，行为不变。
+	ReceiveID string `json:"receive_id,omitempty"`
+}
+
+// ScreenWatchOK 是 screen.watch.ok 的载荷。
+//
+// Slot 只有旧 relay 路径有意义；严格接收路径恒为 -1（不再复用发布 PC 上的槽）。
+// SessionID/Nonce 只在严格路径出现：session_id 是客户端在 watch 前生成的
+// receive_id（服务端原样回显，用于把 offer/answer/ICE 路由到同一条接收 PC），
+// nonce 由服务端生成，绑定 (连接, 目标, generation)；后续 media.signal 必须
+// 同时带对 session_id 与 nonce，否则按会话拒绝（过期/错身份的 answer/ICE 不会
+// 进入新接收器）。
+//
+// Generation 是该观看者在本频道的单调代次（每次成功 watch 递增）。原生用它
+// 绑定「目标 + 代次」，旧代次的迟到帧即使回调晚到也不能冒充新目标。
+type ScreenWatchOK struct {
+	ChannelID  string `json:"channel_id"`
+	SharerID   string `json:"sharer_id"`
+	Slot       int    `json:"slot"`
+	Generation uint64 `json:"generation"`
+	Transport  string `json:"transport"` // relay | direct（服务端裁决，客户端只消费）
+	SessionID  string `json:"session_id,omitempty"`
+	Nonce      string `json:"nonce,omitempty"`
+	// Isolated 表示这次 watch 走的是 B2 的独立接收传输。relay 下接收 PC 在服务端
+	// SFU；direct 下接收 PC 在观看者本端，对端共享者为该会话新建独立的发送传输
+	// （screen.publish.sessions.v1）。两种情况下 session/nonce/generation 的语义相同。
+	Isolated bool `json:"isolated,omitempty"`
+}
+
+// ScreenUnwatchRequest 是 screen.unwatch 的载荷。两种互斥语义：
+//
+//   - ReceiveID 非空（B2 严格接收）：按**会话**精确撤销。服务端只清「本连接持有 +
+//     session 完全匹配」的那条接收 lease；SharerID 不参与身份判定（目标相同不代表
+//     同一会话，旧 target guard 不能冒充严格身份）。会话已关闭、属于同成员另一条
+//     连接、或已被新会话取代时，按幂等成功返回空 SharerID，不动任何 lease。
+//   - ReceiveID 为空：v1.1 legacy 语义不变——SharerID 省略表示「停止当前目标」；
+//     若给出则必须与当前目标一致，否则按幂等成功处理（不误停别的目标）。
+//
+// 严格路径必须在拿到 ACK 之前也能撤销：receive_id 是客户端在 watch 前生成的会话
+// 标识，客户端无需等待 watch.ok 即可精确撤租（迟到 ACK 之后还会再撤一次）。
+type ScreenUnwatchRequest struct {
+	ChannelID string `json:"channel_id"`
+	SharerID  string `json:"sharer_id,omitempty"`
+	ReceiveID string `json:"receive_id,omitempty"`
+}
+
+// ScreenUnwatchOK 是 screen.unwatch.ok 的载荷。SharerID 是实际被停止的目标
+// （没有目标时为空串），客户端据此清理本地状态。
+type ScreenUnwatchOK struct {
+	ChannelID string `json:"channel_id"`
+	SharerID  string `json:"sharer_id"`
+}
+
 // MediaSignalRequest 是客户端上行的一条媒体信令。
 //
 // Payload 是媒体核心吐出来的原始信令信封（{"type":"offer","sdp":...} /
@@ -352,10 +618,20 @@ type MediaSignalRequest struct {
 	// Target 明确指定接收方：省略 = 按 To/广播处理（direct 模式，发给成员）；
 	// "sfu" = 交给服务端 SFU（relay 模式，offer/answer/candidate 的对象都是服务端）。
 	// 不靠猜：relay 与 direct 的信令信封长得一样，只有这个字段能区分。
-	Target  string `json:"target,omitempty"`
-	Media   string `json:"media"` // screen | voice
-	Kind    string `json:"kind"`  // offer | answer | candidate
-	Payload string `json:"payload"`
+	Target string `json:"target,omitempty"`
+	Media  string `json:"media"` // screen | voice
+	Kind   string `json:"kind"`  // offer | answer | candidate
+	// SessionID / SessionNonce 是 B2 严格接收会话的归属（screen）。
+	// relay 下服务端用它把信令路由到**当前**接收 lease；direct 下服务端用它把信令
+	// 路由到该会话的**对端连接**（viewer ↔ sharer），并拒绝过期/错身份/错方向的
+	// 信令。客户端不能只靠 payload 内容或全局 epoch。
+	SessionID    string `json:"session_id,omitempty"`
+	SessionNonce string `json:"session_nonce,omitempty"`
+	// Generation 是 screen.watch.ok 下发的代次，严格会话的后续信令必须原样带回。
+	// 旧客户端（没有 receive_id/session_id）不进入严格路径，省略该字段按 0 解码，
+	// legacy 广播语义不变；严格路径要求与 arm 时的代次精确相等，0 不能冒充任何代次。
+	Generation uint64 `json:"generation,omitempty"`
+	Payload    string `json:"payload"`
 }
 
 // MediaSignalPush 是服务端下发的媒体信令（media.signal），字段与上行一致，
@@ -369,7 +645,13 @@ type MediaSignalPush struct {
 	FromName string `json:"from_name"`
 	Media    string `json:"media"`
 	Kind     string `json:"kind"`
-	Payload  string `json:"payload"`
+	// SessionID / SessionNonce / Generation 只在严格接收路径出现：
+	// offer 携带它们让原生把 SDP 灌进正确的 receive-only 会话；viewer_close /
+	// viewer_arm 携带它们让共享者只停/恢复对应会话的发送传输。
+	SessionID    string `json:"session_id,omitempty"`
+	SessionNonce string `json:"session_nonce,omitempty"`
+	Generation   uint64 `json:"generation,omitempty"`
+	Payload      string `json:"payload"`
 }
 
 // ScreenStartOK / ScreenStopOK / MediaSignalOK 是三类共享信令的成功响应载荷。

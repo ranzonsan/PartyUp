@@ -66,7 +66,7 @@ DSH 进程的 `PATH` 是启动时的快照。刚才 winget 装的 CMake/Go/Pytho
 ```
 C:\Program Files\CMake\bin\cmake.exe
 C:\Program Files\Go\bin\go.exe
-C:\Users\<user>\AppData\Local\Programs\Python\Python313\python.exe
+C:\Users\<用户名>\AppData\Local\Programs\Python\Python313\python.exe
 ```
 
 三个办法，按顺序选：(1) 脚本里显式拼 PATH；(2) 新开一个 WSL 会话；(3) 正在跑的 DSH 不用重启，调用时用绝对路径即可。
@@ -409,8 +409,8 @@ Windows 侧跑 GUI 的正确姿势走调试桥，不用手工 rsync。它来自 
 ```powershell
 Set-Location C:\
 pwsh -NoProfile -ExecutionPolicy Bypass -File `
-  '\\wsl.localhost\<distro>\<repo>\tools\windows-debug-bridge\start-worker.ps1' `
-  -Queue '\\wsl.localhost\<distro>\<repo>\.wdb\queue'
+  '\\wsl.localhost\<发行版>\<repo>\tools\windows-debug-bridge\start-worker.ps1' `
+  -Queue '\\wsl.localhost\<发行版>\<repo>\.wdb\queue'
 ```
 
 **在 WSL 里使用**

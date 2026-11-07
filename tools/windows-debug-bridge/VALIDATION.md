@@ -69,9 +69,9 @@
 ### 阶段二：Windows 实测验收 (真实前台 Worker 实机已验证)
 1. **用户前台启动 Worker（实测记录）**：
    用户在 Windows 物理机终端成功拉起前台 Worker：
-   - Host: `<dev-host>` (PID 17732，workerId `82a3c1b632c27239`)
-   - QueueRoot: `\\wsl.localhost\ai-dev\...\.wdb\queue`
-   - RunsRoot: `C:\Users\<user>\AppData\Local\WslDebugBridge\runs`
+   - Host: `<开发主机名>` (PID 17732，workerId `82a3c1b632c27239`)
+   - QueueRoot: `\\wsl.localhost\<发行版>\...\.wdb\queue`
+   - RunsRoot: `C:\Users\<用户名>\AppData\Local\WslDebugBridge\runs`
 2. **WSL 端发起自动化验收（全量实测记录）**：
    - **基础控制面冒烟**：`python3 tools/windows-debug-bridge/tests/windows-smoke.py` 实测 **12/12 PASSED**（33.2s，包含 6 个离线与 6 个真实 Windows 宿主用例，证据 `.wdb/windows-validation.json`）；
    - **Day2 边界用例整组**：`python3 tools/windows-debug-bridge/tests/windows-smoke.py --day2` 实测 **8/8 PASSED**（73.9s，包含硬超时三层杀灭、多 TFM 错误阻断与正确选择、1MiB+ 大日志切片、`logs --follow` 真实流式到达、非 UTF-8 替换，证据 `.wdb/windows-day2-boundaries.json`）；

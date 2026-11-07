@@ -7,7 +7,17 @@ using System.Text.Json;
 
 namespace PartyUp.Client.Models;
 
-public sealed record MemberDto(string Id, string Name, bool Admin);
+/// <summary>
+/// 成员身份。Name 是**唯一登录名**，DisplayName 是展示名（REG-02，2026-11-06 补入）。
+/// 服务端对旧库回退 display_name = name；客户端应优先显示 DisplayName，
+/// 但任何按成员去重/归属的地方都必须用 Id，不能拿显示名当键。
+/// </summary>
+public sealed record MemberDto(string Id, string Name, bool Admin, string? DisplayName = null)
+{
+    /// <summary>UI 展示名：有 display_name 用它，否则回退唯一登录名。</summary>
+    public string EffectiveDisplayName =>
+        string.IsNullOrWhiteSpace(DisplayName) ? Name : DisplayName;
+}
 
 public sealed record SessionDto(MemberDto Member, string Token);
 
@@ -15,7 +25,29 @@ public sealed record ErrorDto(string Code, string Message);
 
 public sealed record ServerInfoDto(string Name, string Version, int ProtocolVersion, IReadOnlyList<string> Capabilities);
 
+/// <summary>
+/// GET /api/server-info（匿名）的响应，对应 server/internal/protocol/admin.go 的 ServerInfoPublic。
+/// 注意 <see cref="Initialized"/> 与 <see cref="BootstrapAllowed"/> 都只是 UI 提示：
+/// 真正的授权在服务端（成员数为 0 + bootstrap token + 连接可信性），客户端不据此放行任何操作。
+/// </summary>
+public sealed record ServerPublicInfoDto(
+    string Name,
+    string Version,
+    int ProtocolVersion,
+    bool Initialized,
+    string Registration,
+    string VoiceMode,
+    string ScreenMode,
+    bool BootstrapAllowed);
+
 public sealed record AuthOkDto(MemberDto Member, ServerInfoDto Server);
+
+/// <summary>
+/// session.replaced 的载荷（服务端 → 客户端）：本连接所属会话已结束。
+/// Reason: login_elsewhere / logout / kicked / banned；关闭码 4001/4001/4002/4003
+/// 是同义兜底，**文案以 reason 为准**（关闭码只用于诊断）。
+/// </summary>
+public sealed record SessionReplacedDto(string Reason);
 
 public sealed record ChannelDto(string Id, string Name);
 
@@ -27,13 +59,62 @@ public sealed record SubscribeAckDto(string ChannelId);
 
 public sealed record TextSendAckDto(string Id, long Seq, long Ts, string? ClientMsgId);
 
-public sealed record TextMessageDto(string ChannelId, string Id, long Seq, string MemberId, string MemberName, string Body, long Ts);
+public sealed record TextMessageDto(string ChannelId, string Id, long Seq, string MemberId, string MemberName, string Body, long Ts)
+{
+    /// <summary>展示名（REG-02）：优先显示它，MemberName 仍是唯一登录名语义。</summary>
+    public string? MemberDisplayName { get; init; }
+
+    /// <summary>作者展示名：display_name → member_name → id 前缀（调用方兜底）。</summary>
+    public string EffectiveAuthor =>
+        !string.IsNullOrWhiteSpace(MemberDisplayName) ? MemberDisplayName
+        : !string.IsNullOrWhiteSpace(MemberName) ? MemberName
+        : MemberId;
+}
+
+/// <summary>
+/// 频道范围 presence（旧语义：该频道当前订阅者）。注意它不是「谁在这个频道的语音里」，
+/// 语音归属只看 voice.state 与 member.list 的 voice_channel_ids。
+/// </summary>
+public sealed record PresenceMemberDto(string MemberId, string Name, string State)
+{
+    /// <summary>展示名（REG-02）。</summary>
+    public string? DisplayName { get; init; }
+
+    public string EffectiveDisplayName =>
+        string.IsNullOrWhiteSpace(DisplayName) ? Name : DisplayName;
+}
+
+public sealed record PresenceDto(string ChannelId, IReadOnlyList<PresenceMemberDto> Members);
 
 public sealed record TextHistoryDto(IReadOnlyList<TextMessageDto> Messages);
 
-public sealed record PresenceMemberDto(string MemberId, string Name, string State);
+/// <summary>
+/// 全服务器名册的一项（MEM-01/02，含离线）。State 是服务端推导的
+/// offline / idle / voice：idle = 在线但不在任何频道语音里（不是键盘活动），
+/// voice = 在线且至少在一个频道语音里。
+/// </summary>
+/// <remarks>
+/// <see cref="VoiceChannelIds"/> 是**实际**语音频道集合（按 id 排序），可能多项——同一成员
+/// 可以通过多条连接分别进入不同频道。不能用单个字段冒充唯一频道，也不能用文字订阅推断语音。
+/// </remarks>
+public sealed record MemberRosterEntryDto(
+    string Id,
+    string Name,
+    bool Admin,
+    bool Online,
+    string State,
+    IReadOnlyList<string> VoiceChannelIds)
+{
+    /// <summary>展示名（REG-02）：优先显示，但从不用来当身份键。</summary>
+    public string? DisplayName { get; init; }
 
-public sealed record PresenceDto(string ChannelId, IReadOnlyList<PresenceMemberDto> Members);
+    public string EffectiveDisplayName =>
+        string.IsNullOrWhiteSpace(DisplayName) ? Name : DisplayName;
+}
+
+/// <summary>member.list.ok 与 members.state 推送共用同一载荷。</summary>
+public sealed record MemberListDto(IReadOnlyList<MemberRosterEntryDto> Members);
+
 
 // ---- 屏幕共享 / 媒体信令（docs/PROTOCOL.md §4.2、§5）----
 
@@ -47,6 +128,26 @@ public sealed record ScreenStateDto(string ChannelId, string Mode, IReadOnlyList
 
 public sealed record ScreenAckDto(string ChannelId);
 
+/// <summary>
+/// screen.watch.ok（v1.1）：服务端选定的目标 + relay 槽位 + 单调代次。
+/// Slot 只有 relay 有意义（direct = -1）；客户端把 (SharerId, Slot, Generation)
+/// 原样交给媒体核心 pu_screen_watch_ex，用于「目标 + 代次」的帧归属。
+/// </summary>
+public sealed record ScreenWatchDto(string ChannelId, string SharerId, int Slot, ulong Generation,
+    string Transport)
+{
+    /// <summary>B2：严格接收会话 id（客户端生成的 receive_id，服务端原样回显）。</summary>
+    public string? SessionId { get; init; }
+
+    /// <summary>B2：服务端生成的会话 nonce，后续 answer/ICE 必须带回。</summary>
+    public string? Nonce { get; init; }
+
+    /// <summary>B2：本次 watch 是否走独立 receive-only 传输。</summary>
+    public bool Isolated { get; init; }
+}
+
+public sealed record ScreenUnwatchDto(string ChannelId, string SharerId);
+
 /// <summary>media.signal：payload 是媒体核心的原始信令 JSON，客户端不解析、只透传。</summary>
 public sealed record MediaSignalDto(
     string ChannelId,
@@ -56,7 +157,17 @@ public sealed record MediaSignalDto(
     string? FromName,
     string Media,
     string Kind,
-    string Payload);
+    string Payload)
+{
+    /// <summary>B2：严格接收会话 id；旧路径/voice 为 null。</summary>
+    public string? SessionId { get; init; }
+
+    /// <summary>B2：服务端会话 nonce（offer 推送携带，answer/ICE 回带）。</summary>
+    public string? SessionNonce { get; init; }
+
+    /// <summary>B2：观看代次（viewer_close/viewer_arm 也携带）。</summary>
+    public ulong Generation { get; init; }
+}
 
 /// <summary>voice.state 里的一个语音成员（PROTOCOL.md §4）。</summary>
 /// <summary>

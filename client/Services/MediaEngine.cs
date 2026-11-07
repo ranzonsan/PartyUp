@@ -35,6 +35,12 @@ public sealed record MediaEvent(
     /// <summary>PU_EVENT_SIGNAL_OUT：媒体核心产出的原始 JSON 信封（已复制成托管字符串）。</summary>
     public string? SignalPayload { get; init; }
 
+    /// <summary>
+    /// v2.16（B2）：这条信令属于哪条严格接收会话（原生 token；0 = 旧 voice/screen 会话）。
+    /// 客户端按 token 映射回协议 session_id，answer 才能带对 session/nonce。
+    /// </summary>
+    public uint SignalSessionToken { get; init; }
+
     /// <summary>PU_EVENT_REMOTE_FRAME：该引擎收到的第 N 帧（0 起）。</summary>
     public ulong RemoteSequence { get; init; }
 
@@ -54,6 +60,75 @@ public sealed record MediaSource(string Id, string Title, uint Width, uint Heigh
 /// 用 <see cref="ShareSession.VoiceSlots"/> 的映射翻译成成员。
 /// </summary>
 public sealed record VoiceTrackStats(string Id, uint PcmFrames, uint Peak, ulong LastFrameMs);
+
+/// <summary>音频设备（pu_audio_device）。Index 是 ADM 枚举位置；IsDefault 表示该设备是当前系统默认端点。</summary>
+public sealed record AudioDeviceInfo(int Index, bool IsDefault, string Name, string Guid);
+
+/// <summary>
+/// 独立接收会话统计（pu_screen_receive_stats，v2.16/B2）。
+/// Active=false 表示会话已关闭/不存在；关闭会话的计数不再增长。
+/// </summary>
+public sealed record ReceiveSessionStats(
+    bool Active, uint Token, uint VideoTracks, uint FramesDelivered, ulong LastFrameMs);
+
+/// <summary>
+/// per-viewer 发送会话统计（pu_screen_publish_stats，v2.17/B2b direct）。
+/// <see cref="PacketsSent"/> 是标准 GetStats 的 outbound-rtp.packetsSent：
+/// 它增长说明该会话仍在真实发 RTP（不是仅 ICE 保活）；会话关闭后 Active=false。
+/// </summary>
+public sealed record PublishSessionStats(
+    bool Active, uint Token, uint PacketsSent, ulong BytesSent, ulong FramesEncoded,
+    bool HasRemote);
+
+/// <summary>
+/// 接收会话的真实 RTP 计数（pu_screen_receive_rtp_stats，v2.17）。
+/// 与 <see cref="ReceiveSessionStats.FramesDelivered"/> 不同，它在网络层：
+/// 停看后包数不再增长，而 ICE/DTLS 保活不增加它。
+/// </summary>
+public sealed record ReceiveRtpStats(
+    bool Active, uint PacketsReceived, ulong BytesReceived, ulong FramesDecoded);
+
+/// <summary>
+/// 音频设备状态（pu_audio_status）：真实选择 + 热插拔/默认端点代次 + 回落/故障标记。
+/// 注意 <see cref="MediaEngine.GetAudioStatus"/> 会推进原生的真实重新选择/回退，
+/// 不是纯只读快照。InputFaulted/OutputFaulted 表示该方向因切换/回退失败而未在运行
+/// （不能当成“已静音”）。热切能力用 <see cref="MediaEngine.HasAudioHotSwitch"/> 区分。
+/// </summary>
+public sealed record AudioDeviceStatus(
+    int InputIndex, int OutputIndex, uint InputCount, uint OutputCount,
+    uint Generation, bool Changed, bool InputFallback, bool OutputFallback,
+    string InputName, string OutputName, bool InputFaulted = false, bool OutputFaulted = false);
+
+/// <summary>
+/// 本端电平（pu_voice_level）。Valid=false 时 Peak/Rms 无意义——不能当成 0 电平显示。
+/// Source: 0=none, 1=GetSignalLevel, 2=通话音频轨 PCM sink。
+/// Rms 只在 Source==2 时是实测值；Source==1（GetSignalLevel 没有 RMS）时 Rms=0 表示
+/// 「未测量 RMS」，UI 不得把它当静音/零 RMS 展示。
+///
+/// <para>
+/// CaptureFrames/CaptureBytes/LastCbMs 是**与音量无关**的采集计数（v2.19 追加）：
+/// 全零 PCM（例如麦克风降噪把环境声吃掉、或用户没说话）也会增长。
+/// 判断「麦克风采集是否活着」要看它们，**不要**看 Frames/Valid（那条走 track sink，
+/// 通话中可能恒为 0，见 2026-11-07 的真机证据）。
+/// </para>
+/// </summary>
+public sealed record VoiceLevel(
+    bool Valid, uint Peak, uint Rms, uint Frames, uint Source, ulong LastFrameMs,
+    uint CaptureFrames = 0, ulong CaptureBytes = 0, ulong LastCbMs = 0,
+    uint AdmInitialized = 0, uint AdmRecording = 0, uint AdmRecordingInitialized = 0,
+    uint AdmInstance = 0)
+{
+    /// <summary>采集链路是否在出帧（与音量无关）。旧 DLL 无该字段时恒为 0。</summary>
+    public bool CaptureAlive => CaptureFrames > 0;
+}
+
+/// <summary>
+/// 独立输入电平（pu_audio_monitor_info，v2.18/AUD02）。State 0=Idle / 1=Active /
+/// 2=Faulted；Running -1=未知 / 0=否 / 1=是（Stop 失败时必须看它，不能假设已停）。
+/// Valid=false 时 Peak/Rms/Frames 无意义，不能当成「有效静音」显示。
+/// </summary>
+public sealed record AudioMonitorStatus(
+    int State, int Running, bool Valid, uint Peak, uint Rms, uint Frames, ulong LastFrameMs);
 
 /// <summary>
 /// 媒体核心（partyup_media.dll，ABI v2）的托管包装。
@@ -92,8 +167,9 @@ public sealed class MediaEngine : IDisposable
     };
 
     /// <summary>
-    /// ABI v2 在 18 个必需导出之后以加法方式追加的 6 个导出（共 24 个）。
+    /// ABI v2 在 18 个必需导出之后以加法方式追加的导出（v2.2–v2.18，共 20 个）。
     /// 只用于统计"实际命中/已知总数"的自检显示；是否可用仍由下方的 has* 标志决定。
+    /// v2.17 的 5 个 per-viewer publish 导出不在此表（由 HasDirectPublishExports 单独探测）。
     /// </summary>
     public static readonly IReadOnlyList<string> ExtendedExportNames = new[]
     {
@@ -103,13 +179,30 @@ public sealed class MediaEngine : IDisposable
         "pu_screen_prepare",
         "pu_screen_start_ex",
         "pu_voice_tracks",
+        // v2.14（v1.1 单流观看 / 音频能力）：
+        "pu_screen_watch_ex",
+        "pu_engine_caps",
+        "pu_audio_devices",
+        "pu_audio_status",
+        "pu_audio_set_device",
+        "pu_voice_level",
+        // v2.18（AUD02 独立输入电平）：
+        "pu_audio_monitor_start",
+        "pu_audio_monitor_stop",
+        "pu_audio_monitor_status",
+        // v2.16（B2 接收隔离）：
+        "pu_screen_receive_open",
+        "pu_screen_receive_close",
+        "pu_signal_in_session",
+        "pu_screen_receive_stats",
+        "pu_screen_pause_send",
     };
 
-    /// <summary>ABI 迄今声明的全部导出（18 必需 + 6 扩展）。自检显示的分母取自这里。</summary>
+    /// <summary>ABI 迄今声明的全部导出（18 必需 + 20 扩展 = 38；publish 5 个单独探测）。</summary>
     public static readonly IReadOnlyList<string> KnownExportNames =
         ExportNames.Concat(ExtendedExportNames).ToArray();
 
-    /// <summary>已知导出总数（当前 24）；UI 自检显示 "命中数/这个数"。</summary>
+    /// <summary>已知导出总数（当前 38）；UI 自检显示 "命中数/这个数"。</summary>
     public static int KnownExportCount => KnownExportNames.Count;
 
     private static readonly object ResolverGate = new();
@@ -119,9 +212,12 @@ public sealed class MediaEngine : IDisposable
     private IntPtr _engine;
     private IntPtr _handle;
     private bool _disposed;
+    private uint _lastAudioGeneration;
 
     private MediaEngine(string libraryPath, IntPtr handle, IReadOnlyList<string> missingExports,
-        int presentExportCount, bool hasMediaSignal, bool hasScreenRelay, bool hasIceServers)
+        int presentExportCount, bool hasMediaSignal, bool hasScreenRelay, bool hasIceServers,
+        bool hasWatchEx, bool hasEngineCaps, bool hasAudioDevices, bool hasVoiceLevel,
+        bool hasAudioMonitor)
     {
         LibraryPath = libraryPath;
         _handle = handle;
@@ -130,11 +226,17 @@ public sealed class MediaEngine : IDisposable
         HasMediaSignalSupport = hasMediaSignal;
         HasScreenRelaySupport = hasScreenRelay;
         HasIceServersSupport = hasIceServers;
+        HasScreenWatchExports = hasWatchEx;
+        HasEngineCapsExport = hasEngineCaps;
+        HasAudioDeviceExports = hasAudioDevices;
+        HasVoiceLevelExport = hasVoiceLevel;
+        HasAudioMonitorExport = hasAudioMonitor;
     }
 
     /// <summary>
     /// <c>pu_frame_acquire</c> 的远端流 id：观看方要渲染的那一路解码帧。
-    /// 与 native 侧约定（encoder-dev 实现），改名要两边一起改。
+    /// native 约定 <c>"remote"</c>（以及空串）表示**当前选台**，而不是某个固定流：
+    /// 显式 watch 之后仍用它取当前目标的帧；改名/改语义要两边一起改。
     /// </summary>
     public const string RemoteStreamId = "remote";
 
@@ -222,7 +324,40 @@ public sealed class MediaEngine : IDisposable
             AppLog.Warn("media: DLL 缺少 pu_engine_set_ice_servers（ABI 第 24 个导出）——" +
                         "STUN 配置暂不生效（等 split-dev 的 DLL），直连只剩 host 候选");
         }
-        return new MediaEngine(path, handle, missing, presentExportCount, hasMediaSignal, hasScreenRelay, hasIceServers);
+        // v2.14：旧 DLL 里 pu_screen_watch/unwatch 导出**存在但返回 NOT_IMPLEMENTED**，
+        // 所以不能按导出存在判断可用。必须同时有显式能力探测与 watch_ex 才算支持。
+        var hasWatchEx = NativeLibrary.TryGetExport(handle, "pu_screen_watch_ex", out _);
+        var hasEngineCaps = NativeLibrary.TryGetExport(handle, "pu_engine_caps", out _);
+        if (!hasWatchEx || !hasEngineCaps)
+        {
+            AppLog.Warn("media: DLL 缺少 pu_screen_watch_ex / pu_engine_caps（v2.14）——" +
+                        "显式单流观看不可用；旧导出 pu_screen_watch 返回 NOT_IMPLEMENTED，不能当可用");
+        }
+        var hasAudioDevices = NativeLibrary.TryGetExport(handle, "pu_audio_devices", out _) &&
+                              NativeLibrary.TryGetExport(handle, "pu_audio_status", out _) &&
+                              NativeLibrary.TryGetExport(handle, "pu_audio_set_device", out _);
+        if (!hasAudioDevices)
+        {
+            AppLog.Warn("media: DLL 缺少 pu_audio_devices/status/set_device（v2.14）——音频设备选择不可用");
+        }
+        var hasVoiceLevel = NativeLibrary.TryGetExport(handle, "pu_voice_level", out _);
+        if (!hasVoiceLevel)
+        {
+            AppLog.Warn("media: DLL 缺少 pu_voice_level（v2.14）——本端电平不可用");
+        }
+        // v2.18（AUD02）：三个导出必须同时存在，缺一个就明确报不支持（旧 DLL 不能
+        // 静默返回全 0 电平）。能力位仍由 pu_engine_caps 的 bit7 决定。
+        var hasAudioMonitor =
+            NativeLibrary.TryGetExport(handle, "pu_audio_monitor_start", out _) &&
+            NativeLibrary.TryGetExport(handle, "pu_audio_monitor_stop", out _) &&
+            NativeLibrary.TryGetExport(handle, "pu_audio_monitor_status", out _);
+        if (!hasAudioMonitor)
+        {
+            AppLog.Warn("media: DLL 缺少 pu_audio_monitor_start/stop/status（v2.18）——独立输入电平不可用");
+        }
+        return new MediaEngine(path, handle, missing, presentExportCount, hasMediaSignal,
+            hasScreenRelay, hasIceServers, hasWatchEx, hasEngineCaps, hasAudioDevices, hasVoiceLevel,
+            hasAudioMonitor);
     }
 
     /// <summary>DllImport 解析器：只接管 partyup_media，其余交给默认逻辑。</summary>
@@ -268,7 +403,99 @@ public sealed class MediaEngine : IDisposable
         }
         // ICE servers 必须在第一条 PeerConnection 之前写进引擎，所以在这里补应用。
         ApplyIceServers();
+        // v2.14：显式能力探测需要已创建的引擎。旧 DLL 没有这个导出 → 不探测、明确不支持。
+        ProbeEngineCaps();
     }
+
+    /// <summary>
+    /// 调用 pu_engine_caps 读取真实能力位。导出存在但返回失败时按「不支持」处理，
+    /// 不按「有 watch/unwatch 导出」推断可用（旧 DLL 那两个导出是 NOT_IMPLEMENTED 桩）。
+    /// </summary>
+    private void ProbeEngineCaps()
+    {
+        if (!HasEngineCapsExport || _engine == IntPtr.Zero)
+        {
+            EngineCapabilities = 0;
+            return;
+        }
+        uint caps = 0;
+        var rc = NativeMethods.pu_engine_caps(_engine, ref caps);
+        if (rc != 0)
+        {
+            EngineCapabilities = 0;
+            AppLog.Warn($"media: pu_engine_caps 返回 {rc}：{LastErrorText()}");
+            return;
+        }
+        EngineCapabilities = caps;
+        // v2.16：五个新导出缺一不可；旧 DLL 不能按「watch 存在」推断严格接收可用。
+        HasIsolatedReceiveExports =
+            NativeLibrary.TryGetExport(_handle, "pu_screen_receive_open", out _) &&
+            NativeLibrary.TryGetExport(_handle, "pu_screen_receive_close", out _) &&
+            NativeLibrary.TryGetExport(_handle, "pu_signal_in_session", out _) &&
+            NativeLibrary.TryGetExport(_handle, "pu_screen_receive_stats", out _) &&
+            NativeLibrary.TryGetExport(_handle, "pu_screen_pause_send", out _);
+        // v2.17：per-viewer 发送会话 + 真实 RTP 计数，同样要求导出齐全且能力位为 1。
+        HasDirectPublishExports =
+            NativeLibrary.TryGetExport(_handle, "pu_screen_publish_open", out _) &&
+            NativeLibrary.TryGetExport(_handle, "pu_screen_publish_signal_in", out _) &&
+            NativeLibrary.TryGetExport(_handle, "pu_screen_publish_close", out _) &&
+            NativeLibrary.TryGetExport(_handle, "pu_screen_publish_stats", out _) &&
+            NativeLibrary.TryGetExport(_handle, "pu_screen_receive_rtp_stats", out _);
+        AppLog.Info($"media: engine caps=0x{caps:x} watch={(caps & 1) != 0} " +
+                    $"watch_slots={(caps & 2) != 0} audio_devices={(caps & 4) != 0} " +
+                    $"voice_level={(caps & 8) != 0} audio_hot_switch={(caps & 0x10) != 0} " +
+                    $"isolated_receive={(HasIsolatedReceiveExports && (caps & 0x20) != 0)} " +
+                    $"direct_publish={(HasDirectPublishExports && (caps & 0x40) != 0)} " +
+                    $"audio_monitor={(HasAudioMonitorExport && (caps & 0x80) != 0)}");
+    }
+
+    /// <summary>v2.17：per-viewer 发送会话与真实 RTP 计数的五个导出是否齐全（不含能力位）。</summary>
+    public bool HasDirectPublishExports { get; private set; }
+
+    /// <summary>
+    /// v2.17（B2b direct）：共享者能否为单个 viewer 建立独立发送传输。
+    /// 只有 bit5 的旧 DLL 只有 pause_send，不能当成 direct 严格隔离可用。
+    /// </summary>
+    public bool HasDirectPublishSupport =>
+        HasDirectPublishExports && (EngineCapabilities & 0x40) != 0;
+
+    /// <summary>v2.16：独立接收会话的五个导出是否齐全（不含能力位）。</summary>
+    public bool HasIsolatedReceiveExports { get; private set; }
+
+    /// <summary>
+    /// v2.16（B2）：独立 receive-only 接收会话是否真实可用。
+    /// 旧 DLL、或只有导出没有能力位，都按不支持处理——不能退回旧混合 PC 的 watch。
+    /// </summary>
+    public bool HasIsolatedReceiveSupport =>
+        HasIsolatedReceiveExports && (EngineCapabilities & 0x20) != 0;
+
+    /// <summary>引擎能力位（pu_engine_caps；0 = 未探测/旧 DLL）。</summary>
+    public uint EngineCapabilities { get; private set; }
+
+    /// <summary>显式单流观看（目标 + 槽位/代次）是否真实可用。</summary>
+    public bool HasScreenWatchSupport =>
+        HasScreenWatchExports && (EngineCapabilities & 0x1) != 0 && (EngineCapabilities & 0x2) != 0;
+
+    /// <summary>音频设备枚举/选择是否可用（同一通话 ADM）。</summary>
+    public bool HasAudioDeviceSupport => HasAudioDeviceExports && (EngineCapabilities & 0x4) != 0;
+
+    /// <summary>
+    /// 通话中真实设备热切 + 稳定 ID 选择 + 系统默认跟随/热插拔回退（v2.15 caps bit4）。
+    /// 旧 DLL 没有该位：此时 <see cref="SetAudioDevice"/> 只是登记到下次 join，UI 不得
+    /// 宣称“通话中已切换”。要配合轮询 <see cref="GetAudioStatus"/> 才能发现热插拔/
+    /// 默认端点变化，本版没有主动事件通道。
+    /// </summary>
+    public bool HasAudioHotSwitch => HasAudioDeviceExports && (EngineCapabilities & 0x10) != 0;
+
+    /// <summary>本端电平是否可用（GetSignalLevel 或通话轨 PCM 兜底）。</summary>
+    public bool HasVoiceLevelSupport => HasVoiceLevelExport && (EngineCapabilities & 0x8) != 0;
+
+    /// <summary>
+    /// v2.18（AUD02）：独立输入电平是否可用（三个导出齐全 + caps bit7）。
+    /// 旧 DLL 没有该位时调用必须明确报 unsupported，不能静默返回全 0 电平。
+    /// </summary>
+    public bool HasAudioMonitorSupport =>
+        HasAudioMonitorExport && (EngineCapabilities & 0x80) != 0;
 
     /// <summary>非阻塞/阻塞取一条事件。<paramref name="timeoutMs"/> &lt; 0 表示一直等。无事件返回 null。</summary>
     public MediaEvent? Poll(int timeoutMs = 0)
@@ -365,6 +592,21 @@ public sealed class MediaEngine : IDisposable
 
     /// <summary>媒体核心是否支持被动屏幕会话（SFU 屏幕共享，ABI v2.11）。</summary>
     public bool HasScreenRelaySupport { get; private set; }
+
+    /// <summary>DLL 是否同时导出 pu_screen_watch_ex 与 pu_engine_caps（仅存在性，不代表可用）。</summary>
+    public bool HasScreenWatchExports { get; }
+
+    /// <summary>DLL 是否导出 pu_engine_caps（旧 DLL 没有）。</summary>
+    public bool HasEngineCapsExport { get; }
+
+    /// <summary>DLL 是否导出 pu_audio_devices / status / set_device。</summary>
+    public bool HasAudioDeviceExports { get; }
+
+    /// <summary>DLL 是否导出 pu_voice_level。</summary>
+    public bool HasVoiceLevelExport { get; }
+
+    /// <summary>DLL 是否导出 pu_audio_monitor_start/stop/status（v2.18；不含能力位）。</summary>
+    public bool HasAudioMonitorExport { get; }
 
     /// <summary>
     /// 开始共享，可指定角色。<paramref name="passive"/>=true 时（SFU 中继）：只采屏 + 建视频轨，
@@ -521,9 +763,370 @@ public sealed class MediaEngine : IDisposable
 
     public int VoiceSetDeafen(bool deafened) => NativeMethods.pu_voice_set_deafen(_engine, deafened ? 1 : 0);
 
-    public int Watch(string sharerId) => NativeMethods.pu_screen_watch(_engine, sharerId);
+    /// <summary>
+    /// 兼容入口：只按目标 arm（slot=-1/generation=0）。新客户端应使用
+    /// <see cref="WatchEx"/> 把服务端 slot/generation 带进来，否则 relay 下无法
+    /// 保证「新目标落在不同 track」的帧归属。旧 DLL 会返回 NOT_IMPLEMENTED，
+    /// 所以这里必须先检查能力，不能只按导出存在就调用。
+    /// </summary>
+    public int Watch(string sharerId)
+    {
+        EnsureWatchSupported();
+        return NativeMethods.pu_screen_watch(_engine, sharerId);
+    }
 
-    public int Unwatch(string sharerId) => NativeMethods.pu_screen_unwatch(_engine, sharerId);
+    /// <summary>
+    /// v1.1 显式观看：目标 + relay 槽位 + 服务端代次。原生按 (target, epoch) 过滤帧，
+    /// 切源后旧目标的迟到帧不会串到新目标。
+    /// </summary>
+    public int WatchEx(string sharerId, int slot, ulong generation)
+    {
+        EnsureWatchSupported();
+        return NativeMethods.pu_screen_watch_ex(_engine, sharerId, slot, generation);
+    }
+
+    /// <summary>停止观看；<paramref name="sharerId"/> 与当前目标不一致时是幂等 no-op。</summary>
+    public int Unwatch(string sharerId)
+    {
+        EnsureWatchSupported();
+        return NativeMethods.pu_screen_unwatch(_engine, sharerId);
+    }
+
+    private void EnsureWatchSupported()
+    {
+        ThrowIfDisposed();
+        EnsureCreated();
+        if (!HasScreenWatchSupport)
+        {
+            throw new InvalidOperationException(
+                "媒体核心不支持显式单流观看（需要 v2.14 DLL 的 pu_screen_watch_ex + pu_engine_caps；" +
+                "旧 DLL 的 pu_screen_watch 导出存在但返回 NOT_IMPLEMENTED）");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // v2.16（B2）：独立 receive-only 接收会话
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// 建立（或复用）一条独立接收会话。必须在发送 screen.watch 之前调用：
+    /// identity/传输先于信令，服务端 offer 才有确定落点。返回原生 token，
+    /// 用于把 SIGNAL_OUT 的 answer 映射回协议 session_id。
+    /// </summary>
+    public uint ReceiveOpen(string sessionId)
+    {
+        EnsureIsolatedReceiveSupported();
+        var rc = NativeMethods.pu_screen_receive_open(_engine, sessionId, out var token);
+        if (rc != 0)
+        {
+            throw new InvalidOperationException(
+                $"pu_screen_receive_open 返回 {rc}：{LastErrorText()}");
+        }
+        return token;
+    }
+
+    /// <summary>只关闭这条接收会话；发布 PC/采集/语音完全不动。幂等。</summary>
+    public int ReceiveClose(string sessionId)
+    {
+        EnsureIsolatedReceiveSupported();
+        return NativeMethods.pu_screen_receive_close(_engine, sessionId);
+    }
+
+    /// <summary>把屏幕信令按 session_id 灌进正确的接收会话；旧会话 id 会被原生拒绝。</summary>
+    public int SignalInSession(string media, string sessionId, byte[] payload)
+    {
+        if (!HasIsolatedReceiveSupport)
+        {
+            throw new InvalidOperationException("媒体核心不支持按会话信令（需要 v2.16 DLL）");
+        }
+        var rc = NativeMethods.pu_signal_in_session(_engine, media, sessionId, payload,
+            (UIntPtr)(uint)payload.Length);
+        return rc;
+    }
+
+    /// <summary>接收会话统计（诊断/回归）；会话不存在时 Active=false。</summary>
+    public ReceiveSessionStats GetReceiveStats(string sessionId)
+    {
+        EnsureIsolatedReceiveSupported();
+        var info = new PuReceiveStatsInfo
+        {
+            StructSize = (uint)Marshal.SizeOf<PuReceiveStatsInfo>(),
+        };
+        Check(NativeMethods.pu_screen_receive_stats(_engine, sessionId, ref info),
+            "pu_screen_receive_stats");
+        return new ReceiveSessionStats(info.Active != 0, info.Token, info.VideoTracks,
+            info.FramesDelivered, info.LastFrameMs);
+    }
+
+    /// <summary>
+    /// direct 1v1：暂停/恢复本端屏幕发送轨，保留采集源、视频轨、sender 与发布状态。
+    /// 不是 screen.stop，也不重协商。
+    /// </summary>
+    public int PauseScreenSend(bool paused)
+    {
+        if (!HasIsolatedReceiveSupport)
+        {
+            throw new InvalidOperationException("媒体核心不支持暂停发送（需要 v2.16 DLL）");
+        }
+        return NativeMethods.pu_screen_pause_send(_engine, paused ? 1 : 0);
+    }
+
+    private void EnsureIsolatedReceiveSupported()
+    {
+        ThrowIfDisposed();
+        EnsureCreated();
+        if (!HasIsolatedReceiveSupport)
+        {
+            throw new InvalidOperationException(
+                "媒体核心不支持独立接收会话（需要 v2.16 DLL 的 receive 导出 + caps bit5）；" +
+                "不能退回旧混合 PC 的 watch");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // v2.17（B2b direct）：共享者 per-viewer 发送会话 + 真实 RTP 计数
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// 为单个 viewer 建立一条独立发送会话（新 PC，复用已存在的采集源/视频轨）。
+    /// 原生立刻产生 offer（SIGNAL_OUT 带该会话 token）；answer/candidate 经
+    /// <see cref="PublishSignalIn"/> 灌回。不会重启采集、不会全局 screen.stop。
+    /// </summary>
+    public uint PublishOpen(string sessionId)
+    {
+        EnsureDirectPublishSupported();
+        var rc = NativeMethods.pu_screen_publish_open(_engine, sessionId, out var token);
+        if (rc != 0)
+        {
+            throw new InvalidOperationException(
+                $"pu_screen_publish_open 返回 {rc}：{LastErrorText()}");
+        }
+        return token;
+    }
+
+    /// <summary>把对端 answer/candidate 灌进该发送会话；旧会话 id 会被原生拒绝。</summary>
+    public int PublishSignalIn(string sessionId, byte[] payload)
+    {
+        if (!HasDirectPublishSupport)
+        {
+            throw new InvalidOperationException("媒体核心不支持按会话发送信令（需要 v2.17 DLL）");
+        }
+        return NativeMethods.pu_screen_publish_signal_in(_engine, sessionId, payload,
+            (UIntPtr)(uint)payload.Length);
+    }
+
+    /// <summary>只关闭该 viewer 的发送会话；采集、视频轨、发布状态、其它会话都不动。幂等。</summary>
+    public int PublishClose(string sessionId)
+    {
+        EnsureDirectPublishSupported();
+        return NativeMethods.pu_screen_publish_close(_engine, sessionId);
+    }
+
+    /// <summary>发送会话统计（真实 outbound-rtp 包数/字节数）；会话不存在时 Active=false。</summary>
+    public PublishSessionStats GetPublishStats(string sessionId)
+    {
+        EnsureDirectPublishSupported();
+        var info = new PuPublishStatsInfo
+        {
+            StructSize = (uint)Marshal.SizeOf<PuPublishStatsInfo>(),
+        };
+        Check(NativeMethods.pu_screen_publish_stats(_engine, sessionId, ref info),
+            "pu_screen_publish_stats");
+        return new PublishSessionStats(info.Active != 0, info.Token, info.PacketsSent,
+            info.BytesSent, info.FramesEncoded, info.HasRemote != 0);
+    }
+
+    /// <summary>接收会话的真实 inbound RTP 计数（网络层包/字节），用于验证停收。</summary>
+    public ReceiveRtpStats GetReceiveRtpStats(string sessionId)
+    {
+        EnsureIsolatedReceiveSupported();
+        var info = new PuRtpStatsInfo
+        {
+            StructSize = (uint)Marshal.SizeOf<PuRtpStatsInfo>(),
+        };
+        Check(NativeMethods.pu_screen_receive_rtp_stats(_engine, sessionId, ref info),
+            "pu_screen_receive_rtp_stats");
+        return new ReceiveRtpStats(info.Active != 0, info.PacketsReceived, info.BytesReceived,
+            info.FramesDecoded);
+    }
+
+    private void EnsureDirectPublishSupported()
+    {
+        ThrowIfDisposed();
+        EnsureCreated();
+        if (!HasDirectPublishSupport)
+        {
+            throw new InvalidOperationException(
+                "媒体核心不支持 per-viewer 发送会话（需要 v2.17 DLL 的 publish 导出 + caps bit6）；" +
+                "不能用 pause_send 冒充 direct 严格隔离");
+        }
+    }
+
+    /// <summary>枚举音频设备（kind 0=输入 1=输出）；结果来自通话同一个 ADM。</summary>
+    public IReadOnlyList<AudioDeviceInfo> GetAudioDevices(int kind)
+    {
+        ThrowIfDisposed();
+        EnsureCreated();
+        if (!HasAudioDeviceSupport)
+        {
+            throw new InvalidOperationException("媒体核心不支持音频设备枚举（需要 v2.14 DLL）");
+        }
+        var count = NativeMethods.pu_audio_devices(_engine, kind, null, 0);
+        if (count <= 0) return Array.Empty<AudioDeviceInfo>();
+        var buffer = new PuAudioDevice[count];
+        for (var i = 0; i < buffer.Length; i++)
+        {
+            buffer[i].StructSize = (uint)Marshal.SizeOf<PuAudioDevice>();
+            buffer[i].Name = new byte[128];
+            buffer[i].Guid = new byte[64];
+        }
+        var written = NativeMethods.pu_audio_devices(_engine, kind, buffer, (uint)buffer.Length);
+        if (written <= 0) return Array.Empty<AudioDeviceInfo>();
+        var result = new List<AudioDeviceInfo>(written);
+        for (var i = 0; i < written && i < buffer.Length; i++)
+        {
+            var item = buffer[i];
+            result.Add(new AudioDeviceInfo(
+                item.Index,
+                item.IsDefault != 0,
+                ReadFixedUtf8(item.Name),
+                ReadFixedUtf8(item.Guid)));
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// 读取设备状态。changed 由原生相对本引擎上一次调用计算；失败时抛异常而不是返回全 0。
+    /// 注意：本调用会推进原生的真实重新选择/回退（拔掉选中设备、系统默认端点变化时
+    /// 会停/启对应方向的设备），不是纯只读快照；要发现热插拔/默认变化必须周期性轮询。
+    /// </summary>
+    public AudioDeviceStatus GetAudioStatus()
+    {
+        ThrowIfDisposed();
+        EnsureCreated();
+        if (!HasAudioDeviceSupport)
+        {
+            throw new InvalidOperationException("媒体核心不支持音频设备状态（需要 v2.14 DLL）");
+        }
+        var status = new PuAudioStatus
+        {
+            StructSize = (uint)Marshal.SizeOf<PuAudioStatus>(),
+            Generation = _lastAudioGeneration,
+            InputName = new byte[128],
+            OutputName = new byte[128],
+        };
+        Check(NativeMethods.pu_audio_status(_engine, ref status), "pu_audio_status");
+        _lastAudioGeneration = status.Generation;
+        return new AudioDeviceStatus(
+            status.InputIndex,
+            status.OutputIndex,
+            status.InputCount,
+            status.OutputCount,
+            status.Generation,
+            status.Changed != 0,
+            (status.Fallback & 0x1) != 0,
+            (status.Fallback & 0x2) != 0,
+            ReadFixedUtf8(status.InputName),
+            ReadFixedUtf8(status.OutputName),
+            (status.Reserved & 0x1) != 0,
+            (status.Reserved & 0x2) != 0);
+    }
+
+    /// <summary>
+    /// 选择输入/输出设备（kind 0=输入 1=输出；index=-1 跟随系统默认）。
+    /// 通话中且 <see cref="HasAudioHotSwitch"/> 为真时执行真实热切：返回成功表示新设备
+    /// 已经实际启动（失败会抛异常，原生已尝试恢复原设备/回落默认）。旧 DLL 没有热切
+    /// 能力位时，调用只登记到下次 join，不能据此宣称当前通话已切换。
+    /// </summary>
+    public void SetAudioDevice(int kind, int index)
+    {
+        ThrowIfDisposed();
+        EnsureCreated();
+        if (!HasAudioDeviceSupport)
+        {
+            throw new InvalidOperationException("媒体核心不支持音频设备选择（需要 v2.14 DLL）");
+        }
+        Check(NativeMethods.pu_audio_set_device(_engine, kind, index), "pu_audio_set_device");
+    }
+
+    /// <summary>本端电平。Valid=false 表示没有有效数据（不是 0 电平）。</summary>
+    public VoiceLevel GetVoiceLevel()
+    {
+        ThrowIfDisposed();
+        EnsureCreated();
+        if (!HasVoiceLevelSupport)
+        {
+            throw new InvalidOperationException("媒体核心不支持本端电平（需要 v2.14 DLL）");
+        }
+        var level = new PuVoiceLevel { StructSize = (uint)Marshal.SizeOf<PuVoiceLevel>() };
+        Check(NativeMethods.pu_voice_level(_engine, ref level), "pu_voice_level");
+        return new VoiceLevel(level.Valid != 0, level.Peak, level.Rms, level.Frames,
+            level.Source, level.LastFrameMs,
+            level.CaptureFrames, level.CaptureBytes, level.LastCbMs,
+            level.AdmInitialized, level.AdmRecording, level.AdmRecordingInitialized, level.AdmInstance);
+    }
+
+    /// <summary>
+    /// v2.18（AUD02）：显式开始独立输入电平监测。默认不采集；语音占用、设备无法
+    /// 安全启动或旧 DLL 缺接口时抛异常（不静默造电平）。本方法只打开输入，不启动
+    /// 扬声器、不解除静音、不进语音、不建 PeerConnection。
+    /// </summary>
+    public void StartAudioMonitor()
+    {
+        ThrowIfDisposed();
+        EnsureCreated();
+        if (!HasAudioMonitorSupport)
+        {
+            throw new InvalidOperationException(
+                "媒体核心不支持独立输入电平（需要 v2.18 DLL 的 pu_audio_monitor_* 导出 + caps bit7）");
+        }
+        Check(NativeMethods.pu_audio_monitor_start(_engine), "pu_audio_monitor_start");
+    }
+
+    /// <summary>
+    /// v2.18：幂等停止输入监测。不依赖状态结构；Stop/读回失败时抛异常（原生会进入
+    /// Faulted 并保留真实 running），不会自动重试或自动重新打开采集。
+    /// </summary>
+    public void StopAudioMonitor()
+    {
+        ThrowIfDisposed();
+        EnsureCreated();
+        if (!HasAudioMonitorSupport)
+        {
+            throw new InvalidOperationException(
+                "媒体核心不支持独立输入电平（需要 v2.18 DLL 的 pu_audio_monitor_* 导出 + caps bit7）");
+        }
+        Check(NativeMethods.pu_audio_monitor_stop(_engine), "pu_audio_monitor_stop");
+    }
+
+    /// <summary>
+    /// v2.18：读取独立输入电平快照。只读，不推进设备事务；State/Running 分开读
+    /// （Running=-1 表示未知，不能当成"已停止"）。旧 DLL 明确抛不支持。
+    /// </summary>
+    public AudioMonitorStatus GetAudioMonitorStatus()
+    {
+        ThrowIfDisposed();
+        EnsureCreated();
+        if (!HasAudioMonitorSupport)
+        {
+            throw new InvalidOperationException(
+                "媒体核心不支持独立输入电平（需要 v2.18 DLL 的 pu_audio_monitor_* 导出 + caps bit7）");
+        }
+        var info = new PuAudioMonitor
+        {
+            StructSize = (uint)Marshal.SizeOf<PuAudioMonitor>(),
+        };
+        Check(NativeMethods.pu_audio_monitor_status(_engine, ref info), "pu_audio_monitor_status");
+        return new AudioMonitorStatus(info.State, info.Running, info.Valid != 0, info.Peak,
+            info.Rms, info.Frames, info.LastFrameMs);
+    }
+
+    private static string ReadFixedUtf8(byte[] bytes)
+    {
+        var length = Array.IndexOf(bytes, (byte)0);
+        if (length < 0) length = bytes.Length;
+        return System.Text.Encoding.UTF8.GetString(bytes, 0, length);
+    }
 
     /// <summary>
     /// 把信令投递给指定媒体会话（"voice" / "screen"）。
@@ -645,6 +1248,7 @@ public sealed class MediaEngine : IDisposable
                 return new MediaEvent(kind, ev.Type, ev.TimestampUs, 0, 0, 0, null)
                 {
                     SignalKind = (PuSignalKind)ev.Data.Signal.Kind,
+                    SignalSessionToken = ev.Data.Signal.Reserved,
                     // 库持有 payload 指针（有效期到 destroy 或再取走 64 条信令），
                     // 这里立刻复制：事件对象会跨线程/跨定时器存活。
                     SignalPayload = Marshal.PtrToStringUTF8(

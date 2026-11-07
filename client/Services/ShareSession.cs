@@ -24,8 +24,9 @@ public sealed class ShareSession : IAsyncDisposable
     private readonly MediaEngine _engine;
     private readonly PartyUpConnection _connection;
     private readonly string _channelId;
-    /// <summary>一条待投递给媒体核心的信令：media 决定进 voice 还是 screen 会话。</summary>
-    private readonly record struct InboundSignal(string Media, string Payload);
+    /// <summary>一条待投递给媒体核心的信令：media 决定进 voice 还是 screen 会话；
+    /// SessionId 非空时走严格接收会话（B2），否则走旧会话。</summary>
+    private readonly record struct InboundSignal(string Media, string Payload, string? SessionId = null);
 
     private readonly Channel<InboundSignal> _inbound = Channel.CreateUnbounded<InboundSignal>(
         new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
@@ -109,6 +110,16 @@ public sealed class ShareSession : IAsyncDisposable
     /// <summary>最近一次收到 offer 的对方成员 id：answer/candidate 都要定向回到这个人。</summary>
     private string? _signalPeerId;
 
+    // ---- v2.16/B2：严格接收会话（状态机 + 单一同步 seam）----
+    // 会话身份、本地代次与三个映射全部由 StrictReceiveController 的同一把锁保护：
+    // WS 信令线程（OnMediaSignal）、媒体泵线程（HandleMediaEvent）、watch/stop 协程
+    // 不再各自读写普通 Dictionary；stop 立即关闭接收，不等在飞的 watch ACK。
+    private readonly StrictReceiveController _strict;
+    /// <summary>v2.17（B2b direct）：共享者侧 per-viewer 发送会话状态机。</summary>
+    private readonly DirectPublishController _publish;
+    /// <summary>legacy 槽位路径的本地代次（严格路径由 controller 管理）。</summary>
+    private long _legacyWatchGen;
+
     public ShareSession(MediaEngine engine, PartyUpConnection connection, string channelId,
         bool forcePassive = false, bool forceActive = false)
     {
@@ -120,10 +131,21 @@ public sealed class ShareSession : IAsyncDisposable
         _channelId = channelId;
         _thisMemberId = connection.Member.Id;
         _thisMemberName = connection.Member.Name;
+        _strict = new StrictReceiveController(new ShareStrictTransport(_engine, _connection, _channelId));
+        _publish = new DirectPublishController(new SharePublishTransport(_engine));
 
         // STUN 地址来自 server.info（在任何 PeerConnection 之前由连接层取到）。
         // 放在 ctor：切频道时每条会话都会把同一份配置再应用一次，幂等且便宜。
         _engine.SetIceServers(connection.StunUrls);
+
+        // v1.1：新连接声明了 screen.watch.v1，就先把原生切到「显式模式」：
+        // 在真正 pu_screen_watch_ex 之前，即使 direct PC 已建立也绝不自动挂 sink/交付帧。
+        // 旧客户端（未 opt-in）不会走到这里，保持 v1 自动观看。
+        if (connection.ScreenWatchEnabled && _engine.HasScreenWatchSupport)
+        {
+            try { _engine.Unwatch(string.Empty); }
+            catch (Exception ex) { AppLog.Warn("share: 进入显式观看模式失败：" + ex.Message); }
+        }
 
         connection.MediaSignalReceived += OnMediaSignal;
         connection.ScreenStateChanged += OnScreenState;
@@ -143,6 +165,9 @@ public sealed class ShareSession : IAsyncDisposable
     /// <summary>最近一次共享/信令错误（人类可读），成功路径为 null。</summary>
     public string? LastError { get; private set; }
 
+    /// <summary>成功操作后清掉上一次失败原因，避免陈旧错误长期覆盖正常状态。</summary>
+    public void ClearLastError() => LastError = null;
+
     /// <summary>本端收到的远端帧累计数（验收硬指标）。</summary>
     public int RemoteFrames { get; private set; }
 
@@ -154,6 +179,202 @@ public sealed class ShareSession : IAsyncDisposable
     public string WatchingName => _remoteSharerName;
 
     public bool IsWatching => _remoteSharerId is not null;
+
+    /// <summary>
+    /// 新客户端是否具备显式单流观看的三层条件：连接 opt-in + 服务端广告 + DLL/引擎能力。
+    /// 旧服务端或旧 DLL 时明确 false；UI 不应显示可点入口后静默失败。
+    /// </summary>
+    public bool CanWatchExplicitly =>
+        _connection.ScreenWatchEnabled &&
+        _connection.ServerSupportsScreenWatch &&
+        _engine.HasScreenWatchSupport;
+
+    /// <summary>
+    /// B2 严格接收是否三层齐备：连接 opt-in + 服务端广告 + DLL/引擎 receive 能力。
+    /// 缺任一层都必须明确报不支持；禁止退回旧混合 PC 假装成功。
+    /// </summary>
+    public bool CanWatchStrictly =>
+        _connection.ScreenWatchIsolatedEnabled &&
+        _connection.ServerSupportsIsolatedScreenWatch &&
+        _engine.HasIsolatedReceiveSupport;
+
+    /// <summary>
+    /// 显式观看一路共享（一次一路）。
+    ///
+    /// 严格路径（连接声明 screen.watch.isolated.v1，B2）：
+    ///   1) 先用客户端生成的 receive_id 建原生 receive-only 会话（identity 先于信令）；
+    ///   2) screen.watch 带 receive_id，服务端新建独立接收 PC 并返回 session/nonce；
+    ///   3) offer 按 session_id 灌进这条接收会话，answer 带 session/nonce 回服务端。
+    /// 旧路径（未声明 isolated）保持 v1.1 的混合 PC 槽位行为不变。
+    ///
+    /// 本地代次：每次 watch/stop 都推进代次；等 ACK 期间若被 stop/新 watch 取代，
+    /// 迟到的 ACK 由 StrictReceiveController 关闭刚建的接收会话并撤销服务端 lease，
+    /// 绝不重新 arm。stop 不等待在飞的 watch。
+    /// </summary>
+    public async Task WatchAsync(string sharerId, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(sharerId))
+        {
+            throw new ArgumentException("sharerId is required", nameof(sharerId));
+        }
+        if (!_connection.ScreenWatchEnabled)
+        {
+            throw new InvalidOperationException(
+                "当前连接未声明 screen.watch.v1：请用 PartyUpConnection.ConnectAsync(..., screenWatchCapable: true)");
+        }
+        if (!_connection.ServerSupportsScreenWatch)
+        {
+            throw new InvalidOperationException("服务端不支持 screen.watch.v1（旧服务端），不能假装已观看");
+        }
+        if (!_engine.HasScreenWatchSupport)
+        {
+            throw new InvalidOperationException(
+                "媒体核心不支持显式单流观看（需要 v2.14 DLL 的 pu_screen_watch_ex / pu_engine_caps）");
+        }
+        if (_connection.ScreenWatchIsolatedEnabled && !CanWatchStrictly)
+        {
+            throw new InvalidOperationException(
+                "严格接收传输不可用（需要服务端 screen.watch.isolated.v1 + v2.16 DLL 的 receive 导出与 caps bit5）；" +
+                "拒绝退回旧混合 PC 的 sink-only 路径");
+        }
+
+        if (_connection.ScreenWatchIsolatedEnabled)
+        {
+            LastError = null;
+            await WatchStrictAsync(sharerId, ct).ConfigureAwait(false);
+            return;
+        }
+        LastError = null;
+        await WatchLegacyAsync(sharerId, ct).ConfigureAwait(false);
+    }
+
+    private async Task WatchStrictAsync(string sharerId, CancellationToken ct)
+    {
+        // 状态机内部串行化 watch 往返、管理代次与 token/nonce 映射；这里只做 UI 状态。
+        var result = await _strict.WatchAsync(sharerId, ct).ConfigureAwait(false);
+        switch (result.Outcome)
+        {
+            case StrictWatchOutcome.Armed:
+            {
+                var ack = result.Ack!;
+                _remoteSharerId = ack.SharerId;
+                _remoteSharerName = Shares.FirstOrDefault(s => s.SharerId == ack.SharerId)?.MemberName
+                                    ?? string.Empty;
+                RemoteFrames = 0;
+                RemoteWidth = 0;
+                RemoteHeight = 0;
+                AppLog.Pass($"share: strict watching {ack.SharerId} transport={ack.Transport} " +
+                            $"session={ack.SessionId} gen={ack.Generation}");
+                Changed?.Invoke();
+                break;
+            }
+            case StrictWatchOutcome.Superseded:
+                // 在等 ACK 期间用户已 stop 或选了新目标：controller 已关闭会话并撤销 lease。
+                AppLog.Info("share: stale strict watch ACK discarded (superseded by stop/new watch)");
+                break;
+            default:
+                throw new InvalidOperationException(
+                    result.Error ?? "严格接收会话建立失败；已回滚，不降级为旧路径");
+        }
+    }
+
+    private async Task WatchLegacyAsync(string sharerId, CancellationToken ct)
+    {
+        var gen = Interlocked.Increment(ref _legacyWatchGen);
+        var ack = await _connection.WatchScreenAsync(_channelId, sharerId, receiveId: null, ct: ct)
+            .ConfigureAwait(false);
+        if (gen != Volatile.Read(ref _legacyWatchGen))
+        {
+            await SafeUnwatchAsync(ack.SharerId).ConfigureAwait(false);
+            return;
+        }
+        try
+        {
+            var rc = _engine.WatchEx(ack.SharerId, ack.Slot, ack.Generation);
+            if (rc != 0)
+            {
+                throw new InvalidOperationException(
+                    $"pu_screen_watch_ex 返回 {rc}：{_engine.LastErrorText()}");
+            }
+        }
+        catch
+        {
+            // 原生没 arm 成功：撤销服务端选台，避免服务端继续向本端转发视频。
+            await SafeUnwatchAsync(sharerId).ConfigureAwait(false);
+            throw;
+        }
+        _remoteSharerId = ack.SharerId;
+        _remoteSharerName = Shares.FirstOrDefault(s => s.SharerId == ack.SharerId)?.MemberName ?? string.Empty;
+        RemoteFrames = 0;
+        RemoteWidth = 0;
+        RemoteHeight = 0;
+        AppLog.Pass($"share: watching {ack.SharerId} transport={ack.Transport} slot={ack.Slot} gen={ack.Generation}");
+        Changed?.Invoke();
+    }
+
+    /// <summary>
+    /// 停止观看。严格路径**立即**关闭独立接收 PC（不等在飞的 watch ACK，也不等
+    /// watchGate），再通知服务端撤转发/关闭 lease。本地状态在通知前清空；失败只记录错误。
+    /// </summary>
+    public async Task StopWatchingAsync(CancellationToken ct = default)
+    {
+        // legacy 路径：推进代次，让在飞的槽位 watch ACK 作废。
+        Interlocked.Increment(ref _legacyWatchGen);
+        var target = _remoteSharerId;
+        // 严格路径：controller 先关本地接收会话并撤销服务端 lease；它从不等待在飞的
+        // watch（这正是旧实现 stop 后仍收帧到 ACK 超时的根因）。
+        var hadStrict = await _strict.StopAsync(ct).ConfigureAwait(false);
+        if (!hadStrict && target is not null && _engine.HasScreenWatchSupport &&
+            !_connection.ScreenWatchIsolatedEnabled)
+        {
+            try
+            {
+                var rc = _engine.Unwatch(target);
+                if (rc != 0)
+                {
+                    LastError = $"本端停止观看失败：pu_screen_unwatch 返回 {rc}";
+                    AppLog.Fail($"share: {LastError}：{_engine.LastErrorText()}");
+                }
+            }
+            catch (Exception ex)
+            {
+                LastError = "本端停止观看失败：" + ex.Message;
+                AppLog.Fail("share: " + LastError);
+            }
+        }
+        _remoteSharerId = null;
+        _remoteSharerName = string.Empty;
+        RemoteFrames = 0;
+        // 严格路径的 unwatch 已由 controller 的 transport 发出；这里只处理 legacy。
+        if (!hadStrict && !_connection.ScreenWatchIsolatedEnabled &&
+            _connection.ScreenWatchEnabled && _connection.ServerSupportsScreenWatch)
+        {
+            try
+            {
+                await _connection.UnwatchScreenAsync(_channelId, target, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                // 服务端没收到停止：转发出错只在服务端侧，本地已经不再交付帧。
+                LastError = "停止观看通知服务端失败：" + ex.Message;
+                AppLog.Fail("share: " + LastError);
+            }
+        }
+        Changed?.Invoke();
+    }
+
+    private async Task SafeUnwatchAsync(string? sharerId)
+    {
+        try
+        {
+            await _connection.UnwatchScreenAsync(_channelId, sharerId, CancellationToken.None)
+                .ConfigureAwait(false);
+        }
+        catch
+        {
+            // 回滚尽力而为；原始错误优先。
+        }
+    }
 
     // ------------------------------------------------------------------
     // 语音状态（UI 绑定；信令走 media.signal 的 voice 通道）
@@ -348,19 +569,41 @@ public sealed class ShareSession : IAsyncDisposable
 
     public async Task StopSharingAsync(CancellationToken ct = default)
     {
+        // 先停本地采集；即使本端停止失败，也要通知服务端撤掉共享，避免 ghost share。
+        Exception? localError = null;
         try
         {
             _engine.StopScreen();
         }
-        finally
+        catch (Exception ex)
         {
-            IsSharing = false;
-            SharingSourceTitle = string.Empty;
-            _sharingSource = null;
-            await _connection.StopScreenAsync(_channelId, ct);
-            AppLog.Info("share: stopped");
-            Changed?.Invoke();
+            localError = ex;
         }
+        IsSharing = false;
+        SharingSourceTitle = string.Empty;
+        _sharingSource = null;
+        try
+        {
+            await _connection.StopScreenAsync(_channelId, ct);
+        }
+        catch (Exception ex)
+        {
+            LastError = "停止共享通知服务端失败：" + ex.Message;
+            AppLog.Fail("share: " + LastError);
+            Changed?.Invoke();
+            throw;
+        }
+        if (localError is not null)
+        {
+            LastError = "本端停止采集失败：" + localError.Message;
+            AppLog.Warn("share: " + LastError);
+        }
+        else
+        {
+            LastError = null;
+            AppLog.Info("share: stopped");
+        }
+        Changed?.Invoke();
     }
 
     // ------------------------------------------------------------------
@@ -387,6 +630,29 @@ public sealed class ShareSession : IAsyncDisposable
                     return;
                 }
                 SignalsOut++;
+                if (ev.SignalSessionToken != 0)
+                {
+                    // B2b direct：共享者的 per-viewer 发送会话（offer/候选）只发给该 viewer，
+                    // 带上服务端 arm 时下发的 session/nonce/generation。
+                    if (_publish.TryResolveToken(ev.SignalSessionToken, out var publishSession))
+                    {
+                        ForwardAsync("screen", kindName, ev.SignalPayload, publishSession.ViewerId,
+                            null, publishSession.Id, publishSession.Nonce, publishSession.Generation);
+                        break;
+                    }
+                    // 接收会话的 answer/candidate：relay 回 SFU；direct 回共享者成员。
+                    // token 找不到 = 会话已关闭/被换掉，这条迟到信令必须丢弃。
+                    if (!_strict.TryResolveToken(ev.SignalSessionToken, out var sessionId, out var sessionNonce))
+                    {
+                        AppLog.Info($"share: drop signal from closed session token={ev.SignalSessionToken}");
+                        return;
+                    }
+                    var strictSfu = _screenMode == "relay";
+                    ForwardAsync("screen", kindName, ev.SignalPayload,
+                        strictSfu ? null : _strict.SharerId, strictSfu ? "sfu" : null, sessionId,
+                        sessionNonce, _strict.ServerGeneration);
+                    break;
+                }
                 // media 必须显式标出：语音与屏幕共享各用独立 PeerConnection，服务端/原生侧都靠它
                 // 把 offer/answer/candidate 精确投递到对应会话（candidate 信封里没有媒体类型，
                 // 靠嗅探只能「两边都试」，属于静默失败）。
@@ -426,15 +692,19 @@ public sealed class ShareSession : IAsyncDisposable
         }
     }
 
-    private void ForwardAsync(string media, string kind, string payload, string? to, string? target = null)
+    private void ForwardAsync(string media, string kind, string payload, string? to,
+        string? target = null, string? sessionId = null, string? sessionNonce = null,
+        ulong generation = 0)
     {
         _ = Task.Run(async () =>
         {
             try
             {
-                await _connection.SendMediaSignalAsync(_channelId, media, kind, payload, to, target);
+                await _connection.SendMediaSignalAsync(_channelId, media, kind, payload, to, target,
+                    sessionId, sessionNonce, generation);
                 var where = target ?? to ?? "(broadcast)";
-                AppLog.Info($"media: signal out media={media} kind={kind} to={where} bytes={payload.Length}");
+                var session = sessionId is null ? "" : $" session={sessionId}";
+                AppLog.Info($"media: signal out media={media} kind={kind} to={where}{session} bytes={payload.Length}");
             }
             catch (Exception ex)
             {
@@ -447,11 +717,125 @@ public sealed class ShareSession : IAsyncDisposable
 
     private void OnMediaSignal(MediaSignalDto signal)
     {
+        // B2b direct 的**会话控制**（服务端 → 共享者/观看者）。
+        // 用 session_id 区分两种形态：非空 = 严格会话（建/关该 viewer 的独立发送
+        // 传输），空 = legacy 观看者（只暂停/恢复同一条 PC 的发送）。
+        if (signal.Kind is "viewer_arm" or "viewer_close")
+        {
+            if (!string.IsNullOrEmpty(signal.SessionId))
+            {
+                if (signal.Kind == "viewer_arm")
+                {
+                    var session = _publish.Arm(signal.From ?? string.Empty, signal.SessionId,
+                        signal.SessionNonce ?? string.Empty, signal.Generation);
+                    if (session is null)
+                    {
+                        LastError = "无法为该观看者建立独立的发送传输（strict direct）";
+                        AppLog.Fail($"share: direct publish arm failed viewer={signal.From} " +
+                                    $"session={signal.SessionId}");
+                        Changed?.Invoke();
+                    }
+                    else
+                    {
+                        AppLog.Pass($"share: direct publish armed viewer={signal.From} " +
+                                    $"session={session.Id} token={session.Token} gen={session.Generation}");
+                    }
+                }
+                else
+                {
+                    var closed = _publish.Close(signal.SessionId);
+                    AppLog.Info($"share: direct publish close viewer={signal.From} " +
+                                $"session={signal.SessionId} closed={closed}");
+                }
+                return;
+            }
+            try
+            {
+                var paused = signal.Kind == "viewer_close";
+                var rc = _engine.PauseScreenSend(paused);
+                AppLog.Pass($"share: direct viewer {signal.From} -> send {(paused ? "paused" : "resumed")} rc={rc}");
+            }
+            catch (Exception ex)
+            {
+                AppLog.Warn("share: direct viewer control failed: " + ex.Message);
+            }
+            return;
+        }
+        // 服务端通知观看者：该严格接收会话已结束（共享者停发/断线/会话撤销）。
+        // 只关闭本端接收传输，不撤租（服务端已清理），不碰发布/采集/语音。
+        if (signal.Kind == "receive_close")
+        {
+            if (!string.IsNullOrEmpty(signal.SessionId) && _strict.CloseRemote(signal.SessionId))
+            {
+                AppLog.Info($"share: receive session closed by server {signal.SessionId}");
+                if (string.Equals(_remoteSharerId, signal.From, StringComparison.Ordinal))
+                {
+                    _remoteSharerId = null;
+                    _remoteSharerName = string.Empty;
+                    RemoteFrames = 0;
+                    Changed?.Invoke();
+                }
+            }
+            return;
+        }
+        // direct 严格会话的入站信令（target 为空：服务端按会话点对点转发，不经 SFU）：
+        //   * offer（共享者发来）→ 灌进本端已打开的 receive 会话；
+        //   * answer/candidate（观看者回给共享者）→ 灌进对应的 publish 会话。
+        // 两条路径都必须按 session_id 命中**当前**会话，旧会话的信令直接丢弃。
+        // target=="sfu" 的是 relay 路径，交给下面的分支按接收会话处理。
+        if (signal.Media == "screen" && !string.IsNullOrEmpty(signal.SessionId) &&
+            signal.Target != "sfu")
+        {
+            if (signal.Kind == "offer")
+            {
+                if (!_strict.AcceptInbound(signal.SessionId, signal.SessionNonce ?? string.Empty, out _))
+                {
+                    AppLog.Info($"share: drop direct offer for unknown/closed receive session {signal.SessionId}");
+                    return;
+                }
+                SignalsIn++;
+                _inbound.Writer.TryWrite(new InboundSignal(signal.Media, signal.Payload, signal.SessionId));
+                Changed?.Invoke();
+                return;
+            }
+            var payloadBytes = Encoding.UTF8.GetBytes(signal.Payload);
+            if (_publish.TryApplyInbound(signal.SessionId, payloadBytes, out var applyRc))
+            {
+                SignalsIn++;
+                if (applyRc != 0)
+                {
+                    AppLog.Warn($"share: publish session {signal.SessionId} signal rc={applyRc}：" +
+                                _engine.LastErrorText());
+                }
+                Changed?.Invoke();
+                return;
+            }
+            AppLog.Info($"share: drop direct signal kind={signal.Kind} for unknown session {signal.SessionId}");
+            return;
+        }
         // relay 模式：服务端 SFU 是 offer 的对方。原样喂媒体核心（此时原生是 answerer），
         // answer 会由核心经 SignalOut 事件回给我们，再由 ForwardAsync 带 target=sfu 发回去。
         if (signal.Target == "sfu")
         {
             SignalsIn++;
+            // B2 严格接收：offer/answer/ICE 必须按 session_id 落到独立 receive 会话。
+            // 先记下 nonce（answer 回带要用），再入队；绝不 prepare 旧混合 PC。
+            if (signal.Media == "screen" && !string.IsNullOrEmpty(signal.SessionId))
+            {
+                // 归属判断与 nonce 记录都在 controller 的同一把锁里：WS 信令线程与
+                // 媒体泵/stop 协程不会再并发读写普通 Dictionary。
+                if (!_strict.AcceptInbound(signal.SessionId, signal.SessionNonce ?? string.Empty, out _))
+                {
+                    // 会话已关闭/被替换：迟到信令必须丢弃，不能落进新接收器。
+                    AppLog.Info($"share: drop signal for unknown/closed receive session {signal.SessionId}");
+                    return;
+                }
+                AppLog.Info($"media: strict sfu signal in kind={signal.Kind} session={signal.SessionId} " +
+                            $"bytes={signal.Payload.Length}");
+                _inbound.Writer.TryWrite(new InboundSignal(signal.Media, signal.Payload, signal.SessionId));
+                Changed?.Invoke();
+                return;
+            }
             // 观看者可能在屏幕会话建好之前就收到服务端视频 offer（订阅即发 offer）。
             // 先把 answerer 会话准备好，否则原生没有可灌 offer 的 PC。幂等。
             if (signal.Media == "screen" && signal.Kind == "offer")
@@ -612,6 +996,29 @@ public sealed class ShareSession : IAsyncDisposable
                     AppLog.Info($"voice: stats pcmRx={stats.FramesReceived} peerState={stats.PeerState} " +
                                 $"iceState={stats.IceState} peerStateSource={stateSource} mode={_voiceMode}");
                     EvaluateDirectHealth(stats);
+
+                    // 采集侧 liveness：与音量无关（静音/降噪吃成全零也增长）。
+                    // 「入会成功但麦克风没出声音」只能靠这条发现——收侧计数分辨不出来。
+                    // 同时打印**本端电平**（frames/valid/peak/rms）：它才是能画电平条的量，
+                    // 与上面的 capture_* 同源但用途不同，别互相替代。
+                    if (_engine.HasVoiceLevelSupport)
+                    {
+                        try
+                        {
+                            var capture = _engine.GetVoiceLevel();
+                            AppLog.Info($"voice: capture frames={capture.CaptureFrames} bytes={capture.CaptureBytes} " +
+                                        $"lastCbMs={capture.LastCbMs} adm(init={capture.AdmInitialized} " +
+                                        $"rec={capture.AdmRecording} recInit={capture.AdmRecordingInitialized} " +
+                                        $"instance={capture.AdmInstance}) " +
+                                        $"level(frames={capture.Frames} valid={capture.Valid} " +
+                                        $"peak={capture.Peak} rms={capture.Rms})");
+                        }
+                        catch (Exception ex)
+                        {
+                            AppLog.Warn("voice: capture liveness unavailable: " + ex.Message);
+                        }
+                    }
+
                     foreach (var track in _engine.GetVoiceTracks())
                     {
                         AppLog.Info($"voice: track id={track.Id} pcmFrames={track.PcmFrames} peak={track.Peak} slotOwner={SlotOwnerOf(track.Id)}");
@@ -860,6 +1267,17 @@ public sealed class ShareSession : IAsyncDisposable
     /// </summary>
     public async Task HandleConnectionRestoredAsync(CancellationToken ct = default)
     {
+        // 旧连接上的接收 lease 已随服务端断线清理，本地接收 PC 也不可复用：
+        // 先清掉 pending/armed 的严格接收状态，避免重连后拿旧 session 发信令。
+        // 共享者的 per-viewer 发送会话同样依赖旧连接上的 arm，一并关掉（不碰采集，
+        // 重连后由服务端重新 arm 再建）。
+        _strict.CloseAll();
+        _publish.CloseAll();
+        // 观看也依赖旧连接上的 lease：接收 PC 已关、服务端选台已失效，本地状态必须清空，
+        // 否则 UI 会停在「正在观看 + 最后一帧」。是否按原目标重看由 ViewModel 决定。
+        _remoteSharerId = null;
+        _remoteSharerName = string.Empty;
+        RemoteFrames = 0;
         var wasInVoice = _voiceJoined;
         var wasSharing = IsSharing;
         var sharedSource = _sharingSource;
@@ -1104,6 +1522,13 @@ public sealed class ShareSession : IAsyncDisposable
         var stillShared = state.Shares.Any(s => s.SharerId == _remoteSharerId);
         if (!stillShared)
         {
+            // 新客户端：目标停发后必须解除原生 arm，否则旧 epoch 的 sink 还挂着，
+            // 同一成员重新开共享时会被误认为仍在看（未重新 watch）。
+            if (_remoteSharerId is not null && _engine.HasScreenWatchSupport)
+            {
+                try { _engine.Unwatch(_remoteSharerId); }
+                catch (Exception ex) { AppLog.Fail("share: 目标停发后解除观看失败：" + ex.Message); }
+            }
             _remoteSharerId = null;
             _remoteSharerName = string.Empty;
             RemoteFrames = 0;
@@ -1123,7 +1548,26 @@ public sealed class ShareSession : IAsyncDisposable
                 int status;
                 try
                 {
-                    status = _engine.SignalIn(signal.Media, bytes);
+                    if (string.IsNullOrEmpty(signal.SessionId))
+                    {
+                        status = _engine.SignalIn(signal.Media, bytes);
+                    }
+                    else
+                    {
+                        // 会话可能在归属检查之后被 stop/Dispose 关闭。native 生命周期门内
+                        // 再确认一次：已关闭的会话直接丢弃，绝不把这条迟到信令交给 native。
+                        var sessionId = signal.SessionId!;
+                        var applied = 0;
+                        if (!_strict.TryApplyToSession(sessionId, () =>
+                            {
+                                applied = _engine.SignalInSession(signal.Media, sessionId, bytes);
+                            }))
+                        {
+                            AppLog.Info($"share: drop signal for closed receive session {sessionId}");
+                            continue;
+                        }
+                        status = applied;
+                    }
                 }
                 catch (InvalidOperationException ex)
                 {
@@ -1172,6 +1616,24 @@ public sealed class ShareSession : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        // 离开通话前必须先停共享：只调 VoiceLeave 不会关屏幕 PC，也不会发 screen.stop，
+        // 服务端只在 screen.stop 或连接断开时清 shares——否则他人会看到永远没画面的 ghost share，
+        // 本机采集也会在进程存活期间继续。失败只记日志，不阻止收尾。
+        if (IsSharing)
+        {
+            try
+            {
+                await StopSharingAsync(CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                AppLog.Warn("share: stop sharing during dispose failed: " + ex.Message);
+            }
+        }
+        // B2：先关严格接收会话（只销毁接收 PC，含还在等 ACK 的），再收语音；
+        // 顺序不影响发布 PC。共享者的 per-viewer 发送会话也只关这些传输。
+        _strict.CloseAll();
+        _publish.CloseAll();
         if (_voiceJoined)
         {
             StopVoiceStatsLoop();
@@ -1192,6 +1654,79 @@ public sealed class ShareSession : IAsyncDisposable
             // 收尾不阻塞退出。
         }
         _cts.Dispose();
+    }
+
+    /// <summary>
+    /// 生产环境的严格接收 transport：把状态机的决定落到 native 接收会话与
+    /// screen.watch/unwatch。测试用 fake 实现同一接口，跑的是同一个 controller。
+    /// </summary>
+    private sealed class ShareStrictTransport : IStrictReceiveTransport
+    {
+        private readonly MediaEngine _engine;
+        private readonly PartyUpConnection _connection;
+        private readonly string _channelId;
+
+        public ShareStrictTransport(MediaEngine engine, PartyUpConnection connection, string channelId)
+        {
+            _engine = engine;
+            _connection = connection;
+            _channelId = channelId;
+        }
+
+        public uint Open(string receiveId) => _engine.ReceiveOpen(receiveId);
+
+        public void Close(string receiveId)
+        {
+            var rc = _engine.ReceiveClose(receiveId);
+            if (rc != 0)
+            {
+                AppLog.Fail($"share: pu_screen_receive_close 返回 {rc}：{_engine.LastErrorText()}");
+            }
+        }
+
+        public async Task<StrictWatchAck> WatchAsync(string sharerId, string receiveId, CancellationToken ct)
+        {
+            var ack = await _connection.WatchScreenAsync(_channelId, sharerId, receiveId, ct)
+                .ConfigureAwait(false);
+            return new StrictWatchAck(
+                ack.Isolated,
+                ack.SessionId ?? string.Empty,
+                ack.Nonce ?? string.Empty,
+                ack.SharerId,
+                ack.Transport ?? string.Empty,
+                ack.Generation);
+        }
+
+        public Task RevokeSessionAsync(StrictReceiveSession session, CancellationToken ct)
+        {
+            // 按会话精确撤租：session id 与 sharer 目标分开传，不再复用 sharer_id 字段。
+            return _connection.UnwatchScreenSessionAsync(_channelId, session.Id, ct);
+        }
+    }
+
+    /// <summary>
+    /// 生产环境的 per-viewer 发送 transport（v2.17）：落到 native 发布会话。
+    /// 这里绝不调用 pu_screen_stop / pause_send——关一条会话不能停采集或全局发布。
+    /// </summary>
+    private sealed class SharePublishTransport : IDirectPublishTransport
+    {
+        private readonly MediaEngine _engine;
+
+        public SharePublishTransport(MediaEngine engine) => _engine = engine;
+
+        public uint Open(string sessionId) => _engine.PublishOpen(sessionId);
+
+        public int SignalIn(string sessionId, byte[] payload) =>
+            _engine.PublishSignalIn(sessionId, payload);
+
+        public void Close(string sessionId)
+        {
+            var rc = _engine.PublishClose(sessionId);
+            if (rc != 0)
+            {
+                AppLog.Fail($"share: pu_screen_publish_close 返回 {rc}：{_engine.LastErrorText()}");
+            }
+        }
     }
 }
 

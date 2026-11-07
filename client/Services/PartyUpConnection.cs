@@ -36,9 +36,17 @@ public sealed class PartyUpConnection : IAsyncDisposable
     private readonly HashSet<string> _subscribedChannels = new(StringComparer.Ordinal);
     private Uri? _baseUri;
     private string _token = string.Empty;
+    // v1.1：只有显式声明 screen.watch.v1 的连接才走新观看路径；默认 false 保持旧 UI 行为。
+    private bool _screenWatchCapable;
+    // v2.16/B2：只有同时声明 screen.watch.isolated.v1 才允许 receive_id 严格接收路径。
+    private bool _screenWatchIsolated;
+    // v2.17/B2b direct：声明本连接（作为共享者）能为单个 viewer 建独立发送会话。
+    private bool _screenPublishSessions;
     private long _lastInboundTicks;
     private int _reconnecting; // 0/1，Interlocked 保护
     private volatile bool _userClosed;
+    /// <summary>会话已被服务端终止（顶号/踢/封禁/主动退出）：终态，不再自动重连。</summary>
+    private volatile bool _sessionTerminated;
     private int _reconnectAttempt;
     private Task? _watchdog;
     private readonly ConcurrentDictionary<string, TaskCompletionSource<EnvelopeDto>> _pending = new(StringComparer.Ordinal);
@@ -56,6 +64,42 @@ public sealed class PartyUpConnection : IAsyncDisposable
 
     public ServerInfoDto? Server { get; private set; }
 
+    /// <summary>服务端能力名：显式单流观看（auth.ok.server.capabilities）。</summary>
+    public const string ScreenWatchCapability = "screen.watch.v1";
+
+    /// <summary>服务端能力名：严格独立接收传输（B2，每次 watch 新 receive PC/会话）。</summary>
+    public const string ScreenWatchIsolatedCapability = "screen.watch.isolated.v1";
+
+    /// <summary>
+    /// 客户端能力名（B2b direct）：本连接作为共享者能为单个 viewer 建立独立发送
+    /// 传输/会话（新 PC，复用采集源/视频轨）。服务端不广告它——它只用于服务端判定
+    /// 「对该共享者的 direct 严格 watch 是否可 arm」。
+    /// </summary>
+    public const string ScreenPublishSessionsCapability = "screen.publish.sessions.v1";
+
+    /// <summary>
+    /// 服务端是否广告 screen.watch.v1。新客户端在调用 WatchScreenAsync 前必须检查它：
+    /// 旧服务端不认识 screen.watch，不能假装成功。
+    /// </summary>
+    public bool ServerSupportsScreenWatch =>
+        Server?.Capabilities?.Contains(ScreenWatchCapability, StringComparer.Ordinal) == true;
+
+    /// <summary>
+    /// 服务端是否广告严格接收传输。未广告 = 旧服务端/旧配置，严格 watch 必须明确报
+    /// 不支持，不能降级成旧混合 PC 的 sink-only 成功。
+    /// </summary>
+    public bool ServerSupportsIsolatedScreenWatch =>
+        Server?.Capabilities?.Contains(ScreenWatchIsolatedCapability, StringComparer.Ordinal) == true;
+
+    /// <summary>本连接是否在 auth 里声明了 screen.watch.v1（决定服务端是否自动绑定）。</summary>
+    public bool ScreenWatchEnabled => _screenWatchCapable;
+
+    /// <summary>本连接是否声明了 screen.publish.sessions.v1（可作为 direct 共享者）。</summary>
+    public bool ScreenPublishSessionsEnabled => _screenPublishSessions;
+
+    /// <summary>本连接是否声明了 screen.watch.isolated.v1（严格接收传输）。</summary>
+    public bool ScreenWatchIsolatedEnabled => _screenWatchIsolated;
+
     public bool IsConnected => _socket.State == WebSocketState.Open;
 
     public event Action<TextMessageDto>? TextReceived;
@@ -71,11 +115,25 @@ public sealed class PartyUpConnection : IAsyncDisposable
     /// <summary>语音状态推送（voice.state，docs/PROTOCOL.md §4）。在接收循环线程触发。</summary>
     public event Action<VoiceStateDto>? VoiceStateChanged;
 
+    /// <summary>
+    /// 全服务器名册推送（members.state，MEM-01/02）。在接收循环线程触发。
+    /// 与 <see cref="PresenceChanged"/> 刻意分开：presence 是频道范围内订阅者，
+    /// 名册是全服（含离线）且带 voice_channel_ids。旧服务端不发这条推送时不会触发。
+    /// </summary>
+    public event Action<MemberListDto>? MembersStateChanged;
+
     /// <summary>连接丢失（非主动关闭）；随后会自动进入重连。</summary>
     public event Action<string>? ConnectionLost;
 
     /// <summary>主动关闭（Dispose）或重连无法继续。</summary>
     public event Action<string>? Closed;
+
+    /// <summary>
+    /// 会话被服务端终止（login_elsewhere / kicked / banned / logout）。
+    /// 这是**终态**：收到后不能再自动重连（token 已被撤销，重连只会一直 401），
+    /// 上层应回到登录界面并按 reason 给出对应提示。
+    /// </summary>
+    public event Action<string>? SessionTerminated;
 
     /// <summary>重连中：(第几次尝试, 本次等待毫秒)。</summary>
     public event Action<int, int>? Reconnecting;
@@ -88,9 +146,47 @@ public sealed class PartyUpConnection : IAsyncDisposable
     public int ReconnectAttempt => Volatile.Read(ref _reconnectAttempt);
 
     /// <summary>连接 + auth 握手。失败时连接已释放，不会泄漏半开状态。</summary>
-    public static async Task<PartyUpConnection> ConnectAsync(Uri baseUri, string token, CancellationToken ct = default)
+    public static Task<PartyUpConnection> ConnectAsync(Uri baseUri, string token, CancellationToken ct = default) =>
+        ConnectAsync(baseUri, token, screenWatchCapable: false, ct: ct);
+
+    /// <summary>
+    /// 连接 + auth，并显式声明 <c>screen.watch.v1</c> 能力。
+    /// 只有声明后服务端才会走「未 watch 不绑定视频」的新路径；v1 UI 不传这个重载，
+    /// 保持旧行为。声明前应确认 DLL 有 pu_screen_watch_ex / pu_engine_caps（见 MediaEngine）。
+    /// </summary>
+    public static async Task<PartyUpConnection> ConnectAsync(
+        Uri baseUri, string token, bool screenWatchCapable, CancellationToken ct = default) =>
+        await ConnectAsync(baseUri, token, screenWatchCapable, screenWatchIsolated: false, ct)
+            .ConfigureAwait(false);
+
+    /// <summary>
+    /// 连接 + auth，并声明 <c>screen.watch.isolated.v1</c>（B2 严格接收传输）。
+    /// 调用方必须先确认媒体核心有 <see cref="MediaEngine.HasIsolatedReceiveSupport"/>；
+    /// 服务端未广告该能力时 <see cref="ServerSupportsIsolatedScreenWatch"/> 为 false，
+    /// 严格 watch 必须报不支持而不是退回旧路径。
+    /// </summary>
+    public static async Task<PartyUpConnection> ConnectAsync(
+        Uri baseUri, string token, bool screenWatchCapable, bool screenWatchIsolated,
+        CancellationToken ct = default) =>
+        await ConnectAsync(baseUri, token, screenWatchCapable, screenWatchIsolated,
+            screenPublishSessions: false, ct).ConfigureAwait(false);
+
+    /// <summary>
+    /// 连接 + auth，并声明 <c>screen.publish.sessions.v1</c>（B2b direct 共享者侧：
+    /// 为单个 viewer 建立独立发送传输/会话）。调用方必须确认
+    /// <see cref="MediaEngine.HasDirectPublishSupport"/>；服务端只在共享者声明它时
+    /// 才允许别人对该共享做 direct 严格 watch，否则明确 NOT_IMPLEMENTED。
+    /// </summary>
+    public static async Task<PartyUpConnection> ConnectAsync(
+        Uri baseUri, string token, bool screenWatchCapable, bool screenWatchIsolated,
+        bool screenPublishSessions, CancellationToken ct = default)
     {
-        var connection = new PartyUpConnection();
+        var connection = new PartyUpConnection
+        {
+            _screenWatchCapable = screenWatchCapable || screenWatchIsolated || screenPublishSessions,
+            _screenWatchIsolated = screenWatchIsolated,
+            _screenPublishSessions = screenPublishSessions,
+        };
         try
         {
             await connection.OpenAsync(baseUri, token, ct);
@@ -113,6 +209,13 @@ public sealed class PartyUpConnection : IAsyncDisposable
 
     public Task<ChannelListDto> ListChannelsAsync(CancellationToken ct = default) =>
         RequestAsync<ChannelListDto>("channel.list", null, ct);
+
+    /// <summary>
+    /// 全服务器名册（含离线），是 GET /api/members 的 WS 等价物（MEM-01）。
+    /// 之后的增量走 <see cref="MembersStateChanged"/>；本请求本身只读。
+    /// </summary>
+    public Task<MemberListDto> ListMembersAsync(CancellationToken ct = default) =>
+        RequestAsync<MemberListDto>("member.list", null, ct);
 
     public async Task<ChannelDto> CreateChannelAsync(string name, CancellationToken ct = default)
     {
@@ -196,6 +299,46 @@ public sealed class PartyUpConnection : IAsyncDisposable
         RequestAsync<ScreenAckDto>("screen.stop", new { channel_id = channelId }, ct);
 
     /// <summary>
+    /// 显式选择一路共享（screen.watch，v1.1）。调用前必须：
+    ///   1) 本连接以 screenWatchCapable=true 建立（auth 已声明 screen.watch.v1）；
+    ///   2) 服务端广告了 screen.watch.v1（<see cref="ServerSupportsScreenWatch"/>）；
+    ///   3) 媒体核心探测到 watch_ex 能力（<see cref="MediaEngine.HasScreenWatchSupport"/>）。
+    /// 旧服务端会返回 INVALID_ARGUMENT/未知消息；本方法不把它包装成成功。
+    /// </summary>
+    /// <param name="receiveId">
+    /// B2 严格接收的客户端会话标识。非空时必须已在原生 receive 会话里打开；
+    /// 服务端为它新建独立接收 PC，后续 media.signal 必须带同一 session/nonce。
+    /// </param>
+    public Task<ScreenWatchDto> WatchScreenAsync(string channelId, string sharerId,
+        string? receiveId = null, CancellationToken ct = default) =>
+        RequestAsync<ScreenWatchDto>("screen.watch", new
+        {
+            channel_id = channelId,
+            sharer_id = sharerId,
+            receive_id = receiveId,
+        }, ct);
+
+    /// <summary>停止当前观看目标（screen.unwatch，幂等）。</summary>
+    public Task<ScreenUnwatchDto> UnwatchScreenAsync(string channelId, string? sharerId = null, CancellationToken ct = default) =>
+        RequestAsync<ScreenUnwatchDto>("screen.unwatch", new
+        {
+            channel_id = channelId,
+            sharer_id = sharerId,
+        }, ct);
+
+    /// <summary>
+    /// 按会话精确撤销严格接收 lease（B2）：服务端只清「本连接持有 + receive_id 完全
+    /// 匹配」的那条接收会话，不按 sharer 目标猜测（同目标的新会话不受旧撤销影响）。
+    /// 幂等：会话已关闭/已被新会话取代时返回空 SharerID。
+    /// </summary>
+    public Task<ScreenUnwatchDto> UnwatchScreenSessionAsync(string channelId, string sessionId, CancellationToken ct = default) =>
+        RequestAsync<ScreenUnwatchDto>("screen.unwatch", new
+        {
+            channel_id = channelId,
+            receive_id = sessionId,
+        }, ct);
+
+    /// <summary>
     /// 转发一条媒体信令。payload 是媒体核心的原始 JSON 信封，本方法不解析它。
     /// to 为空表示广播（offer）；非空表示只投递给该成员（answer / candidate）。
     /// </summary>
@@ -206,6 +349,9 @@ public sealed class PartyUpConnection : IAsyncDisposable
         string payload,
         string? to = null,
         string? target = null,
+        string? sessionId = null,
+        string? sessionNonce = null,
+        ulong generation = 0,
         CancellationToken ct = default) =>
         RequestAsync<ScreenAckDto>("media.signal", new
         {
@@ -214,6 +360,9 @@ public sealed class PartyUpConnection : IAsyncDisposable
             to,
             media,
             kind,
+            session_id = sessionId,
+            session_nonce = sessionNonce,
+            generation,
             payload,
         }, ct);
 
@@ -400,14 +549,38 @@ public sealed class PartyUpConnection : IAsyncDisposable
     // 内部实现
     // ------------------------------------------------------------------
 
+    /// <summary>auth 里声明的客户端能力（重连时同样使用，避免中途换能力集）。</summary>
+    private string[]? AuthCapabilities()
+    {
+        if (!_screenWatchCapable)
+        {
+            return null;
+        }
+        var caps = new List<string> { ScreenWatchCapability };
+        if (_screenWatchIsolated)
+        {
+            caps.Add(ScreenWatchIsolatedCapability);
+        }
+        if (_screenPublishSessions)
+        {
+            caps.Add(ScreenPublishSessionsCapability);
+        }
+        return caps.ToArray();
+    }
+
     private async Task OpenAsync(Uri baseUri, string token, CancellationToken ct)
     {
-        _baseUri = baseUri;
+        // base path 规范化后保存：WS 端点必须保留反代前缀，root 部署路径不变。
+        _baseUri = ServerEndpoint.NormalizeBase(baseUri);
         _token = token;
         await ConnectSocketAsync(ct);
         _receiveLoop = Task.Run(ReceiveLoopAsync, CancellationToken.None);
 
-        var auth = await RequestAsync<AuthOkDto>("auth", new { token }, ct);
+        var auth = await RequestAsync<AuthOkDto>("auth", new
+        {
+            token,
+            capabilities = AuthCapabilities(),
+        }, ct);
         Member = auth.Member;
         Server = auth.Server;
     }
@@ -416,13 +589,8 @@ public sealed class PartyUpConnection : IAsyncDisposable
     private async Task ConnectSocketAsync(CancellationToken ct)
     {
         if (_baseUri is null) throw new InvalidOperationException("connection base uri is missing");
-        var builder = new UriBuilder(_baseUri)
-        {
-            Scheme = _baseUri.Scheme == Uri.UriSchemeHttps ? "wss" : "ws",
-            Path = "/ws",
-        };
         _socket = new ClientWebSocket();
-        await _socket.ConnectAsync(builder.Uri, ct);
+        await _socket.ConnectAsync(ServerEndpoint.WebSocketUri(_baseUri), ct);
         Interlocked.Exchange(ref _lastInboundTicks, DateTime.UtcNow.Ticks);
     }
 
@@ -499,7 +667,12 @@ public sealed class PartyUpConnection : IAsyncDisposable
                     result = await _socket.ReceiveAsync(new ArraySegment<byte>(buffer), _cts.Token);
                     if (result.MessageType == WebSocketMessageType.Close)
                     {
-                        HandleConnectionLost("server closed the connection");
+                        // 关闭码是 reason 的同义兜底：服务端通常先发 session.replaced（应用层，
+                        // 带精确 reason），但连接也可能被直接关掉，所以两处都要认。
+                        var closeCode = result.CloseStatus is { } status ? (int)status : 0;
+                        var closeText = result.CloseStatusDescription ?? string.Empty;
+                        HandleConnectionLost(
+                            $"server closed the connection (code={closeCode} {closeText})", closeCode);
                         return;
                     }
                     message.Write(buffer, 0, result.Count);
@@ -545,9 +718,14 @@ public sealed class PartyUpConnection : IAsyncDisposable
     // ------------------------------------------------------------------
 
     /// <summary>连接丢失：非主动关闭就进入自动重连（同一时刻只允许一个重连循环）。</summary>
-    private void HandleConnectionLost(string reason)
+    /// <param name="closeCode">
+    /// 服务端给的 WS 关闭码；4001/4002/4003 表示会话已被撤销（顶号/踢/封禁），
+    /// 属于**终态**——token 已经失效，重连不会成功，只会把用户卡在"重连中"。
+    /// </param>
+    private void HandleConnectionLost(string reason, int closeCode = 0)
     {
-        if (_userClosed)
+        var terminal = _sessionTerminated || closeCode is 4001 or 4002 or 4003;
+        if (_userClosed || terminal)
         {
             Closed?.Invoke(reason);
             return;
@@ -589,7 +767,11 @@ public sealed class PartyUpConnection : IAsyncDisposable
                     await ConnectSocketAsync(_cts.Token);
                     _receiveLoop = Task.Run(ReceiveLoopAsync, CancellationToken.None);
 
-                    var auth = await RequestAsync<AuthOkDto>("auth", new { token = _token }, _cts.Token);
+                    var auth = await RequestAsync<AuthOkDto>("auth", new
+                    {
+                        token = _token,
+                        capabilities = AuthCapabilities(),
+                    }, _cts.Token);
                     Member = auth.Member;
                     Server = auth.Server;
 
@@ -717,6 +899,25 @@ public sealed class PartyUpConnection : IAsyncDisposable
                 {
                     VoiceStateChanged?.Invoke(state);
                 }
+                return;
+            }
+            case "members.state":
+            {
+                var roster = envelope.Payload?.Deserialize<MemberListDto>(JsonDefaults.Options);
+                if (roster is not null)
+                {
+                    MembersStateChanged?.Invoke(roster);
+                }
+                return;
+            }
+            case "session.replaced":
+            {
+                var replaced = envelope.Payload?.Deserialize<SessionReplacedDto>(JsonDefaults.Options);
+                var reason = replaced?.Reason ?? string.Empty;
+                // 先立终态标志，再通知上层：这样紧随其后的 Close 帧不会触发重连。
+                _sessionTerminated = true;
+                AppLog.Warn($"ws: session terminated by server reason={reason}");
+                SessionTerminated?.Invoke(reason);
                 return;
             }
         }

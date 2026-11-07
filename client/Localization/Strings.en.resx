@@ -1,0 +1,289 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <!-- English satellite resources. Keys must match Strings.resx one-for-one. -->
+  <resheader name="resmimetype">
+    <value>text/microsoft-resx</value>
+  </resheader>
+  <resheader name="version">
+    <value>2.0</value>
+  </resheader>
+  <resheader name="reader">
+    <value>System.Resources.ResXResourceReader, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+  </resheader>
+  <resheader name="writer">
+    <value>System.Resources.ResXResourceWriter, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+  </resheader>
+
+  <data name="Common_Close" xml:space="preserve">
+    <value>Close</value>
+  </data>
+  <data name="Common_Cancel" xml:space="preserve">
+    <value>Cancel</value>
+  </data>
+  <data name="Common_Save" xml:space="preserve">
+    <value>Save</value>
+  </data>
+  <data name="Common_NotImplemented" xml:space="preserve">
+    <value>Not implemented</value>
+  </data>
+
+  <data name="Settings_Title" xml:space="preserve">
+    <value>Settings</value>
+  </data>
+  <data name="Settings_Intro" xml:space="preserve">
+    <value>Appearance and language are saved locally. Audio and window options are labelled with their real status — nothing pretends to work.</value>
+  </data>
+
+  <data name="Settings_Appearance" xml:space="preserve">
+    <value>Appearance</value>
+  </data>
+  <data name="Settings_Theme" xml:space="preserve">
+    <value>Theme</value>
+  </data>
+  <data name="Settings_TextSize" xml:space="preserve">
+    <value>Text size</value>
+  </data>
+  <data name="Settings_Language" xml:space="preserve">
+    <value>Language</value>
+  </data>
+  <data name="Settings_LanguageNote" xml:space="preserve">
+    <value>Language takes effect after a restart.</value>
+  </data>
+  <data name="Settings_AppearanceNote" xml:space="preserve">
+    <value>Theme and text size apply immediately and are saved locally.</value>
+  </data>
+
+  <data name="Settings_Audio" xml:space="preserve">
+    <value>Audio &amp; input</value>
+  </data>
+  <data name="Settings_InputDevice" xml:space="preserve">
+    <value>Input device</value>
+  </data>
+  <data name="Settings_OutputDevice" xml:space="preserve">
+    <value>Output device</value>
+  </data>
+  <data name="Settings_MicTest" xml:space="preserve">
+    <value>Microphone test</value>
+  </data>
+  <data name="Settings_MicTestStart" xml:space="preserve">
+    <value>Start test</value>
+  </data>
+  <data name="Settings_MicTestStop" xml:space="preserve">
+    <value>Stop test</value>
+  </data>
+  <data name="Settings_MicTestHint" xml:space="preserve">
+    <value>Speak into the microphone; the level bar moving means the input chain works.</value>
+  </data>
+  <data name="Settings_MicTestUnavailable" xml:space="preserve">
+    <value>Media core unavailable — cannot test the microphone.</value>
+  </data>
+  <data name="Settings_SpeakerTest" xml:space="preserve">
+    <value>Speaker test</value>
+  </data>
+  <data name="Settings_SpeakerTestUnavailable" xml:space="preserve">
+    <value>Requires media-core support (the current DLL has no playback-test export); not available in this version.</value>
+  </data>
+
+  <data name="Settings_WindowStartup" xml:space="preserve">
+    <value>Window &amp; startup</value>
+  </data>
+  <data name="Settings_CloseToTray" xml:space="preserve">
+    <value>Keep running in the tray when closed</value>
+  </data>
+  <data name="Settings_LaunchAtStartup" xml:space="preserve">
+    <value>Launch at Windows startup</value>
+  </data>
+  <data name="Settings_Hotkeys" xml:space="preserve">
+    <value>Global hotkeys</value>
+  </data>
+  <data name="Settings_HotkeysNote" xml:space="preserve">
+    <value>Requires system-wide hotkey registration (Windows RegisterHotKey); not implemented in this version. The keys below do nothing.</value>
+  </data>
+  <data name="Settings_HotkeyToggleMute" xml:space="preserve">
+    <value>Toggle microphone mute</value>
+  </data>
+  <data name="Settings_HotkeyToggleDeafen" xml:space="preserve">
+    <value>Toggle speaker mute</value>
+  </data>
+  <data name="Settings_HotkeyToggleShare" xml:space="preserve">
+    <value>Start / stop screen sharing</value>
+  </data>
+  <data name="Settings_Unset" xml:space="preserve">
+    <value>Not set</value>
+  </data>
+
+  <data name="Settings_Account" xml:space="preserve">
+    <value>Account</value>
+  </data>
+  <data name="Settings_Logout" xml:space="preserve">
+    <value>Sign out</value>
+  </data>
+
+  <data name="Settings_Diagnostics" xml:space="preserve">
+    <value>Diagnostics</value>
+  </data>
+  <data name="Settings_PathHistory" xml:space="preserve">
+    <value>Voice / screen path changes (decided by the server; the client exposes no direct/relay switch)</value>
+  </data>
+  <data name="Settings_NoPathHistory" xml:space="preserve">
+    <value>No path changes recorded</value>
+  </data>
+
+  <data name="Settings_ServerAdmin" xml:space="preserve">
+    <value>Server administration</value>
+  </data>
+  <data name="Settings_ServerAdminHint" xml:space="preserve">
+    <value>Manage members, invites, bans and server settings. Only the owner can change dangerous settings such as transport mode.</value>
+  </data>
+  <data name="Settings_OpenServerAdmin" xml:space="preserve">
+    <value>Open server administration</value>
+  </data>
+  <data name="Settings_About" xml:space="preserve">
+    <value>About</value>
+  </data>
+  <data name="Settings_AboutLine" xml:space="preserve">
+    <value>PartyUp {0} · Avalonia {1} · Semi.Avalonia {2}</value>
+  </data>
+
+  <data name="Settings_Updates" xml:space="preserve">
+    <value>Updates</value>
+  </data>
+  <data name="Settings_AutoCheckUpdates" xml:space="preserve">
+    <value>Check for updates on startup</value>
+  </data>
+  <data name="Settings_CheckUpdates" xml:space="preserve">
+    <value>Check for updates</value>
+  </data>
+  <data name="Update_Current" xml:space="preserve">
+    <value>Current version v{0}</value>
+  </data>
+  <data name="Update_Checking" xml:space="preserve">
+    <value>Checking for updates…</value>
+  </data>
+  <data name="Update_UpToDate" xml:space="preserve">
+    <value>You are up to date.</value>
+  </data>
+  <data name="Update_Available" xml:space="preserve">
+    <value>Version v{0} is available. Choose “Update now” to download and restart.</value>
+  </data>
+  <data name="Update_Portable" xml:space="preserve">
+    <value>Portable build: download new versions manually, in-app updates are unavailable.</value>
+  </data>
+  <data name="Update_Failed" xml:space="preserve">
+    <value>Update check failed (network or update feed unavailable). Try again later.</value>
+  </data>
+  <data name="Update_Downloading" xml:space="preserve">
+    <value>Downloading update…</value>
+  </data>
+  <data name="Update_DownloadProgress" xml:space="preserve">
+    <value>Downloading update… {0}%</value>
+  </data>
+  <data name="Update_DownloadFailed" xml:space="preserve">
+    <value>Update download failed. Please try again later.</value>
+  </data>
+  <data name="Update_ServerVersion" xml:space="preserve">
+    <value>Server version v{0}</value>
+  </data>
+  <data name="Update_ServerVersionUnknown" xml:space="preserve">
+    <value>Server version unknown (not connected to a server)</value>
+  </data>
+  <data name="UpdatePrompt_Title" xml:space="preserve">
+    <value>Update available</value>
+  </data>
+  <data name="UpdatePrompt_Message" xml:space="preserve">
+    <value>Version v{0} is available (current v{1}). Download it now and restart the app when it finishes?</value>
+  </data>
+  <data name="UpdatePrompt_Now" xml:space="preserve">
+    <value>Update now</value>
+  </data>
+  <data name="UpdatePrompt_Later" xml:space="preserve">
+    <value>Later</value>
+  </data>
+  <data name="Theme_Light" xml:space="preserve">
+    <value>Light</value>
+  </data>
+  <data name="Theme_Dark" xml:space="preserve">
+    <value>Dark</value>
+  </data>
+  <data name="Theme_System" xml:space="preserve">
+    <value>Follow system</value>
+  </data>
+  <data name="TextSize_Normal" xml:space="preserve">
+    <value>Normal</value>
+  </data>
+  <data name="TextSize_Large" xml:space="preserve">
+    <value>Large</value>
+  </data>
+  <data name="Settings_AudioNote" xml:space="preserve">
+    <value>Input/output device selection, level meters and playback tests are not wired into the UI yet (P3); no fake device values are shown here.</value>
+  </data>
+  <data name="Settings_StartupNote" xml:space="preserve">
+    <value>Keep-in-tray is wired; launch-at-startup writes the current user's Run entry on Windows, and the checkbox reflects the real registry state (not a local cache).</value>
+  </data>
+  <data name="Settings_EvidenceNote" xml:space="preserve">
+    <value>Screenshots do not prove a feature works; real sign-in, channels, text and media are verified by server logs / window evidence.</value>
+  </data>
+  <data name="Settings_AudioDefault" xml:space="preserve">
+    <value>Follow system default</value>
+  </data>
+  <data name="Settings_AudioRefresh" xml:space="preserve">
+    <value>Refresh devices</value>
+  </data>
+  <data name="Settings_AudioHotSwitchOn" xml:space="preserve">
+    <value>This media core supports hot-switching during a call: changes apply immediately.</value>
+  </data>
+  <data name="Settings_AudioHotSwitchOff" xml:space="preserve">
+    <value>This media core cannot hot-switch during a call: changes apply the next time you join voice.</value>
+  </data>
+  <data name="Settings_AudioDeviceMissing" xml:space="preserve">
+    <value>The device you selected earlier is gone; fell back to the system default.</value>
+  </data>
+  <data name="Settings_AudioUnavailable" xml:space="preserve">
+    <value>Media core unavailable — cannot list devices.</value>
+  </data>
+  <data name="Settings_MicTestLevel" xml:space="preserve">
+    <value>Level</value>
+  </data>
+  <data name="Settings_MicTestWaiting" xml:space="preserve">
+    <value>Capturing — waiting for audio data…</value>
+  </data>
+  <data name="Settings_MicTestNoSignal" xml:space="preserve">
+    <value>No level received: check microphone permission, the mute key, or the selected device.</value>
+  </data>
+  <data name="Settings_MicTestInCall" xml:space="preserve">
+    <value>Cannot start the test while in a voice call; leave voice first, or watch the level on your member card.</value>
+  </data>
+  <data name="Tray_Show" xml:space="preserve">
+    <value>Show main window</value>
+  </data>
+  <data name="Tray_Mute" xml:space="preserve">
+    <value>Mute microphone</value>
+  </data>
+  <data name="Tray_Exit" xml:space="preserve">
+    <value>Quit PartyUp</value>
+  </data>
+  <data name="Startup_RegisterFailed" xml:space="preserve">
+    <value>Could not register launch-at-startup: {0}</value>
+  </data>
+  <data name="Settings_CloseAction" xml:space="preserve">
+    <value>When closing the window</value>
+  </data>
+  <data name="CloseAction_Ask" xml:space="preserve">
+    <value>Ask every time</value>
+  </data>
+  <data name="CloseAction_Tray" xml:space="preserve">
+    <value>Minimize to tray</value>
+  </data>
+  <data name="CloseAction_Exit" xml:space="preserve">
+    <value>Exit directly</value>
+  </data>
+  <data name="CloseDialog_Title" xml:space="preserve">
+    <value>Close PartyUp</value>
+  </data>
+  <data name="CloseDialog_Message" xml:space="preserve">
+    <value>Keep PartyUp running in the tray, or quit?</value>
+  </data>
+  <data name="CloseDialog_Remember" xml:space="preserve">
+    <value>Remember my choice and do not ask again</value>
+  </data>
+</root>

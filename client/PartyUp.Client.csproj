@@ -15,6 +15,13 @@
     <ApplicationIcon>$(MSBuildThisFileDirectory)../assets/icon.ico</ApplicationIcon>
 
     <!--
+      版本号唯一来源是仓库根 VERSION（scripts/package.ps1 读同一个文件打 vpk 包），
+      这样「程序集版本 = 包版本 = GitHub release tag」不会漂移；Velopack 比对新版本也靠它。
+      调试桥把源码快照到 runs/<id>/src 后 VERSION 仍与 client/ 同级；文件缺失时退回 SDK 默认版本。
+    -->
+    <Version Condition="Exists('$(MSBuildThisFileDirectory)../VERSION')">$([System.IO.File]::ReadAllText('$(MSBuildThisFileDirectory)../VERSION').Trim())</Version>
+
+    <!--
       Avalonia 依赖反射，trim 的风险高于收益：显式关闭（打包命令也会再传一次）。
     -->
     <PublishTrimmed>false</PublishTrimmed>
@@ -36,7 +43,11 @@
   <ItemGroup>
     <PackageReference Include="Avalonia" Version="12.1.4" />
     <PackageReference Include="Avalonia.Desktop" Version="12.1.4" />
-    <PackageReference Include="Avalonia.Themes.Fluent" Version="12.1.4" />
+    <!-- 视觉基线来自独立的 Semi 修订预览（docs/design/semi-preview）；正式客户端沿用同一套
+         主题与图标依赖，保证迁移后是同一份设计而不是重新发明一套。Fluent 主题不再加载，
+         避免两套控件主题同时生效。 -->
+    <PackageReference Include="Semi.Avalonia" Version="12.1.0.1" />
+    <PackageReference Include="Material.Icons.Avalonia" Version="3.0.2" />
     <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.2" />
     <!-- ULID：PROTOCOL.md §0 规定消息 id 是 ULID，不自造编码。 -->
     <PackageReference Include="NUlid" Version="1.7.3" />
@@ -44,6 +55,9 @@
          VelopackApp.Build().Run()，否则安装/卸载时 Velopack 的钩子参数不会被处理，
          安装器会把 GUI 拉起来等 30s 再强杀。版本与本机 vpk CLI 1.2.0 对齐。 -->
     <PackageReference Include="Velopack" Version="1.2.0" />
+    <!-- REG-03 邀请链接：query 解析/拼装用 ASP.NET Core 的标准 QueryHelpers，
+         不手写 Split/正则/百分号解码器。版本与 docs/design/semi-preview 原型一致。 -->
+    <PackageReference Include="Microsoft.AspNetCore.WebUtilities" Version="10.0.10" />
   </ItemGroup>
 
   <!--
@@ -55,6 +69,11 @@
           Condition="Exists('$(PartyUpMediaDll)')"
           Link="partyup_media.dll"
           CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <!-- 窗口图标与打包用的是同一份 assets/icon.ico（唯一图标来源，换 logo 只替换该文件）。 -->
+  <ItemGroup>
+    <AvaloniaResource Include="$(MSBuildThisFileDirectory)../assets/icon.ico" Link="Assets/icon.ico" />
   </ItemGroup>
 
   <Target Name="WarnMissingPartyUpMediaDll" BeforeTargets="Build">

@@ -1,0 +1,526 @@
+<!--
+  v1.1 重构外壳：视觉基线来自 docs/design/semi-preview/SemiPreviewWindow.axaml。
+  与预览的关键区别是**全部数据来自真实服务**：登录/频道/文字/名册/语音/共享。
+  这里不导入 DemoState，也没有任何定时合成数据的兜底分支。
+-->
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:PartyUp.Client.ViewModels"
+        xmlns:views="using:PartyUp.Client.Views"
+        xmlns:services="using:PartyUp.Client.Services"
+        xmlns:mi="clr-namespace:Material.Icons.Avalonia;assembly=Material.Icons.Avalonia"
+        x:Class="PartyUp.Client.ShellWindow"
+        x:DataType="vm:ShellViewModel"
+        x:CompileBindings="True"
+        Title="PartyUp"
+        Width="1280" Height="800" MinWidth="900" MinHeight="600"
+        FontFamily="Microsoft YaHei UI" WindowStartupLocation="CenterScreen">
+  <Window.Resources>
+    <!-- 当前浏览频道的语音成员：语音/麦克风/发声/扬声器/共享五个独立状态 -->
+    <DataTemplate x:Key="ChannelMember" x:DataType="vm:ShellMemberRow">
+      <Border Classes="member" Classes.speaking="{Binding IsSpeaking}" Padding="8" Margin="0,0,0,5">
+        <Grid RowDefinitions="Auto,Auto" ColumnDefinitions="*,Auto">
+          <TextBlock Text="{Binding DisplayName}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"
+                     ToolTip.Tip="{Binding DisplayName}" Margin="0,0,6,0" VerticalAlignment="Center" />
+          <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="5" VerticalAlignment="Center">
+            <mi:MaterialIcon Kind="AccountVoice" Width="16" Height="16"
+                             IsVisible="{Binding IsInVoice}" ToolTip.Tip="{Binding VoiceChannelLabel}" />
+            <mi:MaterialIcon Kind="{Binding MicrophoneIcon}" Width="16" Height="16"
+                             Classes.off="{Binding !MicrophoneEnabled}" ToolTip.Tip="{Binding MicrophoneLabel}" />
+            <mi:MaterialIcon Kind="RecordCircle" Width="16" Height="16" Classes.active="{Binding IsSpeaking}"
+                             Classes.quiet="{Binding !IsSpeaking}" ToolTip.Tip="{Binding SpeakingLabel}" />
+            <mi:MaterialIcon Kind="{Binding SpeakerIcon}" Width="16" Height="16"
+                             Classes.off="{Binding IsDeafened}" ToolTip.Tip="{Binding SpeakerLabel}" />
+            <mi:MaterialIcon Kind="MonitorShare" Width="16" Height="16" Classes.active="{Binding IsSharing}"
+                             Classes.quiet="{Binding !IsSharing}" ToolTip.Tip="{Binding ShareLabel}" />
+          </StackPanel>
+          <Button Grid.Row="1" Grid.ColumnSpan="2" Content="观看共享" Classes="Primary Small"
+                  Command="{Binding WatchCommand}" CommandParameter="{Binding}"
+                  IsVisible="{Binding ShowWatchButton}" IsEnabled="{Binding CanWatch}"
+                  Margin="0,5,0,0" HorizontalAlignment="Left"
+                  AutomationProperties.AutomationId="{Binding Id}"
+                  ToolTip.Tip="{Binding WatchLabel}" />
+        </Grid>
+      </Border>
+    </DataTemplate>
+
+    <!-- 其他在线成员：空闲 / 在其他频道语音 -->
+    <DataTemplate x:Key="OtherOnlineMember" x:DataType="vm:ShellMemberRow">
+      <Grid ColumnDefinitions="24,*" Margin="0,0,0,7">
+        <mi:MaterialIcon Kind="AccountCircle" Width="18" Height="18" VerticalAlignment="Center" />
+        <StackPanel Grid.Column="1" Spacing="1">
+          <TextBlock Text="{Binding DisplayName}" />
+          <TextBlock Classes="caption"
+                     Text="{Binding VoiceChannelLabel, StringFormat='在 {0} 语音'}"
+                     IsVisible="{Binding IsInVoice}" />
+          <TextBlock Classes="caption" Text="空闲（在线，未加入语音）" IsVisible="{Binding !IsInVoice}" />
+        </StackPanel>
+      </Grid>
+    </DataTemplate>
+
+    <DataTemplate x:Key="OfflineMember" x:DataType="vm:ShellMemberRow">
+      <Grid ColumnDefinitions="24,*" Margin="0,0,0,7">
+        <mi:MaterialIcon Kind="AccountCircle" Width="18" Height="18" VerticalAlignment="Center" />
+        <TextBlock Grid.Column="1" Text="{Binding DisplayName}" VerticalAlignment="Center" />
+      </Grid>
+    </DataTemplate>
+
+    <DataTemplate x:Key="ChatMessage" x:DataType="vm:ShellMessageItem">
+      <Border Padding="0,12" BorderThickness="0,0,0,1" BorderBrush="{DynamicResource SemiColorFill0}">
+        <StackPanel Spacing="6">
+          <StackPanel Orientation="Horizontal" Spacing="12">
+            <TextBlock Text="{Binding Author}" FontWeight="SemiBold" />
+            <TextBlock Text="{Binding TimeText}" Classes="caption" VerticalAlignment="Center" />
+          </StackPanel>
+          <SelectableTextBlock Text="{Binding Body}" TextWrapping="Wrap" LineHeight="23" />
+        </StackPanel>
+      </Border>
+    </DataTemplate>
+
+    <DataTemplate x:Key="ChannelRow" x:DataType="vm:ShellChannelItem">
+      <TextBlock Text="{Binding NameWithMarkers}" FontSize="14" Padding="2"
+                 TextTrimming="CharacterEllipsis" ToolTip.Tip="{Binding Name}" />
+    </DataTemplate>
+  </Window.Resources>
+
+  <!-- 顶部不再有横跨整窗的一条「顶栏」：原来那条只画了左边 300px 的服务器名，右边整条留白约 40px，
+       把主区标题挤到底下、和左栏顶部对不齐。顶栏移到左栏内部（ChannelPane 第一行），
+       主区从窗口内容区顶部开始。 -->
+  <Grid>
+    <Grid>
+      <!-- ============ 已登录：主界面 ============ -->
+      <Grid IsVisible="{Binding IsLoggedIn}">
+        <SplitView IsPaneOpen="{Binding ShowSettings, Mode=TwoWay}" PanePlacement="Right"
+                   DisplayMode="Overlay" OpenPaneLength="420" CompactPaneLength="0">
+          <SplitView.Pane>
+            <Border Background="{DynamicResource SemiColorBackground0}" Padding="22"
+                    BorderThickness="1,0,0,0" BorderBrush="{DynamicResource SemiColorBorder}">
+              <views:SettingsView DataContext="{Binding}" />
+            </Border>
+          </SplitView.Pane>
+
+          <!-- 左栏宽度：底部媒体卡片那一行要同时放下「加入语音 / 麦克风 / 扬声器 / 共享屏幕」四个按钮，
+               不换行、不被裁。1280×800 @1.75 的实测是 300 太窄（右端挤到栏边），四个按钮连同
+               卡片内边距实际需要约 276 DIP；这里给 360，给大字号（16px）和更长文案留余量。
+               不写 ColumnDefinition.MinWidth：全屏（ShellWindow.axaml.cs 的 ApplyLayout）会把第 0 列
+               宽设成 0，列级 MinWidth 会把它夹回来、在全屏左侧留一条空带；最小宽度放在 ChannelPane 上。 -->
+          <Grid x:Name="AppGrid">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="360" />
+              <ColumnDefinition Width="4" />
+              <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+            <!-- 左栏：顶栏（服务器名）+ 频道 / 成员（CR-01） -->
+            <!-- MinWidth 340 是「四按钮那一行」的硬底线（媒体卡片内边距 10 + 栏内边距 16/12 都算进去）。 -->
+            <Border x:Name="ChannelPane" Background="{DynamicResource SemiColorFill0}" MinWidth="340">
+              <Grid RowDefinitions="Auto,*">
+                <!-- 顶栏：只占左栏宽度、只显示服务器名（品牌与连接状态不再重复占一行） -->
+                <Border Grid.Row="0" Padding="16,10" BorderThickness="0,0,0,1"
+                        BorderBrush="{DynamicResource SemiColorBorder}">
+                  <TextBlock Text="{Binding ServerCaption}" FontWeight="SemiBold"
+                             TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
+                </Border>
+
+                <Grid Grid.Row="1" RowDefinitions="Auto,*,Auto,Auto" Margin="16,16,12,12">
+                <Button Command="{Binding ChooseChannelCommand}" HorizontalAlignment="Stretch"
+                        HorizontalContentAlignment="Left" Margin="0,0,0,12"
+                        AutomationProperties.AutomationId="ChooseChannel">
+                  <StackPanel Orientation="Horizontal" Spacing="8">
+                    <mi:MaterialIcon Kind="MenuSwap" Width="18" Height="18" />
+                    <TextBlock Text="{Binding BrowseChannelName}" IsVisible="{Binding !ChannelPickerOpen}"
+                               FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
+                    <TextBlock Text="切换频道" IsVisible="{Binding ChannelPickerOpen}" />
+                  </StackPanel>
+                </Button>
+
+                <Grid Grid.Row="1">
+                  <!-- 频道列表：单击浏览（随后自动回到成员视图），双击直接加入该频道语音 -->
+                  <ListBox x:Name="ChannelList" Grid.Row="1" ItemsSource="{Binding Channels}"
+                           SelectedItem="{Binding BrowseChannel, Mode=TwoWay}"
+                           ItemTemplate="{StaticResource ChannelRow}"
+                           DoubleTapped="ChannelDoubleTapped"
+                           ToolTip.Tip="单击浏览 · 双击加入频道语音"
+                           IsVisible="{Binding ChannelPickerOpen}"
+                           AutomationProperties.AutomationId="Channels">
+                    <ListBox.KeyBindings>
+                      <KeyBinding Gesture="Enter" Command="{Binding JoinCallCommand}" />
+                    </ListBox.KeyBindings>
+                  </ListBox>
+
+                  <!-- 三组成员：频道中 / 其他在线 / 离线（只留三类，不再有说明行） -->
+                  <ScrollViewer IsVisible="{Binding ShowMembersPanel}" HorizontalScrollBarVisibility="Disabled">
+                    <StackPanel Spacing="13">
+                      <StackPanel Spacing="6">
+                        <TextBlock Text="{Binding CurrentGroupTitle}" Classes="section"
+                                   Foreground="{DynamicResource SemiColorPrimary}" />
+                        <ItemsControl ItemsSource="{Binding CurrentMembers}"
+                                      ItemTemplate="{StaticResource ChannelMember}" />
+                        <TextBlock Text="此频道暂无已加入语音的成员" Classes="caption"
+                                   IsVisible="{Binding !HasCurrentMembers}" />
+                      </StackPanel>
+                      <Separator Margin="0" />
+                      <StackPanel Spacing="8">
+                        <TextBlock Text="{Binding OnlineGroupTitle}" Classes="section"
+                                   Foreground="{DynamicResource SemiColorSuccess}" />
+                        <ItemsControl ItemsSource="{Binding OtherOnlineMembers}"
+                                      ItemTemplate="{StaticResource OtherOnlineMember}" />
+                        <TextBlock Text="没有其他在线成员" Classes="caption"
+                                   IsVisible="{Binding !HasOtherOnlineMembers}" />
+                      </StackPanel>
+                      <Separator Margin="0" />
+                      <StackPanel Spacing="8" Opacity="0.6">
+                        <TextBlock Text="{Binding OfflineGroupTitle}" Classes="section" />
+                        <ItemsControl ItemsSource="{Binding OfflineMembers}"
+                                      ItemTemplate="{StaticResource OfflineMember}" />
+                        <TextBlock Text="没有离线成员" Classes="caption"
+                                   IsVisible="{Binding !HasOfflineMembers}" />
+                      </StackPanel>
+                    </StackPanel>
+                  </ScrollViewer>
+                </Grid>
+
+                <!-- 媒体卡片：麦克风 / 扬声器 / 屏幕共享 / 加入·离开语音（替代原来的底部通话条） -->
+                <Border Grid.Row="2" Padding="10" Margin="0,10,0,0" CornerRadius="8"
+                        Background="{DynamicResource SemiColorBackground0}" BorderThickness="1"
+                        BorderBrush="{DynamicResource SemiColorBorder}">
+                  <StackPanel Spacing="8">
+                    <TextBlock Text="{Binding ShareStatusText}" Classes="caption" TextWrapping="Wrap"
+                               Foreground="{DynamicResource SemiColorDanger}"
+                               IsVisible="{Binding HasShareProblem}" />
+                    <StackPanel Orientation="Horizontal" Spacing="6">
+                      <Button Command="{Binding JoinCallCommand}" IsVisible="{Binding !IsInVoice}"
+                              IsEnabled="{Binding CanUseMedia}" AutomationProperties.AutomationId="JoinCall">
+                        <StackPanel Orientation="Horizontal" Spacing="6">
+                          <mi:MaterialIcon Kind="Phone" Width="18" Height="18" />
+                          <TextBlock Text="加入语音" />
+                        </StackPanel>
+                      </Button>
+                      <ToggleButton IsChecked="{Binding IsVoiceMuted, Mode=OneWay}"
+                                    Command="{Binding ToggleMuteCommand}" IsEnabled="{Binding IsInVoice}"
+                                    AutomationProperties.AutomationId="Mute" ToolTip.Tip="麦克风开关">
+                        <mi:MaterialIcon Kind="Microphone" Width="20" Height="20"
+                                         Classes.off="{Binding IsVoiceMuted}" />
+                      </ToggleButton>
+                      <ToggleButton IsChecked="{Binding IsVoiceDeafened, Mode=OneWay}"
+                                    Command="{Binding ToggleDeafenCommand}" IsEnabled="{Binding IsInVoice}"
+                                    AutomationProperties.AutomationId="Deafen" ToolTip.Tip="扬声器开关">
+                        <mi:MaterialIcon Kind="VolumeHigh" Width="20" Height="20"
+                                         Classes.off="{Binding IsVoiceDeafened}" />
+                      </ToggleButton>
+                      <Button Command="{Binding OpenShareSetupCommand}" IsEnabled="{Binding CanUseMedia}"
+                              IsVisible="{Binding !IsSharing}" ToolTip.Tip="共享屏幕"
+                              AutomationProperties.AutomationId="Publish">
+                        <mi:MaterialIcon Kind="MonitorShare" Width="20" Height="20" />
+                      </Button>
+                      <Button Command="{Binding StopSharingCommand}" IsVisible="{Binding IsSharing}"
+                              ToolTip.Tip="停止共享" AutomationProperties.AutomationId="StopPublish">
+                        <mi:MaterialIcon Kind="MonitorOff" Width="20" Height="20" />
+                      </Button>
+                      <Button Command="{Binding LeaveCallCommand}" IsVisible="{Binding IsInVoice}" Classes="Danger"
+                              ToolTip.Tip="离开语音" AutomationProperties.AutomationId="Leave">
+                        <mi:MaterialIcon Kind="PhoneHangup" Width="18" Height="18" />
+                      </Button>
+                    </StackPanel>
+                  </StackPanel>
+                </Border>
+
+                <!-- 用户卡片：设置与退出登录的入口（CR-04） -->
+                <Button Grid.Row="3" HorizontalAlignment="Stretch" Margin="0,10,0,0"
+                        HorizontalContentAlignment="Stretch" AutomationProperties.AutomationId="UserCard">
+                  <Button.Flyout>
+                    <MenuFlyout>
+                      <MenuItem Header="应用设置" Command="{Binding OpenSettingsCommand}"
+                                AutomationProperties.AutomationId="OpenSettings" />
+                      <MenuItem Header="退出登录" Command="{Binding LogoutCommand}"
+                                AutomationProperties.AutomationId="Logout" />
+                    </MenuFlyout>
+                  </Button.Flyout>
+                  <Grid ColumnDefinitions="30,*,18" Margin="0,4">
+                    <mi:MaterialIcon Kind="AccountCircle" Width="24" Height="24" VerticalAlignment="Center" />
+                    <StackPanel Grid.Column="1" Spacing="2">
+                      <TextBlock Text="{Binding SelfDisplayName}" FontWeight="SemiBold"
+                                 AutomationProperties.AutomationId="SelfDisplayName" />
+                      <TextBlock Text="{Binding SelfLoginName}" Classes="caption"
+                                 AutomationProperties.AutomationId="SelfLoginName" />
+                    </StackPanel>
+                    <mi:MaterialIcon Grid.Column="2" Kind="ChevronDown" Width="16" Height="16"
+                                     VerticalAlignment="Center" />
+                  </Grid>
+                </Button>
+                </Grid>
+              </Grid>
+            </Border>
+
+            <GridSplitter x:Name="ChannelDivider" Grid.Column="1" ResizeDirection="Columns" />
+
+            <!-- 主区：标题 / 观看舞台 / 聊天 / 输入 -->
+            <!-- 顶部只留 10：和左栏顶栏的服务器名同一条起始高度，不再有横跨整窗的那条 40px 空带。 -->
+            <Grid x:Name="ContentGrid" Grid.Column="2" RowDefinitions="Auto,Auto,*,Auto" Margin="22,10,22,18">
+              <StackPanel Spacing="4" Margin="0,0,0,14">
+                <TextBlock Text="{Binding BrowseChannelName}" Classes="heading" />
+                <TextBlock Text="{Binding BrowseSummary}" Classes="caption" TextWrapping="Wrap" />
+                <!-- 共享中转移的确认与失败回落（原在底部通话条，随通话条一起移到内容区顶部） -->
+                <Border IsVisible="{Binding IsTransferPending}" Background="{DynamicResource SemiColorFill0}"
+                        CornerRadius="6" Padding="10,8" Margin="0,8,0,0">
+                  <StackPanel Orientation="Horizontal" Spacing="8">
+                    <TextBlock Text="{Binding PendingTransferText}" VerticalAlignment="Center" TextWrapping="Wrap" />
+                    <Button Content="确认转移" Command="{Binding ConfirmTransferCommand}" Classes="Primary"
+                            Theme="{StaticResource SolidButton}" AutomationProperties.AutomationId="ConfirmTransfer" />
+                    <Button Content="取消" Command="{Binding CancelTransferCommand}" />
+                  </StackPanel>
+                </Border>
+                <Border IsVisible="{Binding HasTransferFailure}" Background="{DynamicResource SemiColorDanger}"
+                        CornerRadius="6" Padding="10,8" Margin="0,8,0,0">
+                  <StackPanel Orientation="Horizontal" Spacing="8">
+                    <TextBlock Text="{Binding TransferFailureText}" Foreground="White" TextWrapping="Wrap"
+                               VerticalAlignment="Center" />
+                    <Button Content="返回原频道（仅浏览）" Command="{Binding ReturnToPreviousChannelCommand}" />
+                  </StackPanel>
+                </Border>
+              </StackPanel>
+
+              <!-- 观看舞台：只在真实观看/等首帧时出现（不自动抢布局） -->
+              <Border x:Name="WatchStage" Grid.Row="1" IsVisible="{Binding ShowWatchStage}" Height="240"
+                      Padding="14" CornerRadius="8" Background="{DynamicResource SemiColorFill0}"
+                      Margin="0,0,0,12">
+                <Grid RowDefinitions="Auto,*,Auto">
+                  <Grid ColumnDefinitions="*,Auto">
+                    <TextBlock Text="{Binding WatchingTitle}" FontWeight="SemiBold" VerticalAlignment="Center" />
+                    <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="6">
+                      <Button Content="聊天显示/收起" Command="{Binding ToggleChatVisibleCommand}" Classes="Small" />
+                      <Button Content="全屏" Command="{Binding ToggleFullScreenCommand}" Classes="Small"
+                              IsEnabled="{Binding IsWatching}" AutomationProperties.AutomationId="Fullscreen" />
+                      <Button Content="停止观看" Command="{Binding StopWatchingCommand}" Classes="Small"
+                              AutomationProperties.AutomationId="StopWatch" />
+                    </StackPanel>
+                  </Grid>
+                  <Grid Grid.Row="1">
+                    <Image x:Name="RemoteScreen" Stretch="Uniform" />
+                    <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center" Spacing="8"
+                                IsVisible="{Binding !IsWatching}">
+                      <mi:MaterialIcon Kind="MonitorShare" Width="36" Height="36" HorizontalAlignment="Center" />
+                      <TextBlock Text="等待首帧…" HorizontalAlignment="Center" />
+                    </StackPanel>
+                    <TextBlock Text="{Binding RemoteFpsText}" Classes="caption"
+                               HorizontalAlignment="Right" VerticalAlignment="Bottom" Margin="6" />
+                  </Grid>
+                  <ProgressBar Grid.Row="2" IsIndeterminate="True" Height="3"
+                               IsVisible="{Binding IsWaitingForFrame}" />
+                </Grid>
+              </Border>
+
+              <!-- 聊天历史 -->
+              <ScrollViewer x:Name="ChatHistory" Grid.Row="2" HorizontalScrollBarVisibility="Disabled"
+                            IsVisible="{Binding IsChatVisible}" Margin="0,0,0,12">
+                <StackPanel>
+                  <ItemsControl ItemsSource="{Binding Messages}" ItemTemplate="{StaticResource ChatMessage}" />
+                  <TextBlock Text="还没有消息。" Classes="caption" Margin="0,12"
+                             IsVisible="{Binding !HasMessages}" />
+                </StackPanel>
+              </ScrollViewer>
+
+              <StackPanel x:Name="Composer" Grid.Row="3" Spacing="7" IsVisible="{Binding IsChatVisible}">
+                <Button Content="有新消息 · 跳到最新" IsVisible="{Binding HasNewMessages}"
+                        Command="{Binding JumpToLatestCommand}" HorizontalAlignment="Left" Classes="Small" />
+                <Border IsVisible="{Binding HasSendFailure}" Background="{DynamicResource SemiColorDanger}"
+                        CornerRadius="6" Padding="10,7">
+                  <TextBlock Text="{Binding SendError}" Foreground="White" TextWrapping="Wrap" />
+                </Border>
+                <Grid ColumnDefinitions="*,84">
+                  <TextBox Text="{Binding MessageInput, Mode=TwoWay}" AcceptsReturn="True" TextWrapping="Wrap"
+                           MinHeight="52" MaxHeight="120" PlaceholderText="发送消息到当前浏览频道…"
+                           VerticalAlignment="Stretch" AutomationProperties.AutomationId="MessageInput" />
+                  <Button Grid.Column="1" Content="发送" Margin="10,0,0,0" VerticalAlignment="Stretch"
+                          VerticalContentAlignment="Center" HorizontalContentAlignment="Center"
+                          Command="{Binding SendMessageCommand}" IsEnabled="{Binding CanSend}"
+                          Classes="Primary" Theme="{StaticResource SolidButton}"
+                          AutomationProperties.AutomationId="SendMessage" />
+                </Grid>
+              </StackPanel>
+            </Grid>
+          </Grid>
+        </SplitView>
+      </Grid>
+
+      <!-- ============ 未登录：第一屏「我的服务器」 ============ -->
+      <!-- 登录不再是"填地址+账号"，而是先选服务器：多服务器场景下这能避免连错服，
+           也是邀请链接/邀请码/服务器地址三种输入的统一入口。 -->
+      <ScrollViewer IsVisible="{Binding ShowServerPicker}" HorizontalScrollBarVisibility="Disabled">
+        <StackPanel Width="560" HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="14" Margin="28">
+          <TextBlock Text="PartyUp" FontSize="32" FontWeight="Bold"
+                     Foreground="{DynamicResource SemiColorPrimary}" />
+          <TextBlock Text="选择服务器" Classes="heading" />
+          <TextBlock Text="服务器由朋友或群主自托管。首次加入通常用邀请链接；已有账号就直接选服务器登录。"
+                     Classes="caption" TextWrapping="Wrap" />
+
+          <TextBlock Text="还没有添加过服务器。" Classes="caption" IsVisible="{Binding !HasServers}" />
+
+          <ItemsControl ItemsSource="{Binding Servers}" AutomationProperties.AutomationId="ServerList">
+            <ItemsControl.ItemTemplate>
+              <DataTemplate x:DataType="services:KnownServer" x:CompileBindings="False">
+                <Border Margin="0,0,0,8" Padding="14" CornerRadius="10"
+                        Background="{DynamicResource SemiColorBackground1}"
+                        BorderThickness="1" BorderBrush="{DynamicResource SemiColorBorder}"
+                        AutomationProperties.AutomationId="ServerRow">
+                  <Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="10">
+                    <StackPanel Grid.Column="0" Spacing="2" VerticalAlignment="Center">
+                      <TextBlock Text="{Binding Name}" FontWeight="SemiBold"
+                                 AutomationProperties.AutomationId="ServerRowName" />
+                      <TextBlock Text="{Binding Url}" Classes="caption"
+                                 AutomationProperties.AutomationId="ServerRowUrl"
+                                 TextTrimming="CharacterEllipsis" />
+                    </StackPanel>
+                    <Button Grid.Column="1" Content="进入" Classes="Primary"
+                            Theme="{StaticResource SolidButton}"
+                            AutomationProperties.AutomationId="ServerUse"
+                            Command="{Binding $parent[ItemsControl].DataContext.UseServerCommand}"
+                            CommandParameter="{Binding}" />
+                    <Button Grid.Column="2" Content="移除"
+                            AutomationProperties.AutomationId="ServerRemove"
+                            Command="{Binding $parent[ItemsControl].DataContext.RemoveServerCommand}"
+                            CommandParameter="{Binding}" />
+                  </Grid>
+                </Border>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+
+          <Separator />
+          <TextBlock Text="添加服务器" FontWeight="SemiBold" />
+          <TextBlock Text="粘贴服务器地址、邀请链接或邀请码都行，会自动识别。"
+                     Classes="caption" TextWrapping="Wrap" />
+          <TextBox Text="{Binding AddServerInput, Mode=TwoWay}"
+                   Watermark="http://192.168.1.10:8080 或 https://…/?code=XXXX"
+                   AutomationProperties.AutomationId="AddServerInput" />
+          <TextBlock Text="{Binding AddServerError}"
+                     Foreground="{DynamicResource SemiColorDanger}" TextWrapping="Wrap"
+                     IsVisible="{Binding HasAddServerError}"
+                     AutomationProperties.AutomationId="AddServerError" />
+          <Button Content="添加并继续" Command="{Binding AddServerCommand}" Classes="Primary"
+                  Theme="{StaticResource SolidButton}" HorizontalAlignment="Stretch"
+                  HorizontalContentAlignment="Center" IsEnabled="{Binding !IsAddingServer}"
+                  AutomationProperties.AutomationId="AddServer" />
+          <TextBlock Text="正在识别服务器…" Classes="caption" IsVisible="{Binding IsAddingServer}" />
+        </StackPanel>
+      </ScrollViewer>
+
+      <!-- ============ 未登录：未初始化服务器的 owner 创建向导 ============ -->
+      <ScrollViewer IsVisible="{Binding ShowBootstrap}" HorizontalScrollBarVisibility="Disabled">
+        <StackPanel Width="460" HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="14" Margin="28">
+          <TextBlock Text="创建管理员" Classes="heading" />
+          <TextBlock Text="{Binding BootstrapServerName}" FontWeight="SemiBold"
+                     AutomationProperties.AutomationId="BootstrapServerName" />
+          <TextBlock Text="这台服务器还没有初始化。请填入服务端启动时在终端打印的 bootstrap token，然后设定管理员账号。"
+                     Classes="caption" TextWrapping="Wrap" />
+          <TextBlock Text="bootstrap token" />
+          <TextBox Text="{Binding BootstrapToken, Mode=TwoWay}"
+                   Watermark="服务端终端输出里的 BOOTSTRAP_TOKEN"
+                   AutomationProperties.AutomationId="BootstrapToken" />
+          <TextBlock Text="管理员用户名" />
+          <TextBox Text="{Binding BootstrapUsername, Mode=TwoWay}"
+                   AutomationProperties.AutomationId="BootstrapUser" />
+          <TextBlock Text="密码（至少 8 位）" />
+          <TextBox Text="{Binding BootstrapPassword, Mode=TwoWay}" PasswordChar="●"
+                   AutomationProperties.AutomationId="BootstrapPassword" />
+          <TextBlock Text="{Binding BootstrapError}" Foreground="{DynamicResource SemiColorDanger}"
+                     TextWrapping="Wrap" IsVisible="{Binding HasBootstrapError}"
+                     AutomationProperties.AutomationId="BootstrapError" />
+          <Button Content="创建并进入" Command="{Binding CompleteBootstrapCommand}" Classes="Primary"
+                  Theme="{StaticResource SolidButton}" HorizontalAlignment="Stretch"
+                  HorizontalContentAlignment="Center" AutomationProperties.AutomationId="CompleteBootstrap" />
+          <Button Content="返回服务器列表" Command="{Binding BackToServerListCommand}"
+                  HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+                  AutomationProperties.AutomationId="BootstrapBackToServerList" />
+        </StackPanel>
+      </ScrollViewer>
+
+      <!-- ============ 未登录：登录页（已选定服务器） ============ -->
+      <ScrollViewer IsVisible="{Binding ShowLogin}" HorizontalScrollBarVisibility="Disabled">
+        <StackPanel Width="420" HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="14" Margin="28">
+          <TextBlock Text="PartyUp" FontSize="32" FontWeight="Bold"
+                     Foreground="{DynamicResource SemiColorPrimary}" />
+          <TextBlock Text="登录你的服务器" Classes="heading" />
+          <TextBlock Text="{Binding ActiveServerCaption}" FontWeight="SemiBold"
+                     AutomationProperties.AutomationId="ActiveServerName" />
+          <TextBlock Text="{Binding ActiveServerUrl}" Classes="caption"
+                     AutomationProperties.AutomationId="ActiveServerUrl" />
+          <TextBlock Text="用户名" />
+          <TextBox Text="{Binding Username, Mode=TwoWay}" AutomationProperties.AutomationId="LoginUser" />
+          <TextBlock Text="密码" />
+          <TextBox Text="{Binding Password, Mode=TwoWay}" PasswordChar="●"
+                   AutomationProperties.AutomationId="LoginPassword" />
+          <CheckBox Content="记住我（下次自动登录）" IsChecked="{Binding RememberMe, Mode=TwoWay}"
+                    AutomationProperties.AutomationId="RememberMe" />
+          <TextBlock Text="{Binding SessionNotice}" Foreground="{DynamicResource SemiColorDanger}"
+                     TextWrapping="Wrap" IsVisible="{Binding HasSessionNotice}"
+                     AutomationProperties.AutomationId="SessionNotice" />
+          <TextBlock Text="{Binding LoginError}" Foreground="{DynamicResource SemiColorDanger}" TextWrapping="Wrap"
+                     IsVisible="{Binding HasLoginError}"
+                     AutomationProperties.AutomationId="LoginError" />
+          <Button Content="登录" Command="{Binding LoginCommand}" Classes="Primary"
+                  Theme="{StaticResource SolidButton}" HorizontalAlignment="Stretch"
+                  HorizontalContentAlignment="Center" IsEnabled="{Binding !IsLoggingIn}"
+                  AutomationProperties.AutomationId="Login" />
+          <TextBlock Text="正在连接…" Classes="caption" IsVisible="{Binding IsLoggingIn}" />
+          <Separator />
+          <Button Content="用邀请链接注册新账户" Command="{Binding BeginRegistrationCommand}"
+                  HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+                  AutomationProperties.AutomationId="BeginRegistration" />
+          <Button Content="换一台服务器" Command="{Binding BackToServerListCommand}"
+                  HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+                  AutomationProperties.AutomationId="BackToServerList" />
+        </StackPanel>
+      </ScrollViewer>
+
+      <!-- ============ 未登录：分步注册（P1b，真实邀请预检） ============ -->
+      <Border IsVisible="{Binding ShowRegistration}">
+        <views:RegistrationView DataContext="{Binding Registration}" />
+      </Border>
+    </Grid>
+
+    <!-- 共享前的设置弹窗：选源 → 开始共享（替代原先常驻底栏里的下拉框） -->
+    <Border Grid.Row="0" IsVisible="{Binding ShowShareSetup}" Background="#66000000">
+      <Border Width="440" Padding="24" CornerRadius="12" HorizontalAlignment="Center" VerticalAlignment="Center"
+              Background="{DynamicResource SemiColorBackground0}" BorderThickness="1"
+              BorderBrush="{DynamicResource SemiColorBorder}">
+        <StackPanel Spacing="12">
+          <TextBlock Text="屏幕共享" FontSize="18" FontWeight="SemiBold" />
+          <TextBlock Text="选择要共享的屏幕或窗口，确认后开始共享。" Classes="caption" TextWrapping="Wrap" />
+          <TextBlock Text="共享源" />
+          <ComboBox ItemsSource="{Binding Sources}" SelectedItem="{Binding SelectedSource, Mode=TwoWay}"
+                    HorizontalAlignment="Stretch" AutomationProperties.AutomationId="ShareSource">
+            <ComboBox.ItemTemplate>
+              <DataTemplate x:DataType="services:MediaSource">
+                <TextBlock Text="{Binding Title}" TextTrimming="CharacterEllipsis" />
+              </DataTemplate>
+            </ComboBox.ItemTemplate>
+          </ComboBox>
+          <TextBlock Text="{Binding ShareStatusText}" Classes="caption" TextWrapping="Wrap" />
+          <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
+            <Button Content="取消" Command="{Binding CancelShareSetupCommand}"
+                    AutomationProperties.AutomationId="ShareSetupCancel" />
+            <Button Content="开始共享" Command="{Binding StartSharingCommand}" Classes="Primary"
+                    Theme="{StaticResource SolidButton}" AutomationProperties.AutomationId="ShareSetupStart" />
+          </StackPanel>
+        </StackPanel>
+      </Border>
+    </Border>
+    <!-- ============ 服务器管理（覆盖层） ============ -->
+    <!-- 做成覆盖层而不是设置里的一屏：管理操作要看成员/频道上下文，且它是服务器级的。
+         owner 与 admin 共用同一视图，按角色裁剪按钮（危险设置仅 owner）。 -->
+    <Border Grid.Row="0" IsVisible="{Binding IsAdminOverlayVisible}" Background="#88000000">
+      <!-- 不要写死 MaxWidth/MaxHeight：1280×800 的默认窗口 + 1.75 缩放时会把右栏裁掉
+           （真机截图抓到）。让它跟随窗口拉伸，内部各自滚动。 -->
+      <Border Margin="24" CornerRadius="12" ClipToBounds="True"
+              Background="{DynamicResource SemiColorBackground0}" BorderThickness="1"
+              BorderBrush="{DynamicResource SemiColorBorder}">
+        <Grid RowDefinitions="*,Auto">
+          <views:AdminView Grid.Row="0" DataContext="{Binding Admin}" Margin="0,0,0,0" />
+          <Button Grid.Row="1" Content="关闭" Command="{Binding CloseAdminCommand}"
+                  HorizontalAlignment="Right" Margin="0,0,16,12"
+                  AutomationProperties.AutomationId="CloseAdmin" />
+        </Grid>
+      </Border>
+    </Border>
+  </Grid>
+</Window>

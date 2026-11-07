@@ -1,0 +1,292 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <!--
+    中性资源 = 简体中文（产品的第一语言）。英文在 Strings.en.resx，构建时生成 en 卫星程序集。
+    加一条文案 = 两个文件各加一个同名的 <data>；键名统一 <区域>_<含义>。
+  -->
+  <resheader name="resmimetype">
+    <value>text/microsoft-resx</value>
+  </resheader>
+  <resheader name="version">
+    <value>2.0</value>
+  </resheader>
+  <resheader name="reader">
+    <value>System.Resources.ResXResourceReader, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+  </resheader>
+  <resheader name="writer">
+    <value>System.Resources.ResXResourceWriter, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+  </resheader>
+
+  <data name="Common_Close" xml:space="preserve">
+    <value>关闭</value>
+  </data>
+  <data name="Common_Cancel" xml:space="preserve">
+    <value>取消</value>
+  </data>
+  <data name="Common_Save" xml:space="preserve">
+    <value>保存</value>
+  </data>
+  <data name="Common_NotImplemented" xml:space="preserve">
+    <value>功能建设中</value>
+  </data>
+
+  <data name="Settings_Title" xml:space="preserve">
+    <value>应用设置</value>
+  </data>
+  <data name="Settings_Intro" xml:space="preserve">
+    <value>外观与语言写入本机设置文件；音频设备与窗口相关设置的状态在下方逐项标注，不会假装已生效。</value>
+  </data>
+
+  <data name="Settings_Appearance" xml:space="preserve">
+    <value>外观</value>
+  </data>
+  <data name="Settings_Theme" xml:space="preserve">
+    <value>主题</value>
+  </data>
+  <data name="Settings_TextSize" xml:space="preserve">
+    <value>文字大小</value>
+  </data>
+  <data name="Settings_Language" xml:space="preserve">
+    <value>语言</value>
+  </data>
+  <data name="Settings_LanguageNote" xml:space="preserve">
+    <value>重启应用后生效。</value>
+  </data>
+  <data name="Settings_AppearanceNote" xml:space="preserve">
+    <value>主题与文字大小立即生效并保存到本机设置。</value>
+  </data>
+
+  <data name="Settings_Audio" xml:space="preserve">
+    <value>音频与输入</value>
+  </data>
+  <data name="Settings_InputDevice" xml:space="preserve">
+    <value>输入设备</value>
+  </data>
+  <data name="Settings_OutputDevice" xml:space="preserve">
+    <value>输出设备</value>
+  </data>
+  <data name="Settings_MicTest" xml:space="preserve">
+    <value>麦克风测试</value>
+  </data>
+  <data name="Settings_MicTestStart" xml:space="preserve">
+    <value>开始测试</value>
+  </data>
+  <data name="Settings_MicTestStop" xml:space="preserve">
+    <value>停止测试</value>
+  </data>
+  <data name="Settings_MicTestHint" xml:space="preserve">
+    <value>请对着麦克风讲话，并观察电平显示是否随您的音量而变动。</value>
+  </data>
+  <data name="Settings_MicTestUnavailable" xml:space="preserve">
+    <value></value>
+  </data>
+  <data name="Settings_SpeakerTest" xml:space="preserve">
+    <value>扬声器测试</value>
+  </data>
+  <data name="Settings_SpeakerTestUnavailable" xml:space="preserve">
+    <value>扬声器测试功能暂不可用。</value>
+  </data>
+
+  <data name="Settings_WindowStartup" xml:space="preserve">
+    <value>窗口与启动</value>
+  </data>
+  <data name="Settings_CloseToTray" xml:space="preserve">
+    <value>关闭后留在托盘</value>
+  </data>
+  <data name="Settings_LaunchAtStartup" xml:space="preserve">
+    <value>开机启动</value>
+  </data>
+  <data name="Settings_Hotkeys" xml:space="preserve">
+    <value>全局快捷键</value>
+  </data>
+  <data name="Settings_HotkeysNote" xml:space="preserve">
+    <value>快捷键功能暂不可用。</value>
+  </data>
+  <data name="Settings_HotkeyToggleMute" xml:space="preserve">
+    <value>切换麦克风静音</value>
+  </data>
+  <data name="Settings_HotkeyToggleDeafen" xml:space="preserve">
+    <value>切换扬声器静音</value>
+  </data>
+  <data name="Settings_HotkeyToggleShare" xml:space="preserve">
+    <value>开始 / 停止屏幕共享</value>
+  </data>
+  <data name="Settings_Unset" xml:space="preserve">
+    <value>未设置</value>
+  </data>
+
+  <data name="Settings_Account" xml:space="preserve">
+    <value>账号</value>
+  </data>
+  <data name="Settings_Logout" xml:space="preserve">
+    <value>退出登录</value>
+  </data>
+
+  <data name="Settings_Diagnostics" xml:space="preserve">
+    <value>诊断</value>
+  </data>
+  <data name="Settings_PathHistory" xml:space="preserve">
+    <value>语音和共享网络路径变化</value>
+  </data>
+  <data name="Settings_NoPathHistory" xml:space="preserve">
+    <value>暂无路径变化记录</value>
+  </data>
+
+  <data name="Settings_ServerAdmin" xml:space="preserve">
+    <value>服务器管理</value>
+  </data>
+  <data name="Settings_ServerAdminHint" xml:space="preserve">
+    <value>管理成员、邀请、禁言与服务器设置。所有者可以改传输模式等危险设置。</value>
+  </data>
+  <data name="Settings_OpenServerAdmin" xml:space="preserve">
+    <value>打开服务器管理</value>
+  </data>
+  <data name="Settings_About" xml:space="preserve">
+    <value>关于</value>
+  </data>
+  <data name="Settings_AboutLine" xml:space="preserve">
+    <value>PartyUp {0} · Avalonia {1} · Semi.Avalonia {2}</value>
+  </data>
+
+  <data name="Settings_Updates" xml:space="preserve">
+    <value>更新</value>
+  </data>
+  <data name="Settings_AutoCheckUpdates" xml:space="preserve">
+    <value>启动后自动检查更新</value>
+  </data>
+  <data name="Settings_CheckUpdates" xml:space="preserve">
+    <value>检查更新</value>
+  </data>
+  <data name="Update_Current" xml:space="preserve">
+    <value>当前版本 v{0}</value>
+  </data>
+  <data name="Update_Checking" xml:space="preserve">
+    <value>正在检查更新…</value>
+  </data>
+  <data name="Update_UpToDate" xml:space="preserve">
+    <value>已是最新版本。</value>
+  </data>
+  <data name="Update_Available" xml:space="preserve">
+    <value>发现新版本 v{0}，点「立即更新」下载并在完成后重启。</value>
+  </data>
+  <data name="Update_Portable" xml:space="preserve">
+    <value>便携版（非安装版）：需要手动下载新版本，无法自动更新。</value>
+  </data>
+  <data name="Update_Failed" xml:space="preserve">
+    <value>检查更新失败（网络或更新源不可用），稍后可重试。</value>
+  </data>
+  <data name="Update_Downloading" xml:space="preserve">
+    <value>正在下载更新…</value>
+  </data>
+  <data name="Update_DownloadProgress" xml:space="preserve">
+    <value>正在下载更新… {0}%</value>
+  </data>
+  <data name="Update_DownloadFailed" xml:space="preserve">
+    <value>下载更新失败，请稍后重试。</value>
+  </data>
+  <data name="Update_ServerVersion" xml:space="preserve">
+    <value>服务端版本 v{0}</value>
+  </data>
+  <data name="Update_ServerVersionUnknown" xml:space="preserve">
+    <value>服务端版本未知（未连接模板：这是本机设置，不代表已连上服务器）</value>
+  </data>
+  <data name="UpdatePrompt_Title" xml:space="preserve">
+    <value>发现新版本</value>
+  </data>
+  <data name="UpdatePrompt_Message" xml:space="preserve">
+    <value>发现新版本 v{0}（当前 v{1}）。现在就下载，并在下载完成后重启应用吗？</value>
+  </data>
+  <data name="UpdatePrompt_Now" xml:space="preserve">
+    <value>立即更新</value>
+  </data>
+  <data name="UpdatePrompt_Later" xml:space="preserve">
+    <value>稍后</value>
+  </data>
+  <data name="Theme_Light" xml:space="preserve">
+    <value>浅色</value>
+  </data>
+  <data name="Theme_Dark" xml:space="preserve">
+    <value>深色</value>
+  </data>
+  <data name="Theme_System" xml:space="preserve">
+    <value>跟随系统</value>
+  </data>
+  <data name="TextSize_Normal" xml:space="preserve">
+    <value>标准</value>
+  </data>
+  <data name="TextSize_Large" xml:space="preserve">
+    <value>大号</value>
+  </data>
+  <data name="Settings_AudioNote" xml:space="preserve">
+    <value>输入/输出设备选择、电平与播放测试尚未接入正式界面（P3）；这里不显示假的设备值。</value>
+  </data>
+  <data name="Settings_StartupNote" xml:space="preserve">
+    <value>「关闭后留在托盘」已接入；「开机启动」在 Windows 上写入当前用户的启动项，勾选框反映注册表的真实状态（不是本地缓存）。</value>
+  </data>
+  <data name="Settings_EvidenceNote" xml:space="preserve">
+    <value>截图不能证明功能通过；真实登录、频道、文字与媒体分别以服务日志 / 窗口证据验收。</value>
+  </data>
+  <data name="Settings_AudioDefault" xml:space="preserve">
+    <value>跟随系统默认</value>
+  </data>
+  <data name="Settings_AudioRefresh" xml:space="preserve">
+    <value>刷新设备</value>
+  </data>
+  <data name="Settings_AudioHotSwitchOn" xml:space="preserve">
+    <value>媒体核心支持通话中热切换：改动立即生效。</value>
+  </data>
+  <data name="Settings_AudioHotSwitchOff" xml:space="preserve">
+    <value>当前媒体核心不支持通话中热切换：改动会在下次加入语音时生效。</value>
+  </data>
+  <data name="Settings_AudioDeviceMissing" xml:space="preserve">
+    <value>上次选择的设备已不可用，已回落到系统默认。</value>
+  </data>
+  <data name="Settings_AudioUnavailable" xml:space="preserve">
+    <value>媒体核心不可用，无法读取设备列表。</value>
+  </data>
+  <data name="Settings_MicTestLevel" xml:space="preserve">
+    <value>电平</value>
+  </data>
+  <data name="Settings_MicTestWaiting" xml:space="preserve">
+    <value>正在采集，等待音频数据…</value>
+  </data>
+  <data name="Settings_MicTestNoSignal" xml:space="preserve">
+    <value>没有收到电平：检查麦克风权限、静音键或所选设备。</value>
+  </data>
+  <data name="Settings_MicTestInCall" xml:space="preserve">
+    <value>语音通话中无法启动测试；先离开语音，或直接看成员卡片上的电平。</value>
+  </data>
+  <data name="Tray_Show" xml:space="preserve">
+    <value>显示主窗口</value>
+  </data>
+  <data name="Tray_Mute" xml:space="preserve">
+    <value>麦克风静音</value>
+  </data>
+  <data name="Tray_Exit" xml:space="preserve">
+    <value>退出 PartyUp</value>
+  </data>
+  <data name="Startup_RegisterFailed" xml:space="preserve">
+    <value>写入开机启动失败：{0}</value>
+  </data>
+  <data name="Settings_CloseAction" xml:space="preserve">
+    <value>关闭窗口时</value>
+  </data>
+  <data name="CloseAction_Ask" xml:space="preserve">
+    <value>每次询问</value>
+  </data>
+  <data name="CloseAction_Tray" xml:space="preserve">
+    <value>最小化到托盘</value>
+  </data>
+  <data name="CloseAction_Exit" xml:space="preserve">
+    <value>直接退出</value>
+  </data>
+  <data name="CloseDialog_Title" xml:space="preserve">
+    <value>关闭 PartyUp</value>
+  </data>
+  <data name="CloseDialog_Message" xml:space="preserve">
+    <value>要让 PartyUp 继续在托盘里运行，还是退出？</value>
+  </data>
+  <data name="CloseDialog_Remember" xml:space="preserve">
+    <value>记住我的选择，以后不再询问</value>
+  </data>
+</root>

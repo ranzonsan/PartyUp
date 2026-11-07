@@ -1,0 +1,29 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:loc="using:PartyUp.Client.Localization"
+        x:Class="PartyUp.Client.Views.CloseToTrayDialog"
+        Title="{loc:Tr CloseDialog_Title}"
+        Width="440" SizeToContent="Height"
+        WindowStartupLocation="CenterOwner"
+        CanResize="False" ShowInTaskbar="False"
+        Background="{DynamicResource SemiColorBackground0}"
+        AutomationProperties.AutomationId="CloseToTrayDialog">
+  <!-- 关闭窗口时的询问框：默认焦点在「最小化到托盘」（IsDefault），Esc / 关闭窗口 = 取消。 -->
+  <StackPanel Margin="24" Spacing="14">
+    <TextBlock Text="{loc:Tr CloseDialog_Title}" Classes="heading" />
+    <TextBlock Text="{loc:Tr CloseDialog_Message}" TextWrapping="Wrap"
+               AutomationProperties.AutomationId="CloseDialogMessage" />
+    <CheckBox x:Name="RememberCheck" Content="{loc:Tr CloseDialog_Remember}"
+              AutomationProperties.AutomationId="CloseDialogRemember" />
+    <Grid ColumnDefinitions="*,*" ColumnSpacing="10" Margin="0,4,0,0">
+      <Button Content="{loc:Tr CloseAction_Tray}" Click="OnTrayClick"
+              Classes="Primary" Theme="{StaticResource SolidButton}"
+              IsDefault="True"
+              HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+              AutomationProperties.AutomationId="CloseDialogTray" />
+      <Button Grid.Column="1" Content="{loc:Tr Tray_Exit}" Click="OnExitClick"
+              HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+              AutomationProperties.AutomationId="CloseDialogExit" />
+    </Grid>
+  </StackPanel>
+</Window>

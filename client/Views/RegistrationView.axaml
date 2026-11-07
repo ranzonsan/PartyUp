@@ -1,0 +1,98 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:PartyUp.Client.ViewModels"
+             x:Class="PartyUp.Client.Views.RegistrationView"
+             x:DataType="vm:RegistrationViewModel">
+  <!-- 分步注册（CR-06 / REG-01..REG-04 的正式接线）：
+       目标服务器或邀请链接 → 真实只读邀请码预检 → 账户信息 → 真实注册并自动登录。
+       视觉沿用 Semi 修订预览；页面内没有本地占位文案，每一步都是真实请求。 -->
+  <ScrollViewer HorizontalScrollBarVisibility="Disabled">
+    <StackPanel Width="470" HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="15" Margin="24">
+      <Grid ColumnDefinitions="*,Auto">
+        <TextBlock Text="在服务器上注册" Classes="caption" VerticalAlignment="Center" />
+        <Button Grid.Column="1" Content="返回登录" Command="{Binding CancelCommand}"
+                AutomationProperties.AutomationId="CancelRegistration" />
+      </Grid>
+
+      <TextBlock Text="{Binding StepTitle}" Classes="heading" />
+      <TextBlock Text="服务器 → 邀请校验 → 账户信息" Classes="caption" />
+
+      <Border Padding="12" CornerRadius="6" Background="{DynamicResource SemiColorFill0}">
+        <TextBlock TextWrapping="Wrap" Classes="caption"
+                   Text="邀请码只做只读确认，不会被提前消耗；账户创建成功后直接登录。密码只用于本次注册，不保存、不写入日志。" />
+      </Border>
+
+      <!-- 步骤 0：目标服务器，或邀请链接 -->
+      <StackPanel IsVisible="{Binding TargetStep}" Spacing="13" IsEnabled="{Binding !Busy}">
+        <TextBlock Text="目标服务器，或邀请链接" FontWeight="SemiBold" />
+        <TextBox Text="{Binding Target, Mode=TwoWay}"
+                 PlaceholderText="https://example.org/partyup/ 或 https://example.org/partyup/?code=ABCDE12345"
+                 AutomationProperties.AutomationId="RegistrationTarget" />
+        <TextBlock TextWrapping="Wrap" Classes="caption"
+                   Text="只填服务器地址时，邀请码在下一步补填；粘贴带 code 的邀请链接时，会直接与服务器确认该邀请码。" />
+        <Button Content="下一步" Command="{Binding ContinueCommand}" Classes="Primary"
+                Theme="{StaticResource SolidButton}"
+                HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+                AutomationProperties.AutomationId="ContinueRegistrationTarget" />
+      </StackPanel>
+
+      <!-- 步骤 1：邀请码真实预检（非消费） -->
+      <StackPanel IsVisible="{Binding InviteStep}" Spacing="13" IsEnabled="{Binding !Busy}">
+        <TextBlock Text="{Binding ServerLabel}" TextWrapping="Wrap" Classes="caption" />
+        <TextBlock Text="邀请码" FontWeight="SemiBold" />
+        <TextBox Text="{Binding InviteCode, Mode=TwoWay}" PlaceholderText="服务器管理员给你的邀请码"
+                 AutomationProperties.AutomationId="RegistrationInviteCode" />
+        <TextBlock Text="{Binding InviteHint}" Classes="caption" TextWrapping="Wrap" />
+        <Button Content="确认邀请码" Command="{Binding VerifyInviteCommand}" Classes="Primary"
+                Theme="{StaticResource SolidButton}"
+                HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+                AutomationProperties.AutomationId="VerifyRegistrationInvite" />
+      </StackPanel>
+
+      <!-- 步骤 2：账户信息（服务端确认邀请码可用之后才展示） -->
+      <StackPanel IsVisible="{Binding AccountStep}" Spacing="8" IsEnabled="{Binding !Busy}">
+        <TextBlock Text="{Binding VerifiedNote}" Foreground="{DynamicResource SemiColorSuccess}" TextWrapping="Wrap" />
+        <TextBlock Text="{Binding ServerLabel}" Classes="caption" TextWrapping="Wrap" />
+        <TextBlock Text="新用户名（2–32 字符，登录名）" />
+        <TextBox Text="{Binding NewUsername, Mode=TwoWay}"
+                 AutomationProperties.AutomationId="RegistrationUsername" />
+        <TextBlock Text="显示名称（可留空，留空则使用用户名）" />
+        <TextBox Text="{Binding DisplayName, Mode=TwoWay}"
+                 AutomationProperties.AutomationId="RegistrationDisplayName" />
+        <TextBlock Text="密码（6–256 UTF-8 字节）" />
+        <TextBox Text="{Binding NewPassword, Mode=TwoWay}" PasswordChar="●"
+                 AutomationProperties.AutomationId="RegistrationPassword" />
+        <TextBlock Text="再次输入密码" />
+        <TextBox Text="{Binding ConfirmPassword, Mode=TwoWay}" PasswordChar="●"
+                 AutomationProperties.AutomationId="RegistrationConfirmPassword" />
+        <TextBlock Text="{Binding PasswordFeedback}" TextWrapping="Wrap" Classes="caption" />
+        <Button Content="创建账户" Command="{Binding CreateAccountCommand}" Classes="Primary"
+                Theme="{StaticResource SolidButton}" Margin="0,4,0,0"
+                HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+                AutomationProperties.AutomationId="CreateRegistrationAccount" />
+      </StackPanel>
+
+      <!-- 已完成：服务端注册接口已返回 token，宿主通常立刻切到已登录布局；
+           保留这个面板只是为了让宿主在延迟收起视图时仍有一个明确的收尾入口。 -->
+      <StackPanel IsVisible="{Binding DoneStep}" Spacing="14">
+        <TextBlock Text="账户已创建，正在进入服务器…" FontSize="17" TextWrapping="Wrap" />
+        <TextBlock Text="{Binding CompletedAccountLabel}" Classes="caption" TextWrapping="Wrap" />
+        <TextBlock Text="{Binding ServerLabel}" Classes="caption" TextWrapping="Wrap" />
+        <Button Content="进入服务器" Command="{Binding FinishCommand}" Classes="Primary"
+                Theme="{StaticResource SolidButton}"
+                HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+                AutomationProperties.AutomationId="FinishRegistration" />
+      </StackPanel>
+
+      <!-- 步骤 1/2 共用「上一步」；步骤 0 的退出入口是右上角「返回登录」。 -->
+      <Button Content="{Binding BackLabel}" Command="{Binding BackCommand}" IsVisible="{Binding ShowBack}"
+              IsEnabled="{Binding !Busy}" HorizontalAlignment="Stretch"
+              AutomationProperties.AutomationId="RegistrationBack" />
+
+      <ProgressBar IsVisible="{Binding Busy}" IsIndeterminate="True" Height="4" />
+      <TextBlock Text="{Binding BusyText}" IsVisible="{Binding Busy}" Classes="caption" />
+      <TextBlock Text="{Binding Error}" TextWrapping="Wrap" Foreground="{DynamicResource SemiColorDanger}"
+                 IsVisible="{Binding HasError}" AutomationProperties.AutomationId="RegistrationError" />
+    </StackPanel>
+  </ScrollViewer>
+</UserControl>

@@ -1,0 +1,32 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:loc="using:PartyUp.Client.Localization"
+        xmlns:vm="using:PartyUp.Client.ViewModels"
+        x:Class="PartyUp.Client.Views.UpdatePromptWindow"
+        x:DataType="vm:ShellViewModel"
+        Title="{loc:Tr UpdatePrompt_Title}"
+        Width="460" SizeToContent="Height"
+        WindowStartupLocation="CenterOwner"
+        CanResize="False" ShowInTaskbar="False"
+        Background="{DynamicResource SemiColorBackground0}"
+        AutomationProperties.AutomationId="UpdatePrompt">
+  <!--
+    发现新版本时的询问框：用户点「立即更新」才下载（用户要求：确认后才下载、下载完重启）。
+    放在独立窗口而不是主窗口横幅，是为了不碰 ShellWindow.axaml（该文件归其它任务）。
+  -->
+  <StackPanel Margin="24" Spacing="14">
+    <TextBlock Text="{loc:Tr UpdatePrompt_Title}" Classes="heading" />
+    <TextBlock Text="{Binding UpdatePromptMessage}" TextWrapping="Wrap"
+               AutomationProperties.AutomationId="UpdatePromptMessage" />
+    <TextBlock Text="{Binding UpdateStatusText}" Classes="caption" TextWrapping="Wrap"
+               AutomationProperties.AutomationId="UpdatePromptStatus" />
+    <Grid ColumnDefinitions="*,*" ColumnSpacing="10" Margin="0,4,0,0">
+      <Button Content="{loc:Tr UpdatePrompt_Later}" Click="OnLaterClick"
+              AutomationProperties.AutomationId="UpdateLater" />
+      <Button Grid.Column="1" Content="{loc:Tr UpdatePrompt_Now}" Click="OnNowClick"
+              Classes="Primary" Theme="{StaticResource SolidButton}"
+              IsEnabled="{Binding !IsUpdateBusy}"
+              AutomationProperties.AutomationId="UpdateNow" />
+    </Grid>
+  </StackPanel>
+</Window>

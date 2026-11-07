@@ -1,0 +1,212 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:PartyUp.Client.ViewModels"
+             xmlns:models="using:PartyUp.Client.Models"
+             x:Class="PartyUp.Client.Views.AdminView"
+             x:DataType="vm:AdminViewModel">
+  <!-- 「服务器管理」：owner / admin 共用一套界面，按角色裁剪（危险设置仅 owner 可改）。
+       布局刻意用**单列滚动**而不是左右分栏：1280×800 默认窗口下分栏会把右栏裁掉
+       （真机截图抓到），单列在窄窗口/高缩放下也稳定。
+       这里没有任何"假权限"判断——服务端拒绝时错误原样显示在 ErrorText。 -->
+  <ScrollViewer HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto">
+    <StackPanel Margin="20" Spacing="14" MaxWidth="900" HorizontalAlignment="Center">
+
+      <!-- 头部 -->
+      <Grid ColumnDefinitions="*,Auto" ColumnSpacing="10">
+        <StackPanel Grid.Column="0" Spacing="2">
+          <TextBlock Text="服务器管理" FontSize="20" FontWeight="SemiBold" />
+          <TextBlock Text="{Binding OverviewLine}" Classes="caption" />
+          <TextBlock Text="{Binding OverviewDetail}" Classes="caption" TextWrapping="Wrap" />
+        </StackPanel>
+        <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8" VerticalAlignment="Top">
+          <TextBlock Text="{Binding RoleCaption}" Classes="caption" VerticalAlignment="Center"
+                     AutomationProperties.AutomationId="AdminRoleCaption" />
+          <Button Content="刷新" Command="{Binding RefreshCommand}"
+                  IsEnabled="{Binding !IsBusy}" AutomationProperties.AutomationId="AdminRefresh" />
+        </StackPanel>
+      </Grid>
+
+      <!-- 成员 -->
+      <Border Padding="12" CornerRadius="10" BorderThickness="1"
+              BorderBrush="{DynamicResource SemiColorBorder}"
+              Background="{DynamicResource SemiColorBackground1}">
+        <StackPanel Spacing="8">
+          <TextBlock Text="成员" FontWeight="SemiBold" />
+          <ListBox ItemsSource="{Binding Members}" Height="200"
+                   SelectedItem="{Binding SelectedMember, Mode=TwoWay}"
+                   AutomationProperties.AutomationId="AdminMemberList">
+            <ListBox.ItemTemplate>
+              <DataTemplate x:DataType="models:AdminMemberDto">
+                <Grid ColumnDefinitions="*,Auto" ColumnSpacing="6" Margin="0,3">
+                  <StackPanel Grid.Column="0" Spacing="1">
+                    <TextBlock Text="{Binding EffectiveName}" />
+                    <TextBlock Text="{Binding Name}" Classes="caption" />
+                  </StackPanel>
+                  <StackPanel Grid.Column="1" Spacing="1" HorizontalAlignment="Right">
+                    <TextBlock Text="{Binding RoleText}" Classes="caption" HorizontalAlignment="Right" />
+                    <TextBlock Text="已封禁" Classes="caption" Foreground="{DynamicResource SemiColorDanger}"
+                               IsVisible="{Binding Banned}" HorizontalAlignment="Right" />
+                  </StackPanel>
+                </Grid>
+              </DataTemplate>
+            </ListBox.ItemTemplate>
+          </ListBox>
+
+          <TextBlock Text="{Binding SelectedMemberCaption}" FontWeight="SemiBold" />
+          <TextBox Text="{Binding BanReason, Mode=TwoWay}" Watermark="封禁原因（可选，会写入审计日志）"
+                   AutomationProperties.AutomationId="AdminBanReason" />
+          <WrapPanel Orientation="Horizontal">
+            <Button Content="踢下线" Command="{Binding KickCommand}" IsEnabled="{Binding CanKick}"
+                    Margin="0,0,6,6" AutomationProperties.AutomationId="AdminKick" />
+            <Button Content="封禁" Command="{Binding BanCommand}" IsEnabled="{Binding CanBan}"
+                    Margin="0,0,6,6" AutomationProperties.AutomationId="AdminBan" />
+            <Button Content="解封" Command="{Binding UnbanCommand}" IsEnabled="{Binding CanUnban}"
+                    Margin="0,0,6,6" AutomationProperties.AutomationId="AdminUnban" />
+            <Button Content="设为管理员" Command="{Binding PromoteCommand}" IsEnabled="{Binding CanChangeRole}"
+                    Margin="0,0,6,6" AutomationProperties.AutomationId="AdminPromote" />
+            <Button Content="降为成员" Command="{Binding DemoteCommand}" IsEnabled="{Binding CanChangeRole}"
+                    Margin="0,0,6,6" AutomationProperties.AutomationId="AdminDemote" />
+            <Button Content="重置密码" Command="{Binding ResetPasswordCommand}"
+                    IsEnabled="{Binding CanKick}" Margin="0,0,6,6"
+                    AutomationProperties.AutomationId="AdminResetPassword" />
+            <Button Content="转交所有权" Command="{Binding TransferOwnershipCommand}"
+                    IsEnabled="{Binding CanTransferOwnership}" Margin="0,0,6,6"
+                    AutomationProperties.AutomationId="AdminTransferOwnership" />
+          </WrapPanel>
+          <Border Padding="8" CornerRadius="6" Background="{DynamicResource SemiColorFill0}"
+                  IsVisible="{Binding HasTemporaryPassword}">
+            <SelectableTextBlock Text="{Binding TemporaryPassword}" FontFamily="Consolas"
+                                 AutomationProperties.AutomationId="AdminTempPassword" />
+          </Border>
+        </StackPanel>
+      </Border>
+
+      <!-- 设置 -->
+      <Border Padding="12" CornerRadius="10" BorderThickness="1"
+              BorderBrush="{DynamicResource SemiColorBorder}"
+              Background="{DynamicResource SemiColorBackground1}">
+        <StackPanel Spacing="8">
+          <TextBlock Text="服务器设置" FontWeight="SemiBold" />
+          <TextBlock Text="公告" />
+          <TextBox Text="{Binding Announcement, Mode=TwoWay}" AcceptsReturn="True" MinHeight="56"
+                   AutomationProperties.AutomationId="AdminAnnouncement" />
+          <TextBlock Text="欢迎语（新成员注册后发送）" />
+          <TextBox Text="{Binding WelcomeMessage, Mode=TwoWay}" AcceptsReturn="True" MinHeight="48"
+                   AutomationProperties.AutomationId="AdminWelcome" />
+          <Grid ColumnDefinitions="*,160" ColumnSpacing="8">
+            <StackPanel Grid.Column="0" Spacing="2">
+              <TextBlock Text="注册策略" />
+              <TextBlock Text="invite = 必须邀请码；closed = 关闭注册" Classes="caption" />
+            </StackPanel>
+            <ComboBox Grid.Column="1" ItemsSource="{x:Static vm:AdminViewModel.RegistrationChoices}"
+                      SelectedItem="{Binding Registration, Mode=TwoWay}"
+                      AutomationProperties.AutomationId="AdminRegistration" />
+          </Grid>
+          <Grid ColumnDefinitions="*,160" ColumnSpacing="8">
+            <TextBlock Grid.Column="0" Text="谁能生成邀请码" VerticalAlignment="Center" />
+            <ComboBox Grid.Column="1" ItemsSource="{x:Static vm:AdminViewModel.InviteCreatorChoices}"
+                      SelectedItem="{Binding InviteCreators, Mode=TwoWay}"
+                      AutomationProperties.AutomationId="AdminInviteCreators" />
+          </Grid>
+          <Grid ColumnDefinitions="*,160" ColumnSpacing="8">
+            <TextBlock Grid.Column="0" Text="成员上限（0 = 不限）" VerticalAlignment="Center" />
+            <NumericUpDown Grid.Column="1" Value="{Binding MemberLimit, Mode=TwoWay}" Minimum="0"
+                           Increment="1" FormatString="0"
+                           AutomationProperties.AutomationId="AdminMemberLimit" />
+          </Grid>
+          <Grid ColumnDefinitions="*,160" ColumnSpacing="8">
+            <TextBlock Grid.Column="0" Text="历史保留天数（0 = 永久）" VerticalAlignment="Center" />
+            <NumericUpDown Grid.Column="1" Value="{Binding HistoryRetentionDays, Mode=TwoWay}" Minimum="0"
+                           Increment="1" FormatString="0"
+                           AutomationProperties.AutomationId="AdminHistoryDays" />
+          </Grid>
+          <CheckBox Content="全服静音（强制所有在线成员闭麦）" IsChecked="{Binding GlobalMute, Mode=TwoWay}"
+                    AutomationProperties.AutomationId="AdminGlobalMute" />
+
+          <Separator />
+          <TextBlock Text="危险设置（仅所有者可改）" FontWeight="SemiBold" />
+          <TextBlock Text="改传输模式会影响之后新建的语音/共享；最大共享路数需重启服务端生效。"
+                     Classes="caption" TextWrapping="Wrap" />
+          <StackPanel IsEnabled="{Binding CanEditDangerous}" Spacing="8">
+            <Grid ColumnDefinitions="*,160" ColumnSpacing="8">
+              <TextBlock Grid.Column="0" Text="语音传输模式" VerticalAlignment="Center" />
+              <ComboBox Grid.Column="1" ItemsSource="{x:Static vm:AdminViewModel.ModeChoices}"
+                        SelectedItem="{Binding VoiceMode, Mode=TwoWay}"
+                        AutomationProperties.AutomationId="AdminVoiceMode" />
+            </Grid>
+            <Grid ColumnDefinitions="*,160" ColumnSpacing="8">
+              <TextBlock Grid.Column="0" Text="共享传输模式" VerticalAlignment="Center" />
+              <ComboBox Grid.Column="1" ItemsSource="{x:Static vm:AdminViewModel.ModeChoices}"
+                        SelectedItem="{Binding ScreenMode, Mode=TwoWay}"
+                        AutomationProperties.AutomationId="AdminScreenMode" />
+            </Grid>
+            <Grid ColumnDefinitions="*,160" ColumnSpacing="8">
+              <TextBlock Grid.Column="0" Text="最大并发共享路数" VerticalAlignment="Center" />
+              <NumericUpDown Grid.Column="1" Value="{Binding MaxScreenShares, Mode=TwoWay}" Minimum="1"
+                             Increment="1" FormatString="0"
+                             AutomationProperties.AutomationId="AdminMaxShares" />
+            </Grid>
+          </StackPanel>
+
+          <Button Content="保存设置" Command="{Binding SaveSettingsCommand}" Classes="Primary"
+                  Theme="{StaticResource SolidButton}" IsEnabled="{Binding !IsBusy}"
+                  HorizontalAlignment="Right" AutomationProperties.AutomationId="AdminSaveSettings" />
+        </StackPanel>
+      </Border>
+
+      <!-- 邀请 -->
+      <Border Padding="12" CornerRadius="10" BorderThickness="1"
+              BorderBrush="{DynamicResource SemiColorBorder}"
+              Background="{DynamicResource SemiColorBackground1}">
+        <StackPanel Spacing="8">
+          <Grid ColumnDefinitions="*,Auto">
+            <TextBlock Grid.Column="0" Text="邀请" FontWeight="SemiBold" VerticalAlignment="Center" />
+            <Button Grid.Column="1" Content="生成邀请码" Command="{Binding CreateInviteCommand}"
+                    IsEnabled="{Binding !IsBusy}" AutomationProperties.AutomationId="AdminCreateInvite" />
+          </Grid>
+          <Border Padding="8" CornerRadius="6" Background="{DynamicResource SemiColorFill0}"
+                  IsVisible="{Binding NewInviteCode, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
+            <SelectableTextBlock Text="{Binding NewInviteCode}" FontFamily="Consolas"
+                                 AutomationProperties.AutomationId="AdminNewInviteCode" />
+          </Border>
+          <ItemsControl ItemsSource="{Binding Invites}">
+            <ItemsControl.ItemTemplate>
+              <DataTemplate x:DataType="models:AdminInviteDto">
+                <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8" Margin="0,2">
+                  <SelectableTextBlock Grid.Column="0" Text="{Binding Code}" FontFamily="Consolas"
+                                       VerticalAlignment="Center" />
+                  <Button Grid.Column="1" Content="撤销"
+                          Command="{Binding $parent[ItemsControl].DataContext.RevokeInviteCommand}"
+                          CommandParameter="{Binding}" />
+                </Grid>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+        </StackPanel>
+      </Border>
+
+      <!-- 审计 -->
+      <Border Padding="12" CornerRadius="10" BorderThickness="1"
+              BorderBrush="{DynamicResource SemiColorBorder}"
+              Background="{DynamicResource SemiColorBackground1}">
+        <StackPanel Spacing="6">
+          <TextBlock Text="审计日志（最近 100 条）" FontWeight="SemiBold" />
+          <ItemsControl ItemsSource="{Binding AuditLines}">
+            <ItemsControl.ItemTemplate>
+              <DataTemplate x:DataType="x:String">
+                <SelectableTextBlock Text="{Binding}" Classes="caption" FontFamily="Consolas"
+                                     TextWrapping="Wrap" />
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+        </StackPanel>
+      </Border>
+
+      <TextBlock Text="{Binding ErrorText}" Foreground="{DynamicResource SemiColorDanger}"
+                 TextWrapping="Wrap" IsVisible="{Binding HasError}"
+                 AutomationProperties.AutomationId="AdminError" />
+      <TextBlock Text="{Binding StatusText}" Classes="caption"
+                 AutomationProperties.AutomationId="AdminStatus" />
+    </StackPanel>
+  </ScrollViewer>
+</UserControl>

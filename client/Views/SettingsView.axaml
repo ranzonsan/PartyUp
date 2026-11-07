@@ -1,0 +1,156 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:PartyUp.Client.ViewModels"
+             xmlns:loc="using:PartyUp.Client.Localization"
+             x:Class="PartyUp.Client.Views.SettingsView"
+             x:DataType="vm:ShellViewModel"
+             x:CompileBindings="True">
+  <Grid RowDefinitions="Auto,*">
+    <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,18">
+      <TextBlock Text="{loc:Tr Settings_Title}" Classes="heading" VerticalAlignment="Center" />
+      <Button Grid.Column="1" Content="{loc:Tr Common_Close}" Command="{Binding CloseSettingsCommand}"
+              AutomationProperties.AutomationId="CloseSettings" />
+    </Grid>
+    <ScrollViewer Grid.Row="1" HorizontalScrollBarVisibility="Disabled">
+      <StackPanel Spacing="14" Margin="0,0,8,12">
+        <TextBlock Text="{loc:Tr Settings_Intro}" Classes="caption" TextWrapping="Wrap" />
+
+        <TextBlock Text="{loc:Tr Settings_Appearance}" Classes="section" />
+        <TextBlock Text="{loc:Tr Settings_Theme}" />
+        <ComboBox HorizontalAlignment="Stretch" ItemsSource="{x:Static vm:ShellViewModel.ThemeChoices}"
+                  SelectedItem="{Binding ThemeChoice, Mode=TwoWay}"
+                  AutomationProperties.AutomationId="ThemeChoice" />
+        <TextBlock Text="{loc:Tr Settings_TextSize}" />
+        <ComboBox HorizontalAlignment="Stretch" ItemsSource="{x:Static vm:ShellViewModel.TextSizeChoices}"
+                  SelectedItem="{Binding TextSizeChoice, Mode=TwoWay}"
+                  AutomationProperties.AutomationId="TextSizeChoice" />
+        <TextBlock Text="{loc:Tr Settings_Language}" />
+        <ComboBox HorizontalAlignment="Stretch" ItemsSource="{x:Static vm:ShellViewModel.LanguageChoices}"
+                  SelectedItem="{Binding LanguageOption, Mode=TwoWay}"
+                  AutomationProperties.AutomationId="LanguageChoice">
+          <ComboBox.ItemTemplate>
+            <DataTemplate x:DataType="loc:LanguageOption">
+              <TextBlock Text="{Binding DisplayName}" />
+            </DataTemplate>
+          </ComboBox.ItemTemplate>
+        </ComboBox>
+        <TextBlock Text="{loc:Tr Settings_LanguageNote}" Classes="caption" TextWrapping="Wrap" />
+        <TextBlock Text="{loc:Tr Settings_AppearanceNote}" Classes="caption" TextWrapping="Wrap" />
+
+        <Separator />
+
+        <TextBlock Text="{loc:Tr Settings_Audio}" Classes="section" />
+        <TextBlock Text="{Binding AudioDeviceNote}" Classes="caption" TextWrapping="Wrap" />
+        <TextBlock Text="{loc:Tr Settings_InputDevice}" />
+        <ComboBox HorizontalAlignment="Stretch" ItemsSource="{Binding InputDeviceOptions}"
+                  SelectedItem="{Binding InputDeviceChoice, Mode=TwoWay}"
+                  AutomationProperties.AutomationId="InputDeviceChoice" />
+        <TextBlock Text="{loc:Tr Settings_OutputDevice}" />
+        <ComboBox HorizontalAlignment="Stretch" ItemsSource="{Binding OutputDeviceOptions}"
+                  SelectedItem="{Binding OutputDeviceChoice, Mode=TwoWay}"
+                  AutomationProperties.AutomationId="OutputDeviceChoice" />
+        <Button Content="{loc:Tr Settings_AudioRefresh}" Command="{Binding RefreshAudioDevicesCommand}"
+                HorizontalAlignment="Left" AutomationProperties.AutomationId="RefreshAudioDevices" />
+
+        <TextBlock Text="{loc:Tr Settings_MicTest}" FontWeight="SemiBold" Margin="0,6,0,0" />
+        <TextBlock Text="{loc:Tr Settings_MicTestHint}" Classes="caption" TextWrapping="Wrap" />
+        <Grid ColumnDefinitions="Auto,*" ColumnSpacing="10" RowDefinitions="Auto,Auto" RowSpacing="6">
+          <Button Content="{loc:Tr Settings_MicTestStart}" Command="{Binding ToggleMicTestCommand}"
+                  IsVisible="{Binding !MicTestActive}" VerticalAlignment="Center"
+                  AutomationProperties.AutomationId="MicTestStart" />
+          <Button Content="{loc:Tr Settings_MicTestStop}" Command="{Binding ToggleMicTestCommand}"
+                  IsVisible="{Binding MicTestActive}" VerticalAlignment="Center"
+                  AutomationProperties.AutomationId="MicTestStop" />
+          <ProgressBar Grid.Column="1" Minimum="0" Maximum="100" Value="{Binding MicLevel}"
+                       Height="10" VerticalAlignment="Center"
+                       AutomationProperties.AutomationId="MicTestLevel" />
+          <TextBlock Grid.Row="1" Grid.ColumnSpan="2" Text="{Binding MicTestStatusText}" Classes="caption"
+                     TextWrapping="Wrap" />
+        </Grid>
+
+        <TextBlock Text="{loc:Tr Settings_SpeakerTest}" FontWeight="SemiBold" Margin="0,6,0,0" />
+        <TextBlock Text="{loc:Tr Settings_SpeakerTestUnavailable}" Classes="caption" TextWrapping="Wrap" />
+
+        <Separator />
+
+        <TextBlock Text="{loc:Tr Settings_WindowStartup}" Classes="section" />
+        <TextBlock Text="{Binding SettingsStartupNote}" Classes="caption" TextWrapping="Wrap" />
+        <TextBlock Text="{loc:Tr Settings_CloseAction}" />
+        <ComboBox x:Name="CloseActionChoice" HorizontalAlignment="Stretch"
+                  AutomationProperties.AutomationId="CloseActionChoice" />
+        <CheckBox Content="{loc:Tr Settings_LaunchAtStartup}" IsChecked="{Binding LaunchAtStartup, Mode=TwoWay}"
+                  AutomationProperties.AutomationId="LaunchAtStartup" />
+        <TextBlock Text="{Binding StartupNote}" Classes="caption" TextWrapping="Wrap"
+                   IsVisible="{Binding HasStartupNote}" />
+
+        <Separator />
+
+        <!-- 自动更新：默认开启静默检查，只有发现新版本才提示（用户 2026-11-07 的四条要求）。 -->
+        <TextBlock Text="{loc:Tr Settings_Updates}" Classes="section" />
+        <TextBlock Text="{Binding CurrentClientVersionText}" Classes="caption" TextWrapping="Wrap" />
+        <CheckBox Content="{loc:Tr Settings_AutoCheckUpdates}" IsChecked="{Binding AutoCheckUpdates, Mode=TwoWay}"
+                  AutomationProperties.AutomationId="AutoCheckUpdates" />
+        <Button Content="{loc:Tr Settings_CheckUpdates}" Command="{Binding CheckForUpdatesCommand}"
+                HorizontalAlignment="Left" IsEnabled="{Binding !IsUpdateBusy}"
+                AutomationProperties.AutomationId="CheckUpdates" />
+        <TextBlock Text="{Binding UpdateStatusText}" Classes="caption" TextWrapping="Wrap"
+                   AutomationProperties.AutomationId="UpdateStatus" />
+        <TextBlock Text="{Binding ServerVersionText}" Classes="caption" TextWrapping="Wrap"
+                   AutomationProperties.AutomationId="ServerVersion" />
+
+        <TextBlock Text="{loc:Tr Settings_Hotkeys}" Classes="section" />
+        <TextBlock Text="{loc:Tr Settings_HotkeysNote}" Classes="caption" TextWrapping="Wrap" />
+        <Grid ColumnDefinitions="*,Auto" RowDefinitions="Auto,Auto,Auto" RowSpacing="6">
+          <TextBlock Text="{loc:Tr Settings_HotkeyToggleMute}" VerticalAlignment="Center" />
+          <TextBlock Grid.Column="1" Text="{loc:Tr Settings_Unset}" Classes="caption" VerticalAlignment="Center" />
+          <TextBlock Grid.Row="1" Text="{loc:Tr Settings_HotkeyToggleDeafen}" VerticalAlignment="Center" />
+          <TextBlock Grid.Row="1" Grid.Column="1" Text="{loc:Tr Settings_Unset}" Classes="caption"
+                     VerticalAlignment="Center" />
+          <TextBlock Grid.Row="2" Text="{loc:Tr Settings_HotkeyToggleShare}" VerticalAlignment="Center" />
+          <TextBlock Grid.Row="2" Grid.Column="1" Text="{loc:Tr Settings_Unset}" Classes="caption"
+                     VerticalAlignment="Center" />
+        </Grid>
+
+        <Separator />
+
+        <TextBlock Text="{loc:Tr Settings_Account}" Classes="section" />
+        <TextBlock Text="{Binding SelfDisplayName}" FontWeight="SemiBold" />
+        <TextBlock Text="{Binding SelfLoginName}" Classes="caption" />
+        <Button Content="{loc:Tr Settings_Logout}" Command="{Binding LogoutCommand}" HorizontalAlignment="Left"
+                AutomationProperties.AutomationId="SettingsLogout" />
+
+        <Separator />
+
+        <TextBlock Text="{loc:Tr Settings_Diagnostics}" Classes="section" />
+        <TextBlock Text="{Binding MediaStatusText}" Classes="caption" TextWrapping="Wrap" />
+        <TextBlock Text="{Binding StatusText}" Classes="caption" TextWrapping="Wrap" />
+        <TextBlock Text="{loc:Tr Settings_PathHistory}" Classes="caption" TextWrapping="Wrap" />
+        <ItemsControl ItemsSource="{Binding PathHistoryLines}">
+          <ItemsControl.ItemTemplate>
+            <DataTemplate x:DataType="x:String">
+              <TextBlock Text="{Binding}" FontSize="11" TextWrapping="Wrap" Margin="0,1" />
+            </DataTemplate>
+          </ItemsControl.ItemTemplate>
+        </ItemsControl>
+        <TextBlock Text="{loc:Tr Settings_NoPathHistory}" Classes="caption"
+                   IsVisible="{Binding !HasPathHistory}" />
+
+        <Separator />
+
+        <!-- 服务器级管理：只有 owner/admin 看得到入口（授权仍在服务端）。 -->
+        <StackPanel Spacing="6" IsVisible="{Binding HasServerAdminRights}">
+          <TextBlock Text="{loc:Tr Settings_ServerAdmin}" Classes="section" />
+          <TextBlock Text="{loc:Tr Settings_ServerAdminHint}" Classes="caption" TextWrapping="Wrap" />
+          <Button Content="{loc:Tr Settings_OpenServerAdmin}" Command="{Binding OpenAdminCommand}"
+                  HorizontalAlignment="Left" AutomationProperties.AutomationId="OpenServerAdmin" />
+        </StackPanel>
+
+        <Separator />
+
+        <TextBlock Text="{loc:Tr Settings_About}" Classes="section" />
+        <TextBlock Text="{Binding SettingsAboutLine}" Classes="caption" TextWrapping="Wrap" />
+        <TextBlock Text="{loc:Tr Settings_EvidenceNote}" Classes="caption" TextWrapping="Wrap" />
+      </StackPanel>
+    </ScrollViewer>
+  </Grid>
+</UserControl>

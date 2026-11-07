@@ -1,5 +1,6 @@
 param(
-    [string]$Root = '\\wsl.localhost\<distro>\<repo>',
+    # 仓库根：默认取脚本所在目录（scripts\）的父目录，换机器无需改路径。
+    [string]$Root = (Split-Path -Parent $PSScriptRoot),
     [string]$Source = 'spikes\media-link\main.cpp',
     [string]$Exe = 'spikes\media-link\out\hello_webrtc.exe'
 )

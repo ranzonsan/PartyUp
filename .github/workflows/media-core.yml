@@ -9,6 +9,8 @@ name: media-core
 
 on:
   push:
+    tags:
+      - "media-core-v*"
     paths:
       - "src/media-core/**"
       - "scripts/build-media-dll.ps1"
@@ -95,14 +97,21 @@ jobs:
           retention-days: 30
 
       - name: publish media-core release
-        if: inputs.publish == true
+        # 两种触发方式：手动 dispatch 且 publish=true（给 inputs.version），
+        # 或直接推一个 media-core-v* tag（版本号从 tag 名取，不需要 gh CLI / 网页点按钮）。
+        if: inputs.publish == true || startsWith(github.ref, 'refs/tags/media-core-v')
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MEDIA_CORE_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:MEDIA_CORE_VERSION)) { throw "publish=true 时必须填 version" }
-          $tag = "media-core-v$env:MEDIA_CORE_VERSION"
+          $ver = $env:MEDIA_CORE_VERSION
+          if ([string]::IsNullOrWhiteSpace($ver) -and $env:REF_NAME -like 'media-core-v*') {
+            $ver = $env:REF_NAME.Substring('media-core-v'.Length)
+          }
+          if ([string]::IsNullOrWhiteSpace($ver)) { throw "publish=true 时必须填 version（或改推 media-core-v* tag）" }
+          $tag = "media-core-v$ver"
           $notes = @"
           partyup_media.dll (ABI v2) built from `${{ github.sha }}`.
 
@@ -111,7 +120,7 @@ jobs:
           - 客户端打包通过 ``gh release download $tag --pattern partyup_media.dll`` 取用
           "@
           gh release create $tag `
-            --title "media-core $env:MEDIA_CORE_VERSION" `
+            --title "media-core $ver" `
             --notes $notes `
             src/media-core/out/partyup_media.dll `
             src/media-core/out/partyup_media.lib `

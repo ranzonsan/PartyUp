@@ -13,6 +13,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/alexedwards/argon2id"
 )
@@ -23,6 +24,12 @@ const (
 	MaxPasswordLen = 256
 	MinNameLen     = 2
 	MaxNameLen     = 32
+
+	// 显示名（display_name）与登录名（name）是两套约束：登录名唯一、限 ASCII
+	// 字母/数字/下划线/连字符/CJK；显示名只用于展示，允许任意可打印 Unicode
+	// （空格、标点、emoji 等），不要求唯一，也**不能**当作身份 ID。
+	MinDisplayNameLen = 1
+	MaxDisplayNameLen = 32
 )
 
 // HashPassword 返回 argon2id 的 PHC 编码串（含参数与盐）。
@@ -93,6 +100,24 @@ func ValidName(name string) bool {
 		case r == '_' || r == '-':
 		case r >= 0x4E00 && r <= 0x9FFF: // CJK 统一表意文字
 		default:
+			return false
+		}
+	}
+	return true
+}
+
+// ValidDisplayName 校验显示名：1–32 个可打印 Unicode rune。
+//
+// 「可打印」用 unicode.IsPrint 判定（字母/数字/标点/符号/组合记号 + ASCII 空格）；
+// 控制字符、换行、制表符、零宽/格式字符（如 U+202E 双向覆盖）都不接受。显示名
+// 不要求唯一，调用方应先 TrimSpace；空串表示回退到登录名，不做校验。
+func ValidDisplayName(name string) bool {
+	runes := []rune(name)
+	if len(runes) < MinDisplayNameLen || len(runes) > MaxDisplayNameLen {
+		return false
+	}
+	for _, r := range runes {
+		if !unicode.IsPrint(r) {
 			return false
 		}
 	}

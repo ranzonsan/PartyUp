@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/oklog/ulid/v2"
@@ -36,8 +37,15 @@ var (
 // 领域对象。字段与 protocol 包里的同名结构一一对应，转换在 server 层做，
 // 这样持久层不依赖协议（也不需要为了一个 JSON tag 去 import protocol）。
 type Member struct {
-	ID        string
-	Name      string
+	ID   string
+	Name string
+	// DisplayName 是展示用名称，独立于唯一的登录名 Name。旧库/旧行在迁移时
+	// 回填为 Name；读取时仍以 COALESCE 兜底，保证任何行都不会拿到空显示名。
+	DisplayName string
+	// Role 是权限的唯一真源（2026-11-07，身份/权限第一批）：owner / admin / user。
+	// 旧的 is_admin 列保留双写，仅为降级兼容；读取只认 Role。
+	Role Role
+	// Admin 是给旧客户端/旧协议字段的兼容位，恒等于 Role.IsAdmin()。
 	Admin     bool
 	CreatedAt int64
 }
@@ -58,22 +66,26 @@ type Invite struct {
 }
 
 // Channel 是频道。骨架只持久化 id/name/created_at，三区内容在内存里（语音/共享为空）。
+// 2026-11-07 增加 description/position（管理页可改）；旧库迁移时 position 按创建顺序回填。
 type Channel struct {
-	ID        string
-	Name      string
-	CreatedAt int64
+	ID          string
+	Name        string
+	Description string
+	Position    int
+	CreatedAt   int64
 }
 
 // Message 是一条文字消息。MemberName 由 History 联表带出（实时广播时由 hub 填
 // 当前连接的身份），这样历史消息里的离线成员也能显示名字。
 type Message struct {
-	ID         string
-	ChannelID  string
-	Seq        int64
-	MemberID   string
-	MemberName string
-	Body       string
-	TS         int64
+	ID                string
+	ChannelID         string
+	Seq               int64
+	MemberID          string
+	MemberName        string
+	MemberDisplayName string
+	Body              string
+	TS                int64
 }
 
 // Store 是库句柄。
@@ -82,8 +94,8 @@ type Store struct {
 	path string
 }
 
-// schema 是建表语句集合。用 IF NOT EXISTS，启动时幂等执行；骨架不做版本化迁移，
-// 下一版引入 schema_version 表与迁移函数。
+// schema 是建表语句集合。用 IF NOT EXISTS，启动时幂等执行。v1 不引入通用
+// schema_version 迁移框架：只有明确的加法式列迁移，见 migrate。
 var schema = []string{
 	`CREATE TABLE IF NOT EXISTS settings (
 		key   TEXT PRIMARY KEY,
@@ -92,14 +104,17 @@ var schema = []string{
 	`CREATE TABLE IF NOT EXISTS members (
 		id            TEXT PRIMARY KEY,
 		name          TEXT NOT NULL COLLATE NOCASE UNIQUE,
+		display_name  TEXT NOT NULL DEFAULT '',
 		password_hash TEXT NOT NULL,
 		is_admin      INTEGER NOT NULL DEFAULT 0,
+		role          TEXT NOT NULL DEFAULT 'user',
 		created_at    INTEGER NOT NULL
 	)`,
 	`CREATE TABLE IF NOT EXISTS sessions (
 		token_hash TEXT PRIMARY KEY,
 		member_id  TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
 		created_at INTEGER NOT NULL,
+		expires_at INTEGER NOT NULL,
 		revoked_at INTEGER
 	)`,
 	`CREATE INDEX IF NOT EXISTS sessions_member ON sessions(member_id)`,
@@ -111,9 +126,11 @@ var schema = []string{
 		used_at    INTEGER
 	)`,
 	`CREATE TABLE IF NOT EXISTS channels (
-		id         TEXT PRIMARY KEY,
-		name       TEXT NOT NULL COLLATE NOCASE UNIQUE,
-		created_at INTEGER NOT NULL
+		id          TEXT PRIMARY KEY,
+		name        TEXT NOT NULL COLLATE NOCASE UNIQUE,
+		description TEXT NOT NULL DEFAULT '',
+		position    INTEGER NOT NULL DEFAULT 0,
+		created_at  INTEGER NOT NULL
 	)`,
 	`CREATE TABLE IF NOT EXISTS messages (
 		id         TEXT PRIMARY KEY,
@@ -125,6 +142,27 @@ var schema = []string{
 		UNIQUE (channel_id, seq)
 	)`,
 	`CREATE INDEX IF NOT EXISTS messages_channel_seq ON messages(channel_id, seq)`,
+	// 审计日志（2026-11-07）：业务事务提交后写入，失败只 warn，不影响主操作。
+	// detail 是 JSON 摘要，禁止放密码/token；actor 是操作者快照（改名后仍可追溯）。
+	`CREATE TABLE IF NOT EXISTS audit_events (
+		id         INTEGER PRIMARY KEY AUTOINCREMENT,
+		at_ms      INTEGER NOT NULL,
+		actor_id   TEXT NOT NULL,
+		actor_name TEXT NOT NULL,
+		action     TEXT NOT NULL,
+		target     TEXT,
+		detail     TEXT,
+		ip         TEXT
+	)`,
+	`CREATE INDEX IF NOT EXISTS audit_events_at ON audit_events(at_ms DESC)`,
+	// 永久封禁（2026-11-07）：封禁 = 撤销全部 session + 关 WS + 登录/WS/me 一律
+	// 403 MEMBER_BANNED；解封即删行。owner 不可被封禁（服务层保证）。
+	`CREATE TABLE IF NOT EXISTS bans (
+		member_id TEXT PRIMARY KEY REFERENCES members(id) ON DELETE CASCADE,
+		banned_at INTEGER NOT NULL,
+		banned_by TEXT NOT NULL,
+		reason    TEXT
+	)`,
 }
 
 // Open 打开（必要时创建）数据库并应用 schema。dir 不存在时递归创建。
@@ -158,7 +196,97 @@ func Open(dir string) (*Store, error) {
 			return nil, fmt.Errorf("store: apply schema: %w", err)
 		}
 	}
+	if err := migrate(ctx, db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return &Store{db: db, path: path}, nil
+}
+
+// migrate 执行加法式、幂等的列迁移。
+//
+// 旧库（v1 之前）的 members 表没有 display_name：CREATE TABLE IF NOT EXISTS 不会
+// 改已存在的表，所以必须显式 ADD COLUMN，并把旧行回填为登录名。重复启动时列已
+// 存在、回填无匹配行，两步都无副作用。
+//
+// 2026-11-07 加入 sessions.expires_at（会话过期，见 PROTOCOL.md §1.1）：
+// 旧库的行没有过期概念，迁移时按「created_at + 默认 TTL」回填，保证升级后既不会
+// 把老 token 全部踢掉、也不会留下永不过期的记录。迁移发生在读取 CLI 之前，所以
+// 只能用 DefaultSessionTTL；运维改 --session-ttl 只影响之后签发的会话。
+func migrate(ctx context.Context, db *sql.DB) error {
+	var n int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM pragma_table_info('members') WHERE name = 'display_name'`).Scan(&n); err != nil {
+		return fmt.Errorf("store: inspect members schema: %w", err)
+	}
+	if n == 0 {
+		if _, err := db.ExecContext(ctx,
+			`ALTER TABLE members ADD COLUMN display_name TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("store: add members.display_name: %w", err)
+		}
+	}
+	if _, err := db.ExecContext(ctx,
+		`UPDATE members SET display_name = name WHERE display_name = ''`); err != nil {
+		return fmt.Errorf("store: backfill members.display_name: %w", err)
+	}
+
+	// SQLite 的 ADD COLUMN 要求 NOT NULL 列带常量默认值，所以先用 0 占位，
+	// 再回填成真实的过期时间；回填条件是 expires_at = 0，重复执行无副作用。
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'expires_at'`).Scan(&n); err != nil {
+		return fmt.Errorf("store: inspect sessions schema: %w", err)
+	}
+	if n == 0 {
+		if _, err := db.ExecContext(ctx,
+			`ALTER TABLE sessions ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("store: add sessions.expires_at: %w", err)
+		}
+	}
+	if _, err := db.ExecContext(ctx,
+		`UPDATE sessions SET expires_at = created_at + ? WHERE expires_at = 0`,
+		DefaultSessionTTL.Milliseconds()); err != nil {
+		return fmt.Errorf("store: backfill sessions.expires_at: %w", err)
+	}
+
+	// 角色迁移（2026-11-07）：先加列（默认 'user'），真实回填在 EnsureOwner 里做——
+	// 那里才知道「谁是第一个成员」以及旧库里的 is_admin 行，而且要在建唯一索引之前。
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM pragma_table_info('members') WHERE name = 'role'`).Scan(&n); err != nil {
+		return fmt.Errorf("store: inspect members.role: %w", err)
+	}
+	if n == 0 {
+		if _, err := db.ExecContext(ctx,
+			`ALTER TABLE members ADD COLUMN role TEXT NOT NULL DEFAULT 'user'`); err != nil {
+			return fmt.Errorf("store: add members.role: %w", err)
+		}
+	}
+
+	// 频道管理（2026-11-07）：说明与排序。position 用旧行的创建顺序回填，保证
+	// 升级后频道列表顺序不变（旧客户端不依赖它，新管理页按它排序）。
+	for _, col := range []struct{ name, ddl string }{
+		{"description", `ALTER TABLE channels ADD COLUMN description TEXT NOT NULL DEFAULT ''`},
+		{"position", `ALTER TABLE channels ADD COLUMN position INTEGER NOT NULL DEFAULT 0`},
+	} {
+		if err := db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM pragma_table_info('channels') WHERE name = ?`, col.name).Scan(&n); err != nil {
+			return fmt.Errorf("store: inspect channels.%s: %w", col.name, err)
+		}
+		if n == 0 {
+			if _, err := db.ExecContext(ctx, col.ddl); err != nil {
+				return fmt.Errorf("store: add channels.%s: %w", col.name, err)
+			}
+		}
+	}
+	// 只给 position 仍为 0 的行按创建顺序编号，重复执行无副作用。
+	if _, err := db.ExecContext(ctx,
+		`UPDATE channels SET position = (
+		    SELECT COUNT(*) FROM channels c2
+		     WHERE c2.created_at < channels.created_at
+		        OR (c2.created_at = channels.created_at AND c2.id < channels.id))
+		  WHERE position = 0`); err != nil {
+		return fmt.Errorf("store: backfill channels.position: %w", err)
+	}
+	return nil
 }
 
 // Close 关闭库。
@@ -234,12 +362,30 @@ func (s *Store) MemberCount(ctx context.Context) (int, error) {
 	return n, nil
 }
 
-// CreateMember 创建成员。名字重复返回 ErrConflict。
-func (s *Store) CreateMember(ctx context.Context, name, passwordHash string, admin bool) (Member, error) {
-	m := Member{ID: newID(), Name: name, Admin: admin, CreatedAt: time.Now().UnixMilli()}
+// CreateMember 创建成员（role 由 admin 布尔推导，兼容旧代码/旧测试）。
+// 新代码要指定角色请用 CreateMemberWithRole。
+func (s *Store) CreateMember(ctx context.Context, name, displayName, passwordHash string, admin bool) (Member, error) {
+	role := RoleUser
+	if admin {
+		role = RoleAdmin
+	}
+	return s.CreateMemberWithRole(ctx, name, displayName, passwordHash, role)
+}
+
+// CreateMemberWithRole 创建成员并指定角色。名字重复返回 ErrConflict。
+// is_admin 与 role 双写：旧二进制/旧查询仍能读到管理员位（读取只认 role）。
+func (s *Store) CreateMemberWithRole(ctx context.Context, name, displayName, passwordHash string, role Role) (Member, error) {
+	if !role.Valid() {
+		return Member{}, fmt.Errorf("store: invalid role %q", role)
+	}
+	displayName = strings.TrimSpace(displayName)
+	if displayName == "" {
+		displayName = name
+	}
+	m := Member{ID: newID(), Name: name, DisplayName: displayName, Role: role, Admin: role.IsAdmin(), CreatedAt: time.Now().UnixMilli()}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO members (id, name, password_hash, is_admin, created_at) VALUES (?, ?, ?, ?, ?)`,
-		m.ID, m.Name, passwordHash, boolInt(admin), m.CreatedAt)
+		`INSERT INTO members (id, name, display_name, password_hash, is_admin, role, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		m.ID, m.Name, m.DisplayName, passwordHash, boolInt(m.Admin), string(role), m.CreatedAt)
 	if isConstraint(err) {
 		return Member{}, ErrConflict
 	}
@@ -252,62 +398,265 @@ func (s *Store) CreateMember(ctx context.Context, name, passwordHash string, adm
 // MemberByName 按名字取成员及其密码哈希（登录用）。不存在返回 ErrNotFound。
 func (s *Store) MemberByName(ctx context.Context, name string) (MemberRecord, error) {
 	var r MemberRecord
-	var admin int
+	var role string
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, name, password_hash, is_admin, created_at FROM members WHERE name = ?`, name).
-		Scan(&r.ID, &r.Name, &r.PasswordHash, &admin, &r.CreatedAt)
+		`SELECT id, name, COALESCE(NULLIF(display_name, ''), name), password_hash, role, created_at
+		   FROM members WHERE name = ?`, name).
+		Scan(&r.ID, &r.Name, &r.DisplayName, &r.PasswordHash, &role, &r.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return MemberRecord{}, ErrNotFound
 	}
 	if err != nil {
 		return MemberRecord{}, fmt.Errorf("store: member by name: %w", err)
 	}
-	r.Admin = admin != 0
+	r.Role = Role(role)
+	r.Admin = r.Role.IsAdmin()
 	return r, nil
+}
+
+// ListMembers 按创建顺序列出全部成员（含离线）。只返回展示所需字段，
+// 不含密码哈希或任何会话 token。
+func (s *Store) ListMembers(ctx context.Context) ([]Member, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, name, COALESCE(NULLIF(display_name, ''), name), role, created_at
+		   FROM members ORDER BY created_at ASC, id ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("store: list members: %w", err)
+	}
+	defer rows.Close()
+
+	members := make([]Member, 0, 8)
+	for rows.Next() {
+		var m Member
+		var role string
+		if err := rows.Scan(&m.ID, &m.Name, &m.DisplayName, &role, &m.CreatedAt); err != nil {
+			return nil, fmt.Errorf("store: scan member: %w", err)
+		}
+		m.Role = Role(role)
+		m.Admin = m.Role.IsAdmin()
+		members = append(members, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate members: %w", err)
+	}
+	return members, nil
 }
 
 // ------------------------------------------------------------------
 // sessions
 // ------------------------------------------------------------------
 
+// DefaultSessionTTL 是会话的默认有效期（30 天）。
+//
+// 两个用途：
+//   - 命令行 --session-ttl 的缺省值（main 侧解析，server.New 也会兜底）；
+//   - 旧库迁移时回填 expires_at 的唯一依据——迁移发生在读取 CLI 参数之前，
+//     所以只能用这个编译期常量。
+const DefaultSessionTTL = 30 * 24 * time.Hour
+
+// SessionState 是一个 token 的会话状态快照，**只用于把鉴权失败映射成更准确的
+// 协议错误码**（WS auth.err 的 SESSION_REPLACED 与 UNAUTHENTICATED），不对外暴露。
+//
+// ExpiresAt（毫秒 epoch）也给滑动续期的回归测试用：断言「何时写、写到什么值」。
+type SessionState struct {
+	Exists    bool  // sessions 表里是否有这个 token hash
+	Revoked   bool  // 是否已被撤销（登录替换或退出登录）
+	Expired   bool  // expires_at 是否已过
+	ExpiresAt int64 // 过期时刻（毫秒 epoch）；Exists=false 时无意义
+}
+
 // CreateSession 记录一个会话 token 的哈希。明文 token 只出现在响应里。
-func (s *Store) CreateSession(ctx context.Context, memberID, tokenHash string) error {
+//
+// expiresAt 是毫秒 epoch。单独签发（不撤销别的会话）只用于测试与内部工具；
+// 所有面向用户的登录入口都必须走 ReplaceSessions（单端登录）。
+func (s *Store) CreateSession(ctx context.Context, memberID, tokenHash string, expiresAt int64) error {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO sessions (token_hash, member_id, created_at) VALUES (?, ?, ?)`,
-		tokenHash, memberID, time.Now().UnixMilli())
+		`INSERT INTO sessions (token_hash, member_id, created_at, expires_at) VALUES (?, ?, ?, ?)`,
+		tokenHash, memberID, time.Now().UnixMilli(), expiresAt)
 	if err != nil {
 		return fmt.Errorf("store: create session: %w", err)
 	}
 	return nil
 }
 
-// MemberBySession 用 token 哈希换成员；token 不存在或已撤销返回 ErrNotFound。
+// ReplaceSessions 在**同一事务**里撤销该成员所有仍有效的会话，再写入新会话，
+// 返回被撤销的条数。这是「同一账号同时只允许一端登录」的原子底座。
+//
+// 为什么必须是一个事务：如果先撤销、再插入分两步，两个并发登录会交错成
+// 「A 撤销旧会话 → B 撤销旧会话 → A 插入 → B 插入」，最终两条新会话都有效，
+// 单端登录被击穿。放进一个事务后，配合本包固定 1 条连接的连接池，两次登录严格
+// 串行：后提交者会把先提交者的 token 也撤销掉，任一时刻最多一条有效会话。
+//
+// 注意事务内**不做网络/回调**；关闭旧 WS 连接由 server 层在提交成功后做
+// （DB 提交才是「谁赢了」的裁决点，先关连接再提交会出现「关掉了赢家」）。
+func (s *Store) ReplaceSessions(ctx context.Context, memberID, newTokenHash string, expiresAt int64) (int, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("store: begin replace sessions: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // Commit 成功后 Rollback 是空操作
+
+	now := time.Now().UnixMilli()
+	res, err := tx.ExecContext(ctx,
+		`UPDATE sessions SET revoked_at = ? WHERE member_id = ? AND revoked_at IS NULL`, now, memberID)
+	if err != nil {
+		return 0, fmt.Errorf("store: revoke old sessions: %w", err)
+	}
+	revoked, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("store: revoke old sessions rows: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO sessions (token_hash, member_id, created_at, expires_at) VALUES (?, ?, ?, ?)`,
+		newTokenHash, memberID, now, expiresAt); err != nil {
+		return 0, fmt.Errorf("store: insert replaced session: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("store: commit replace sessions: %w", err)
+	}
+	return int(revoked), nil
+}
+
+// MemberBySession 用 token 哈希换成员；token 不存在、已撤销或已过期都返回 ErrNotFound。
+//
+// 过期判定在 SQL 里做（expires_at > 当前时间），不依赖调用方时钟换算；
+// 撤销与过期对「能不能用」是同一件事，只有 WS 鉴权需要区分错误码时才会再查
+// SessionState。
 func (s *Store) MemberBySession(ctx context.Context, tokenHash string) (Member, error) {
 	var m Member
-	var admin int
+	var role string
 	err := s.db.QueryRowContext(ctx,
-		`SELECT m.id, m.name, m.is_admin, m.created_at
+		`SELECT m.id, m.name, COALESCE(NULLIF(m.display_name, ''), m.name), m.role, m.created_at
 		   FROM sessions s JOIN members m ON m.id = s.member_id
-		  WHERE s.token_hash = ? AND s.revoked_at IS NULL`, tokenHash).
-		Scan(&m.ID, &m.Name, &admin, &m.CreatedAt)
+		  WHERE s.token_hash = ? AND s.revoked_at IS NULL AND s.expires_at > ?`,
+		tokenHash, time.Now().UnixMilli()).
+		Scan(&m.ID, &m.Name, &m.DisplayName, &role, &m.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Member{}, ErrNotFound
 	}
 	if err != nil {
 		return Member{}, fmt.Errorf("store: member by session: %w", err)
 	}
-	m.Admin = admin != 0
+	m.Role = Role(role)
+	m.Admin = m.Role.IsAdmin()
 	return m, nil
 }
 
-// RevokeSession 撤销一个 token（"踢下线"能力的底座）。
+// RevokeSession 撤销一个 token（退出登录 / 踢下线）。
+//
+// 幂等：token 行存在但已经是撤销状态时返回 nil（重复调用 POST /api/logout 应
+// 继续 204）；token 行完全不存在返回 ErrNotFound（上层映射 401）。区分这两者
+// 靠 RowsAffected + 一次存在性查询，而不是把「已撤销」当错误。
 func (s *Store) RevokeSession(ctx context.Context, tokenHash string) error {
-	if _, err := s.db.ExecContext(ctx,
+	res, err := s.db.ExecContext(ctx,
 		`UPDATE sessions SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL`,
-		time.Now().UnixMilli(), tokenHash); err != nil {
+		time.Now().UnixMilli(), tokenHash)
+	if err != nil {
 		return fmt.Errorf("store: revoke session: %w", err)
 	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: revoke session rows: %w", err)
+	}
+	if n > 0 {
+		return nil
+	}
+	var exists int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM sessions WHERE token_hash = ?`, tokenHash).Scan(&exists); err != nil {
+		return fmt.Errorf("store: check session exists: %w", err)
+	}
+	if exists == 0 {
+		return ErrNotFound
+	}
+	return nil // 已撤销：幂等成功
+}
+
+// TouchSession 滑动续期：把 expires_at 推到 now+ttl。
+//
+// 节流（PROTOCOL.md §1.1）：只有「剩余有效期 < ttl - granularity」时才写，
+// 即最多每 granularity 写一次。默认 TTL 30 天、粒度 5 分钟时，活跃连接每 5 分钟
+// 至多一次单行 UPDATE——相对每条消息/每次 /api/me 都写，写放大降了几个数量级；
+// 代价是 token 的实际失效时刻最多比最后一次活动晚 granularity，可接受。
+//
+// 过期/已撤销的行不会被「复活」：WHERE 里带 expires_at > now 与 revoked_at IS NULL。
+// 返回 nil 只代表「没有报错」，不保证写了行（正常节流路径就是 0 行）。
+func (s *Store) TouchSession(ctx context.Context, tokenHash string, now int64, ttl, granularity time.Duration) error {
+	if ttl <= 0 {
+		return nil
+	}
+	newExpiry := now + ttl.Milliseconds()
+	threshold := newExpiry - granularity.Milliseconds()
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE sessions SET expires_at = ?
+		  WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ? AND expires_at < ?`,
+		newExpiry, tokenHash, now, threshold); err != nil {
+		return fmt.Errorf("store: touch session: %w", err)
+	}
 	return nil
+}
+
+// SessionInfo 是一条会话的**运维视图**：只给 token 哈希前缀，不返回 token 原文，
+// 供 `partyup sessions` 子命令核对「每个成员是否只剩一条有效会话」。
+type SessionInfo struct {
+	TokenHashPrefix string
+	MemberID        string
+	MemberName      string
+	CreatedAt       int64
+	ExpiresAt       int64
+	RevokedAt       int64 // 0 表示未撤销
+	Active          bool  // 未撤销且未过期
+}
+
+// ListSessions 按创建时间倒序列出全部会话（含已撤销/已过期）。
+func (s *Store) ListSessions(ctx context.Context) ([]SessionInfo, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT substr(s.token_hash, 1, 12), s.member_id, m.name,
+		       s.created_at, s.expires_at, COALESCE(s.revoked_at, 0)
+		  FROM sessions s JOIN members m ON m.id = s.member_id
+		 ORDER BY s.created_at DESC, s.token_hash ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("store: list sessions: %w", err)
+	}
+	defer rows.Close()
+
+	now := time.Now().UnixMilli()
+	out := make([]SessionInfo, 0, 8)
+	for rows.Next() {
+		var info SessionInfo
+		if err := rows.Scan(&info.TokenHashPrefix, &info.MemberID, &info.MemberName,
+			&info.CreatedAt, &info.ExpiresAt, &info.RevokedAt); err != nil {
+			return nil, fmt.Errorf("store: scan session: %w", err)
+		}
+		info.Active = info.RevokedAt == 0 && info.ExpiresAt > now
+		out = append(out, info)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate sessions: %w", err)
+	}
+	return out, nil
+}
+
+// SessionState 查一个 token 的会话状态；不存在时返回零值（Exists=false）。
+// 只在鉴权失败路径调用一次，用来区分「被新登录替换」与「无效/过期」。
+func (s *Store) SessionState(ctx context.Context, tokenHash string) (SessionState, error) {
+	var revokedAt sql.NullInt64
+	var expiresAt int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT revoked_at, expires_at FROM sessions WHERE token_hash = ?`, tokenHash).
+		Scan(&revokedAt, &expiresAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return SessionState{}, nil
+	}
+	if err != nil {
+		return SessionState{}, fmt.Errorf("store: session state: %w", err)
+	}
+	return SessionState{
+		Exists:    true,
+		Revoked:   revokedAt.Valid,
+		Expired:   expiresAt <= time.Now().UnixMilli(),
+		ExpiresAt: expiresAt,
+	}, nil
 }
 
 // ------------------------------------------------------------------
@@ -370,8 +719,8 @@ func (s *Store) ConsumeInvite(ctx context.Context, code, memberID string) error 
 // RegisterWithInvite 在一次事务里「校验邀请码未用 → 建成员 → 标记邀请码已用」。
 //
 // 三步要么全成要么全不成：否则会出现「邀请码被烧掉但成员没建成」或反过来的半截状态。
-// 返回 ErrNotFound（邀请码不存在）、ErrInviteUsed、ErrNameTaken。
-func (s *Store) RegisterWithInvite(ctx context.Context, code, name, passwordHash string) (Member, error) {
+// displayName 为空时回退登录名。返回 ErrNotFound（邀请码不存在）、ErrInviteUsed、ErrNameTaken。
+func (s *Store) RegisterWithInvite(ctx context.Context, code, name, displayName, passwordHash string) (Member, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Member{}, fmt.Errorf("store: begin invite register: %w", err)
@@ -390,10 +739,14 @@ func (s *Store) RegisterWithInvite(ctx context.Context, code, name, passwordHash
 		return Member{}, ErrInviteUsed
 	}
 
-	m := Member{ID: newID(), Name: name, Admin: false, CreatedAt: time.Now().UnixMilli()}
+	displayName = strings.TrimSpace(displayName)
+	if displayName == "" {
+		displayName = name
+	}
+	m := Member{ID: newID(), Name: name, DisplayName: displayName, Role: RoleUser, Admin: false, CreatedAt: time.Now().UnixMilli()}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO members (id, name, password_hash, is_admin, created_at) VALUES (?, ?, ?, 0, ?)`,
-		m.ID, m.Name, passwordHash, m.CreatedAt); err != nil {
+		`INSERT INTO members (id, name, display_name, password_hash, is_admin, role, created_at) VALUES (?, ?, ?, ?, 0, ?, ?)`,
+		m.ID, m.Name, m.DisplayName, passwordHash, string(RoleUser), m.CreatedAt); err != nil {
 		if isConstraint(err) {
 			return Member{}, ErrNameTaken
 		}
@@ -443,11 +796,16 @@ func (s *Store) FirstUnusedInvite(ctx context.Context) (Invite, error) {
 // ------------------------------------------------------------------
 
 // CreateChannel 创建频道。名字重复（不区分大小写）返回 ErrConflict。
+// 新频道排在最后（position = 当前最大值 + 1）。
 func (s *Store) CreateChannel(ctx context.Context, name string) (Channel, error) {
 	ch := Channel{ID: newID(), Name: name, CreatedAt: time.Now().UnixMilli()}
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(position), -1) + 1 FROM channels`).Scan(&ch.Position); err != nil {
+		return Channel{}, fmt.Errorf("store: next channel position: %w", err)
+	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO channels (id, name, created_at) VALUES (?, ?, ?)`,
-		ch.ID, ch.Name, ch.CreatedAt)
+		`INSERT INTO channels (id, name, description, position, created_at) VALUES (?, ?, '', ?, ?)`,
+		ch.ID, ch.Name, ch.Position, ch.CreatedAt)
 	if isConstraint(err) {
 		return Channel{}, ErrConflict
 	}
@@ -457,10 +815,11 @@ func (s *Store) CreateChannel(ctx context.Context, name string) (Channel, error)
 	return ch, nil
 }
 
-// ListChannels 按创建时间列出全部频道。
+// ListChannels 按管理排序（position）列出全部频道。
 func (s *Store) ListChannels(ctx context.Context) ([]Channel, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, name, created_at FROM channels ORDER BY created_at ASC, id ASC`)
+		`SELECT id, name, description, position, created_at
+		   FROM channels ORDER BY position ASC, created_at ASC, id ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("store: list channels: %w", err)
 	}
@@ -469,7 +828,7 @@ func (s *Store) ListChannels(ctx context.Context) ([]Channel, error) {
 	channels := make([]Channel, 0, 8)
 	for rows.Next() {
 		var ch Channel
-		if err := rows.Scan(&ch.ID, &ch.Name, &ch.CreatedAt); err != nil {
+		if err := rows.Scan(&ch.ID, &ch.Name, &ch.Description, &ch.Position, &ch.CreatedAt); err != nil {
 			return nil, fmt.Errorf("store: scan channel: %w", err)
 		}
 		channels = append(channels, ch)
@@ -484,8 +843,8 @@ func (s *Store) ListChannels(ctx context.Context) ([]Channel, error) {
 func (s *Store) ChannelByID(ctx context.Context, id string) (Channel, error) {
 	var ch Channel
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, name, created_at FROM channels WHERE id = ?`, id).
-		Scan(&ch.ID, &ch.Name, &ch.CreatedAt)
+		`SELECT id, name, description, position, created_at FROM channels WHERE id = ?`, id).
+		Scan(&ch.ID, &ch.Name, &ch.Description, &ch.Position, &ch.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Channel{}, ErrNotFound
 	}
@@ -551,13 +910,15 @@ func (s *Store) History(ctx context.Context, channelID string, beforeSeq int64, 
 	)
 	if beforeSeq > 0 {
 		rows, err = s.db.QueryContext(ctx,
-			`SELECT m.id, m.channel_id, m.seq, m.member_id, COALESCE(mb.name, ''), m.body, m.ts
+			`SELECT m.id, m.channel_id, m.seq, m.member_id,
+			        COALESCE(mb.name, ''), COALESCE(NULLIF(mb.display_name, ''), mb.name, ''), m.body, m.ts
 			   FROM messages m LEFT JOIN members mb ON mb.id = m.member_id
 			  WHERE m.channel_id = ? AND m.seq < ? ORDER BY m.seq DESC LIMIT ?`,
 			channelID, beforeSeq, limit)
 	} else {
 		rows, err = s.db.QueryContext(ctx,
-			`SELECT m.id, m.channel_id, m.seq, m.member_id, COALESCE(mb.name, ''), m.body, m.ts
+			`SELECT m.id, m.channel_id, m.seq, m.member_id,
+			        COALESCE(mb.name, ''), COALESCE(NULLIF(mb.display_name, ''), mb.name, ''), m.body, m.ts
 			   FROM messages m LEFT JOIN members mb ON mb.id = m.member_id
 			  WHERE m.channel_id = ? ORDER BY m.seq DESC LIMIT ?`,
 			channelID, limit)
@@ -571,7 +932,8 @@ func (s *Store) History(ctx context.Context, channelID string, beforeSeq int64, 
 	desc := make([]Message, 0, limit)
 	for rows.Next() {
 		var m Message
-		if err := rows.Scan(&m.ID, &m.ChannelID, &m.Seq, &m.MemberID, &m.MemberName, &m.Body, &m.TS); err != nil {
+		if err := rows.Scan(&m.ID, &m.ChannelID, &m.Seq, &m.MemberID,
+			&m.MemberName, &m.MemberDisplayName, &m.Body, &m.TS); err != nil {
 			return nil, fmt.Errorf("store: scan message: %w", err)
 		}
 		desc = append(desc, m)

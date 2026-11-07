@@ -82,10 +82,10 @@ func TestInviteCodeFormat(t *testing.T) {
 
 func TestNormalizeInviteCode(t *testing.T) {
 	cases := map[string]string{
-		"k7qm-3xpd":   "K7QM3XPD",
-		" K7QM3XPD ":  "K7QM3XPD",
-		"k7qm_3xpd":   "K7QM3XPD",
-		"K7QM 3XPD":   "K7QM3XPD",
+		"k7qm-3xpd":    "K7QM3XPD",
+		" K7QM3XPD ":   "K7QM3XPD",
+		"k7qm_3xpd":    "K7QM3XPD",
+		"K7QM 3XPD":    "K7QM3XPD",
 		"alreadyupper": "ALREADYUPPER",
 	}
 	for in, want := range cases {
@@ -107,6 +107,37 @@ func TestValidName(t *testing.T) {
 	for _, name := range invalid {
 		if auth.ValidName(name) {
 			t.Errorf("ValidName(%q) = true, want false", name)
+		}
+	}
+}
+
+func TestValidDisplayName(t *testing.T) {
+	valid := []string{
+		"a",
+		"Alice",
+		"Alice 🐱",
+		"张三",
+		"with space",
+		".-_'\"()[]{}",
+		strings.Repeat("名", auth.MaxDisplayNameLen),
+	}
+	invalid := []string{
+		"",
+		strings.Repeat("名", auth.MaxDisplayNameLen+1),
+		"line\nbreak",
+		"tab\tname",
+		"nul\x00byte",
+		"zero\u200bwidth",
+	}
+
+	for _, name := range valid {
+		if !auth.ValidDisplayName(name) {
+			t.Errorf("ValidDisplayName(%q) = false, want true", name)
+		}
+	}
+	for _, name := range invalid {
+		if auth.ValidDisplayName(name) {
+			t.Errorf("ValidDisplayName(%q) = true, want false", name)
 		}
 	}
 }

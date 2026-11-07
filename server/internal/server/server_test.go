@@ -423,11 +423,22 @@ func TestBootstrapFlow(t *testing.T) {
 	}
 
 	// 已经初始化过：再过一次 bootstrap 应该失败（一次性凭据已焚毁）。
+	// 2026-11-07 起返回 409 ALREADY_BOOTSTRAPPED（此前是 403 FORBIDDEN），
+	// 让客户端能把「已经初始化」与「不允许从这条连接初始化」区分开。
 	status, body = env.doJSON(http.MethodPost, "/api/bootstrap", "", map[string]string{
 		"token": env.bootstrapToken, "username": "mallory", "password": "secret123",
 	})
-	if status != http.StatusForbidden {
-		t.Fatalf("second bootstrap: status = %d, want 403 (body=%s)", status, body)
+	if status != http.StatusConflict {
+		t.Fatalf("second bootstrap: status = %d, want 409 (body=%s)", status, body)
+	}
+	var already struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(body, &already); err != nil {
+		t.Fatalf("decode second bootstrap body: %v", err)
+	}
+	if already.Code != protocol.CodeAlreadyBootstrapped {
+		t.Fatalf("second bootstrap code = %q, want %q", already.Code, protocol.CodeAlreadyBootstrapped)
 	}
 
 	// /api/me 带 token 可用。

@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>PartyUp.InviteLink.Tests</AssemblyName>
+    <RootNamespace>PartyUp.InviteLinkTests</RootNamespace>
+    <!--
+      只编纯 service 源码 + 本目录测试：不引 Avalonia、不需要任何 NuGet 包。
+      生产 InviteLink 用 Microsoft.AspNetCore.WebUtilities.QueryHelpers；本测试项目
+      通过本机已安装的 ASP.NET Core 共享框架提供同一个程序集（生产客户端用
+      PackageReference 引入），链接编译生产源码而不是复制逻辑。
+    -->
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <Compile Include="../../client/Services/InviteLink.cs" Link="InviteLink.cs" />
+    <Compile Include="../../client/Services/PartyUpApi.cs" Link="PartyUpApi.cs" />
+    <Compile Include="../../client/Services/JsonDefaults.cs" Link="JsonDefaults.cs" />
+    <Compile Include="../../client/Models/Dtos.cs" Link="Dtos.cs" />
+    <Compile Include="*.cs" />
+    <Content Include="../fixtures/invite-link-cases.json"
+             Link="invite-link-cases.json"
+             CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

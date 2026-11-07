@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>PartyUp.StrictReceive.Tests</AssemblyName>
+    <RootNamespace>PartyUp.StrictReceive.Tests</RootNamespace>
+    <!--
+      只编状态机源码本身 + 本目录的测试：不引 Avalonia/NuGet，因此可以在没有
+      还原缓存的机器上直接 `dotnet run`。生产 ShareSession 与 fake transport 共用
+      同一份 StrictReceiveController.cs / DirectPublishController.cs（链接编译），
+      不是复制出来的逻辑。
+    -->
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="../../client/Services/StrictReceiveController.cs" Link="StrictReceiveController.cs" />
+    <Compile Include="../../client/Services/DirectPublishController.cs" Link="DirectPublishController.cs" />
+    <Compile Include="*.cs" />
+  </ItemGroup>
+
+</Project>

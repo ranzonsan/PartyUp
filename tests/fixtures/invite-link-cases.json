@@ -1,0 +1,146 @@
+{
+  "_comment": "REG-03 邀请链接跨语言 fixture：Go 生成端校验 build，C# 导入端校验 parse/build 往返。链接里的是测试码，不是真实凭据。",
+  "build": [
+    {
+      "server": "https://example.org",
+      "code": "ABCDE12345",
+      "base": "https://example.org/",
+      "link": "https://example.org/?code=ABCDE12345"
+    },
+    {
+      "server": "https://example.org/",
+      "code": "ABCDE12345",
+      "base": "https://example.org/",
+      "link": "https://example.org/?code=ABCDE12345"
+    },
+    {
+      "server": "https://example.org/partyup",
+      "code": "K7QM3XPD",
+      "base": "https://example.org/partyup/",
+      "link": "https://example.org/partyup/?code=K7QM3XPD"
+    },
+    {
+      "server": "https://example.org/partyup/",
+      "code": "K7QM3XPD",
+      "base": "https://example.org/partyup/",
+      "link": "https://example.org/partyup/?code=K7QM3XPD"
+    },
+    {
+      "server": "https://example.org/a/b/",
+      "code": "K7QM3XPD",
+      "base": "https://example.org/a/b/",
+      "link": "https://example.org/a/b/?code=K7QM3XPD"
+    },
+    {
+      "server": "http://192.0.2.10:8080/partyup",
+      "code": "K7QM3XPD",
+      "base": "http://192.0.2.10:8080/partyup/",
+      "link": "http://192.0.2.10:8080/partyup/?code=K7QM3XPD"
+    },
+    {
+      "server": "http://[::1]:8080/partyup",
+      "code": "K7QM3XPD",
+      "base": "http://[::1]:8080/partyup/",
+      "link": "http://[::1]:8080/partyup/?code=K7QM3XPD"
+    },
+    {
+      "server": "https://example.org:8443",
+      "code": "K7QM3XPD",
+      "base": "https://example.org:8443/",
+      "link": "https://example.org:8443/?code=K7QM3XPD"
+    },
+    {
+      "server": "https://example.org/base%20dir",
+      "code": "K7QM3XPD",
+      "base": "https://example.org/base%20dir/",
+      "link": "https://example.org/base%20dir/?code=K7QM3XPD"
+    },
+    {
+      "server": "HTTPS://example.org/partyup",
+      "code": "K7QM3XPD",
+      "base": "https://example.org/partyup/",
+      "link": "https://example.org/partyup/?code=K7QM3XPD"
+    }
+  ],
+  "build_reject": [
+    "",
+    " ",
+    "example.org/partyup",
+    "//example.org/partyup",
+    "/partyup",
+    "ftp://example.org/partyup",
+    "partyup://example.org/partyup",
+    "javascript:alert(1)",
+    "https://",
+    "https:///partyup",
+    "https://user:pass@example.org/partyup",
+    "https://example.org/partyup?x=1",
+    "https://example.org/partyup?",
+    "https://example.org/partyup#frag",
+    "https://example.org:0/partyup",
+    "https://example.org:70000/partyup",
+    "https://exa mple.org/partyup",
+    " https://example.org/partyup",
+    "https://example.org/partyup\n"
+  ],
+  "parse": [
+    {
+      "link": "https://example.org/?code=ABCDE12345",
+      "base": "https://example.org/",
+      "code": "ABCDE12345"
+    },
+    {
+      "link": "https://example.org/partyup/?code=K7QM3XPD",
+      "base": "https://example.org/partyup/",
+      "code": "K7QM3XPD"
+    },
+    {
+      "link": "https://example.org/partyup?code=K7QM3XPD",
+      "base": "https://example.org/partyup/",
+      "code": "K7QM3XPD"
+    },
+    {
+      "link": "http://192.0.2.10:8080/partyup/?code=K7QM3XPD",
+      "base": "http://192.0.2.10:8080/partyup/",
+      "code": "K7QM3XPD"
+    },
+    {
+      "link": "http://[::1]:8080/partyup?code=K7QM3XPD",
+      "base": "http://[::1]:8080/partyup/",
+      "code": "K7QM3XPD"
+    },
+    {
+      "link": "https://example.org/base%20dir/?code=K7QM3XPD",
+      "base": "https://example.org/base%20dir/",
+      "code": "K7QM3XPD"
+    },
+    {
+      "link": "HTTPS://Example.ORG/partyup/?code=K7QM3XPD",
+      "base": "https://example.org/partyup/",
+      "code": "K7QM3XPD"
+    },
+    {
+      "link": "https://example.org/partyup/?code=k7qm-3xpd",
+      "base": "https://example.org/partyup/",
+      "code": "K7QM3XPD"
+    }
+  ],
+  "parse_reject": [
+    "",
+    " ",
+    "example.org/partyup/?code=ABCDE12345",
+    "/partyup/?code=ABCDE12345",
+    "partyup://example.org/?code=ABCDE12345",
+    "ftp://example.org/partyup/?code=ABCDE12345",
+    "https://example.org/partyup/",
+    "https://example.org/partyup/?code=",
+    "https://example.org/partyup/?code=AAA&code=BBB",
+    "https://example.org/partyup/?code=AAA&ref=1",
+    "https://example.org/partyup/?=1&code=AAA",
+    "https://example.org/partyup/?code=AAA#frag",
+    "https://user:pass@example.org/partyup/?code=AAA",
+    "https://example.org:0/partyup/?code=AAA",
+    "https://example.org:70000/partyup/?code=AAA",
+    "https://example.org/partyup/?invite=AAA"
+  ]
+}

@@ -1,0 +1,180 @@
+name: release
+
+# 发版：push tag v*（或手动 dispatch）→ 取最新的 media-core release DLL → 打包客户端/服务端
+# → 建 **draft** release（人工审 release note 后再点发布）。
+#
+# 为什么是 draft：release note 由人/AI 审过再发；发布物（尤其未签名的 Setup/MSI）也要先人工验一遍。
+# 想改成自动发：把 `--draft` 去掉即可。
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布/重发的 tag（如 v0.1.1）；留空则用当前 ref 的 tag"
+        required: false
+        type: string
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: package + draft release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+
+      - name: install vpk (Velopack CLI)
+        run: dotnet tool install --global vpk
+
+      - name: resolve version
+        id: ver
+        shell: pwsh
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $tag = if ($env:INPUT_TAG) { $env:INPUT_TAG } else { $env:REF_NAME }
+          if ($tag -notmatch '^v(\d+\.\d+\.\d+)$') { throw "tag '$tag' 不是 v<major>.<minor>.<patch> 形式" }
+          $ver = $Matches[1]
+          $fileVer = (Get-Content VERSION -Raw).Trim()
+          if ($ver -ne $fileVer) { throw "tag=$tag 与 VERSION=$fileVer 不一致：先改 VERSION 再打 tag" }
+          "version=$ver"  >> $env:GITHUB_OUTPUT
+          "tag=$tag"      >> $env:GITHUB_OUTPUT
+
+      - name: fetch media-core dll from latest media-core release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 原生库不在这里编译：从 media-core workflow 产出的 release 里拿最后一次构建的 DLL。
+          $tag = (gh release list --limit 100 --json tagName --jq '.[].tagName' |
+                  Where-Object { $_ -like 'media-core-v*' } | Select-Object -First 1)
+          if (-not $tag) { throw "找不到任何 media-core-v* release：先跑 media-core workflow 并 publish=true" }
+          Write-Host "using media-core release: $tag"
+          New-Item -ItemType Directory -Force src/media-core/out | Out-Null
+          gh release download $tag --pattern partyup_media.dll --dir src/media-core/out --clobber
+          $dll = "src/media-core/out/partyup_media.dll"
+          if (-not (Test-Path $dll)) { throw "partyup_media.dll 下载失败" }
+          "$((Get-FileHash $dll -Algorithm SHA256).Hash.ToLower())  partyup_media.dll  (from $tag)" |
+            Tee-Object -FilePath src/media-core/out/FROM-RELEASE.txt
+
+      - name: package (client Setup/MSI/portable + server zip)
+        shell: pwsh
+        run: ./scripts/package.ps1 -Version ${{ steps.ver.outputs.version }}
+
+      - name: verify artifacts
+        shell: pwsh
+        env:
+          VER: ${{ steps.ver.outputs.version }}
+        run: |
+          $want = @(
+            "artifacts/PartyUp-$env:VER-win64-portable.zip",
+            "artifacts/PartyUp-$env:VER-win64-Setup.exe",
+            "artifacts/PartyUp-$env:VER-win64.msi",
+            "artifacts/PartyUp-Server-$env:VER-win64.zip",
+            "artifacts/SHA256SUMS.txt",
+            # Velopack 自动更新 feed：缺了这些，客户端 UpdateManager 找不到更新
+            "artifacts/velopack/RELEASES",
+            "artifacts/velopack/releases.win.json",
+            "artifacts/velopack/assets.win.json"
+          )
+          $missing = $want | Where-Object { -not (Test-Path $_) }
+          if ($missing) { throw ("缺少产物: " + ($missing -join ', ')) }
+          Get-ChildItem artifacts/velopack -Filter '*-full.nupkg' | ForEach-Object {
+            if ($_.Length -le 0) { throw "empty nupkg: $($_.Name)" }
+          }
+          Get-ChildItem artifacts | Select-Object Name,Length | Format-Table -AutoSize | Out-String | Write-Host
+
+      - name: generate release notes draft
+        id: notes
+        shell: pwsh
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          VER: ${{ steps.ver.outputs.version }}
+        run: |
+          $prev = (git tag --list 'v*' --sort=-v:refname | Where-Object { $_ -ne $env:TAG } | Select-Object -First 1)
+          $range = if ($prev) { "$prev..HEAD" } else { "HEAD" }
+          $log = git log $range --no-merges --pretty=format:'- %s (%h)' | Select-Object -First 60
+          $dir = ".docs/release-notes"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          $path = Join-Path $dir "$env:TAG.md"
+          @(
+            "# PartyUp $env:VER",
+            "",
+            "## 变更",
+            "",
+            $log,
+            "",
+            "## 发布物",
+            "",
+            "| 文件 | 说明 |",
+            "|---|---|",
+            "| PartyUp-$env:VER-win64-Setup.exe | 一键安装（按用户安装，无需管理员） |",
+            "| PartyUp-$env:VER-win64.msi | MSI（安装范围可选） |",
+            "| PartyUp-$env:VER-win64-portable.zip | 绿色版（解压即用，不自带自动更新） |",
+            "| PartyUp-Server-$env:VER-win64.zip | 服务端（partyup.exe + start.cmd + invite.cmd） |",
+            "| RELEASES / releases.win.json / *.nupkg | Velopack 自动更新 feed（不要改名） |",
+            "| SHA256SUMS.txt | 校验和 |",
+            "",
+            "## 安装",
+            "",
+            "1. 下载 Setup.exe 或 MSI 安装；或用 portable.zip 解压运行。",
+            "2. 首次启动填服务器地址；首次加入需要邀请码（服务端启动日志里的 INVITE_CODE）。",
+            "",
+            "## 已知限制",
+            "",
+            "- Windows 客户端；未签名（SmartScreen 会提示）。",
+            "- 无摄像头、无 E2EE。",
+            ""
+          ) -join "`n" | Set-Content -Path $path -Encoding utf8
+          "path=$path" >> $env:GITHUB_OUTPUT
+
+      - name: create draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          NOTES: ${{ steps.notes.outputs.path }}
+        run: |
+          $assets = @(
+            "artifacts/PartyUp-*-Setup.exe",
+            "artifacts/PartyUp-*.msi",
+            "artifacts/PartyUp-*-portable.zip",
+            "artifacts/PartyUp-Server-*.zip",
+            "artifacts/SHA256SUMS.txt",
+            "artifacts/velopack/RELEASES",
+            "artifacts/velopack/releases.win.json",
+            "artifacts/velopack/assets.win.json"
+          ) + (Get-ChildItem artifacts/velopack -Filter '*-full.nupkg' | ForEach-Object { $_.FullName })
+          gh release create $env:TAG --draft --title "PartyUp $env:TAG" --notes-file $env:NOTES --verify-tag @assets
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: |
+            artifacts/*.zip
+            artifacts/*.exe
+            artifacts/*.msi
+            artifacts/SHA256SUMS.txt
+            artifacts/velopack/RELEASES
+            artifacts/velopack/*.json
+            artifacts/velopack/*-full.nupkg
+          retention-days: 14

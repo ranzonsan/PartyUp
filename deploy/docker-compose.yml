@@ -1,0 +1,74 @@
+# PartyUp 服务端 · Docker Compose 示例
+#
+# 用法：
+#   docker compose up -d
+#   docker compose logs -f partyup      # 首次启动会打印 BOOTSTRAP_TOKEN / INVITE_CODE
+#
+# 网络：本文用 host 模式（最简单）。如果必须用 bridge，改用文件末尾的「bridge 模式」块：
+#   需要 --ice-port-range 固定 UDP 端口 + --ice-public-ip 改写候选 IP，两者缺一不可。
+#   详见 docs/DOCKER.md。
+#
+# Docker Desktop（Windows / macOS）没有真正的 host 网络，不能当服务端；
+# 请在那两个平台上直接跑二进制，或用一台 Linux 机器/虚拟机做服务端。
+
+services:
+  partyup:
+    image: ghcr.io/ranzonsan/partyup:latest
+    # 想用本地源码构建：把 image 换成 build: { context: . }
+    container_name: partyup
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./data:/data
+    environment:
+      # 首次启动用它创建所有者账号（也可不设：token 会打印在日志里，用 Web 界面 bootstrap）
+      # PARTYUP_BOOTSTRAP_TOKEN: "换成一串随机值"
+      TZ: Asia/Shanghai
+      # bridge 模式可改用环境变量代替命令行参数：
+      # PARTYUP_ICE_PORT_RANGE: "50000-50010"
+      # PARTYUP_ICE_PUBLIC_IP: "203.0.113.10"
+    command:
+      - serve
+      - --data
+      - /data
+      - --http
+      - 0.0.0.0:8080
+      - --name
+      - PartyUp
+      # 公网/多网卡部署时必须显式指定对外 IP，否则通告的是内网地址：
+      # - --stun-advertise
+      # - 203.0.113.10:3478
+      #
+      # 传输模式（默认都是 relay；direct 更省带宽但需要客户端能直连服务端）：
+      # - --voice-mode
+      # - relay
+      # - --screen-mode
+      # - relay
+
+# ─────────────────────────────────────────────────────────────────────────────
+# bridge 模式（不想用 host 网络时）
+#
+# 把上面的 service 换成下面这段（去掉 network_mode: host，加 ports 与两个 ICE 参数）：
+#
+#   services:
+#     partyup:
+#       image: ghcr.io/ranzonsan/partyup:latest
+#       container_name: partyup
+#       restart: unless-stopped
+#       ports:
+#         - "8080:8080"
+#         - "50000-50010:50000-50010/udp"   # 与 --ice-port-range 必须一致
+#         - "3478:3478/udp"
+#       volumes:
+#         - ./data:/data
+#       environment:
+#         TZ: Asia/Shanghai
+#         PARTYUP_ICE_PORT_RANGE: "50000-50010"
+#         PARTYUP_ICE_PUBLIC_IP: "203.0.113.10"   # VPS 填公网 IP；家用 NAT 填公网 IP 并在路由器转发该 UDP 段
+#         PARTYUP_STUN_ADVERTISE: "203.0.113.10:3478"
+#       command: ["serve", "--data", "/data", "--http", "0.0.0.0:8080", "--name", "PartyUp"]
+#
+# 启动后日志应出现：
+#   ICE_PORT_RANGE=50000-50010
+#   ICE_PUBLIC_IP=203.0.113.10
+# 看不到这两行 = 参数没进去，媒体必然连不上。

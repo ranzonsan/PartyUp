@@ -1,0 +1,119 @@
+name: media-core
+
+# 原生媒体库单独出包：只有 src/media-core/**（或本 workflow）改动才构建，
+# 构建一次、发一个 media-core-v* release；客户端打包时从该 release 下载 DLL，不重复编译 C++。
+#
+# 依赖：third_party/libwebrtc（130 MB 预编译包，不入库）。
+#   来源 crow-misia/libwebrtc-bin release 152.7977.0.0（见 .docs/spikes/2026-11-01-libwebrtc-link.md），
+#   CI 里按需下载并用 actions/cache 缓存压缩包，避免每次 130 MB 重下。
+
+on:
+  push:
+    paths:
+      - "src/media-core/**"
+      - "scripts/build-media-dll.ps1"
+      - ".github/workflows/media-core.yml"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "构建后发布 media-core release（tag = media-core-v<version>）"
+        type: boolean
+        default: false
+      version:
+        description: "发布用的版本号（不含前缀，如 2.19.0）；publish=true 时必填"
+        required: false
+        type: string
+
+concurrency:
+  group: media-core-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  LIBWEBRTC_VERSION: "152.7977.0.0"
+  LIBWEBRTC_DIR: third_party/libwebrtc
+
+jobs:
+  build:
+    name: build partyup_media.dll
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: cache libwebrtc archive
+        id: libwebrtc-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.LIBWEBRTC_DIR }}/libwebrtc-win-x64.7z
+          key: libwebrtc-win-x64-${{ env.LIBWEBRTC_VERSION }}
+
+      - name: download libwebrtc
+        if: steps.libwebrtc-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force "$env:LIBWEBRTC_DIR" | Out-Null
+          $url = "https://github.com/crow-misia/libwebrtc-bin/releases/download/$env:LIBWEBRTC_VERSION/libwebrtc-win-x64.7z"
+          Write-Host "downloading $url"
+          curl.exe -L --fail --retry 3 --retry-delay 5 -o "$env:LIBWEBRTC_DIR/libwebrtc-win-x64.7z" $url
+
+      - name: extract libwebrtc
+        shell: pwsh
+        run: |
+          # windows-latest 自带 7z.exe；解出来是 include/ + release/ + debug/
+          7z x -y -o"$env:LIBWEBRTC_DIR" "$env:LIBWEBRTC_DIR/libwebrtc-win-x64.7z"
+          if (-not (Test-Path "$env:LIBWEBRTC_DIR/release/webrtc.lib")) { throw "missing release/webrtc.lib after extract" }
+          if (-not (Test-Path "$env:LIBWEBRTC_DIR/include")) { throw "missing include/ after extract" }
+
+      - name: build dll + run smoke
+        shell: pwsh
+        run: ./scripts/build-media-dll.ps1 -Run
+
+      - name: collect artifacts
+        shell: pwsh
+        run: |
+          $out = "src/media-core/out"
+          Get-ChildItem $out | Select-Object Name,Length | Format-Table -AutoSize | Out-String | Write-Host
+          $dll = Join-Path $out "partyup_media.dll"
+          if (-not (Test-Path $dll)) { throw "partyup_media.dll not produced" }
+          $hash = (Get-FileHash $dll -Algorithm SHA256).Hash.ToLower()
+          "partyup_media.dll sha256=$hash bytes=$((Get-Item $dll).Length)" | Tee-Object -FilePath (Join-Path $out "SHA256SUMS.txt")
+          "media-core ABI v2 · libwebrtc $env:LIBWEBRTC_VERSION · commit $env:GITHUB_SHA" | Out-File (Join-Path $out "BUILD-INFO.txt") -Encoding utf8
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: media-core
+          path: |
+            src/media-core/out/partyup_media.dll
+            src/media-core/out/partyup_media.lib
+            src/media-core/out/exports.txt
+            src/media-core/out/SHA256SUMS.txt
+            src/media-core/out/BUILD-INFO.txt
+            src/media-core/out/run-logs/**
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: publish media-core release
+        if: inputs.publish == true
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MEDIA_CORE_VERSION: ${{ inputs.version }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:MEDIA_CORE_VERSION)) { throw "publish=true 时必须填 version" }
+          $tag = "media-core-v$env:MEDIA_CORE_VERSION"
+          $notes = @"
+          partyup_media.dll (ABI v2) built from `${{ github.sha }}`.
+
+          - libwebrtc: `${{ env.LIBWEBRTC_VERSION }}`
+          - exports: see exports.txt
+          - 客户端打包通过 ``gh release download $tag --pattern partyup_media.dll`` 取用
+          "@
+          gh release create $tag `
+            --title "media-core $env:MEDIA_CORE_VERSION" `
+            --notes $notes `
+            src/media-core/out/partyup_media.dll `
+            src/media-core/out/partyup_media.lib `
+            src/media-core/out/exports.txt `
+            src/media-core/out/SHA256SUMS.txt

@@ -1,0 +1,14 @@
+# 构建上下文只放服务端源码。
+#   server/.cache 是 Go 模块缓存（实测 2.5 GB），不排除会让每次 docker build 先传 2.5 GB；
+#   server/bin/obj 是构建产物；exe/dll/log 一律不进上下文。
+*
+!server/
+!server/**
+
+server/.cache/
+server/bin/
+server/obj/
+**/*.exe
+**/*.dll
+**/*.log
+**/*.pdb

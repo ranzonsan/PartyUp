@@ -1,0 +1,54 @@
+name: CI
+
+# 快速门禁：服务端 Go 测试 + 客户端托管构建。
+# 原生媒体库（partyup_media.dll）不在这里构建——见 media-core.yml，它按路径触发、单独出包。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  server:
+    name: server (go vet + test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./...
+
+      - name: go build
+        run: go build -trimpath -o "${RUNNER_TEMP}/partyup" ./cmd/partyup
+
+  client:
+    name: client (dotnet build)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: dotnet build (Release)
+        run: dotnet build client/PartyUp.Client.csproj -c Release --nologo

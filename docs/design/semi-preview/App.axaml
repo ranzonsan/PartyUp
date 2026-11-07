@@ -1,0 +1,78 @@
+<Application xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:semi="https://irihi.tech/semi"
+             xmlns:mi="clr-namespace:Material.Icons.Avalonia;assembly=Material.Icons.Avalonia"
+             x:Class="PartyUp.UiPrototype.App"
+             RequestedThemeVariant="Light">
+  <Application.Resources>
+    <ResourceDictionary>
+      <!-- Official Semi resource overrides only; no replacement control templates. -->
+      <ResourceDictionary.ThemeDictionaries>
+        <ResourceDictionary x:Key="Light">
+          <SolidColorBrush x:Key="SemiColorPrimary" Color="#C9441F" />
+          <SolidColorBrush x:Key="SemiColorPrimaryPointerover" Color="#B53A19" />
+          <SolidColorBrush x:Key="SemiColorPrimaryActive" Color="#9F3014" />
+          <SolidColorBrush x:Key="ButtonSolidPrimaryBackground" Color="#C9441F" />
+          <SolidColorBrush x:Key="ButtonSolidPrimaryPointeroverBackground" Color="#B53A19" />
+          <SolidColorBrush x:Key="ButtonSolidPrimaryPressedBackground" Color="#9F3014" />
+          <SolidColorBrush x:Key="ButtonSolidPrimaryForeground" Color="White" />
+        </ResourceDictionary>
+        <ResourceDictionary x:Key="Dark">
+          <SolidColorBrush x:Key="SemiColorPrimary" Color="#FF8057" />
+          <SolidColorBrush x:Key="SemiColorPrimaryPointerover" Color="#FF956F" />
+          <SolidColorBrush x:Key="SemiColorPrimaryActive" Color="#FF6A3B" />
+          <SolidColorBrush x:Key="ButtonSolidPrimaryBackground" Color="#FF8057" />
+          <SolidColorBrush x:Key="ButtonSolidPrimaryPointeroverBackground" Color="#FF956F" />
+          <SolidColorBrush x:Key="ButtonSolidPrimaryPressedBackground" Color="#FF6A3B" />
+          <SolidColorBrush x:Key="ButtonSolidPrimaryForeground" Color="#17191D" />
+        </ResourceDictionary>
+      </ResourceDictionary.ThemeDictionaries>
+    </ResourceDictionary>
+  </Application.Resources>
+  <Application.Styles>
+    <semi:SemiTheme Locale="zh-CN" />
+    <mi:MaterialIconStyles />
+    <Style Selector="Border.member">
+      <Setter Property="Background" Value="{DynamicResource SemiColorFill0}" />
+      <Setter Property="CornerRadius" Value="6" />
+    </Style>
+    <Style Selector="Border.member.speaking">
+      <Setter Property="BorderBrush" Value="{DynamicResource SemiColorSuccess}" />
+      <Setter Property="BorderThickness" Value="3,0,0,0" />
+    </Style>
+    <Style Selector="mi|MaterialIcon.active">
+      <Setter Property="Foreground" Value="{DynamicResource SemiColorSuccess}" />
+    </Style>
+    <Style Selector="mi|MaterialIcon.off">
+      <Setter Property="Foreground" Value="{DynamicResource SemiColorDanger}" />
+    </Style>
+    <Style Selector="mi|MaterialIcon.quiet">
+      <Setter Property="Opacity" Value="0.3" />
+    </Style>
+    <Style Selector=":is(Window)">
+      <Setter Property="FontFamily" Value="Microsoft YaHei UI" />
+      <Setter Property="FontSize" Value="14" />
+    </Style>
+    <Style Selector="TextBlock">
+      <Setter Property="FontFamily" Value="Microsoft YaHei UI" />
+    </Style>
+    <Style Selector="SelectableTextBlock">
+      <Setter Property="FontFamily" Value="Microsoft YaHei UI" />
+    </Style>
+    <Style Selector="TextBox">
+      <Setter Property="FontFamily" Value="Microsoft YaHei UI" />
+    </Style>
+    <Style Selector="TextBlock.caption">
+      <Setter Property="Foreground" Value="{DynamicResource SemiColorText2}" />
+      <Setter Property="FontSize" Value="12" />
+    </Style>
+    <Style Selector="TextBlock.heading">
+      <Setter Property="FontSize" Value="24" />
+      <Setter Property="FontWeight" Value="SemiBold" />
+    </Style>
+    <Style Selector="TextBlock.section">
+      <Setter Property="FontSize" Value="16" />
+      <Setter Property="FontWeight" Value="SemiBold" />
+    </Style>
+  </Application.Styles>
+</Application>

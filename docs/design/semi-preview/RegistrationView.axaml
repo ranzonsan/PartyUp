@@ -1,0 +1,77 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:local="using:PartyUp.UiPrototype"
+             xmlns:conv="using:Avalonia.Data.Converters"
+             x:Class="PartyUp.UiPrototype.RegistrationView" x:DataType="local:RegistrationFlow">
+  <ScrollViewer HorizontalScrollBarVisibility="Disabled">
+    <StackPanel Width="470" HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="15" Margin="24">
+      <Grid ColumnDefinitions="*,Auto">
+        <TextBlock Text="在服务器上注册" Classes="caption" VerticalAlignment="Center" />
+        <Button Grid.Column="1" Content="返回登录" Command="{Binding CancelCommand}" AutomationProperties.AutomationId="CancelRegistration" />
+      </Grid>
+      <TextBlock Text="{Binding StepTitle}" Classes="heading" />
+      <TextBlock Text="服务器 → 邀请校验 → 账户信息" Classes="caption" />
+      <Border Padding="12" CornerRadius="6" Background="{DynamicResource SemiColorFill0}">
+        <TextBlock Text="流程预览：未连接真实服务器。校验/创建均为本地模拟，不会消耗真实邀请码。"
+                   TextWrapping="Wrap" Classes="caption" />
+      </Border>
+
+      <StackPanel IsVisible="{Binding TargetStep}" Spacing="13" IsEnabled="{Binding !Busy}">
+        <TextBlock Text="目标服务器，或邀请链接" FontWeight="SemiBold" />
+        <TextBox Text="{Binding Target, Mode=TwoWay}" PlaceholderText="https://example.invalid"
+                 AutomationProperties.AutomationId="RegistrationTarget" />
+        <TextBlock Text="演示链接格式：https://example.invalid/?code=DEMO-2026。此格式仅为界面草案，正式邀请链接协议尚未实现。"
+                   Classes="caption" TextWrapping="Wrap" />
+        <Button Content="下一步" Command="{Binding ContinueCommand}" Classes="Primary" Theme="{StaticResource SolidButton}"
+                HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+                AutomationProperties.AutomationId="ContinueRegistrationTarget" />
+      </StackPanel>
+
+      <StackPanel IsVisible="{Binding InviteStep}" Spacing="13" IsEnabled="{Binding !Busy}">
+        <TextBlock Text="{Binding ServerLabel}" TextWrapping="Wrap" Classes="caption" />
+        <TextBlock Text="邀请码" FontWeight="SemiBold" />
+        <TextBox Text="{Binding InviteCode, Mode=TwoWay}" PlaceholderText="演示邀请码：DEMO-2026"
+                 AutomationProperties.AutomationId="RegistrationInviteCode" />
+        <TextBlock Text="链接未带邀请码时需补填；只有模拟校验通过后才会展示账户信息表单。"
+                   Classes="caption" TextWrapping="Wrap" />
+        <Button Content="校验邀请码（模拟）" Command="{Binding VerifyCommand}" Classes="Primary" Theme="{StaticResource SolidButton}"
+                HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+                AutomationProperties.AutomationId="VerifyRegistrationInvite" />
+        <Button Content="上一步" Command="{Binding BackCommand}" AutomationProperties.AutomationId="RegistrationBack" />
+      </StackPanel>
+
+      <StackPanel IsVisible="{Binding AccountStep}" Spacing="8" IsEnabled="{Binding !Busy}">
+        <TextBlock Text="邀请码模拟校验已通过 · 尚未提交真实服务器" Foreground="{DynamicResource SemiColorSuccess}" TextWrapping="Wrap" />
+        <TextBlock Text="{Binding ServerLabel}" Classes="caption" TextWrapping="Wrap" />
+        <TextBlock Text="新用户名（2–32字符）" />
+        <TextBox Text="{Binding NewUsername, Mode=TwoWay}" AutomationProperties.AutomationId="RegistrationUsername" />
+        <TextBlock Text="显示名称" />
+        <TextBox Text="{Binding DisplayName, Mode=TwoWay}" AutomationProperties.AutomationId="RegistrationDisplayName" />
+        <TextBlock Text="显示名称字段已先预留；真实服务端尚无此字段。" Classes="caption" TextWrapping="Wrap" />
+        <TextBlock Text="密码（6–256 UTF-8字节）" />
+        <TextBox Text="{Binding NewPassword, Mode=TwoWay}" PasswordChar="●" AutomationProperties.AutomationId="RegistrationPassword" />
+        <TextBlock Text="再次输入密码" />
+        <TextBox Text="{Binding ConfirmPassword, Mode=TwoWay}" PasswordChar="●" AutomationProperties.AutomationId="RegistrationConfirmPassword" />
+        <TextBlock Text="{Binding PasswordFeedback}" TextWrapping="Wrap" Classes="caption"
+                   AutomationProperties.AutomationId="PasswordAgreement" />
+        <Button Content="创建演示账户" Command="{Binding CreateCommand}" Classes="Primary" Theme="{StaticResource SolidButton}"
+                HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" AutomationProperties.AutomationId="CreateRegistrationAccount" />
+        <Button Content="重新选择服务器或邀请码" Command="{Binding BackCommand}" />
+      </StackPanel>
+
+      <StackPanel IsVisible="{Binding DoneStep}" Spacing="14">
+        <TextBlock Text="已完成演示步骤，没有创建真实服务器账户。" FontSize="17" TextWrapping="Wrap" />
+        <TextBlock Text="返回登录后将预填服务器和用户名；密码不会保留。显示名称仅用于本次内存预览。"
+                   Classes="caption" TextWrapping="Wrap" />
+        <Button Content="返回登录并预填账户" Command="{Binding ReturnToLoginCommand}" Classes="Primary"
+                Theme="{StaticResource SolidButton}" AutomationProperties.AutomationId="FinishRegistration" />
+      </StackPanel>
+
+      <ProgressBar IsVisible="{Binding Busy}" IsIndeterminate="True" Height="4" />
+      <TextBlock Text="正在处理演示请求…" IsVisible="{Binding Busy}" Classes="caption" />
+      <TextBlock Text="{Binding Error}" TextWrapping="Wrap" Foreground="{DynamicResource SemiColorDanger}"
+                 IsVisible="{Binding Error, Converter={x:Static conv:StringConverters.IsNotNullOrEmpty}}"
+                 AutomationProperties.AutomationId="RegistrationError" />
+    </StackPanel>
+  </ScrollViewer>
+</UserControl>

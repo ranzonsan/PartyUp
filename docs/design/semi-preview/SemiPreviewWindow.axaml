@@ -1,0 +1,298 @@
+<!-- Throwaway Semi revision: fixed chat, native member/voice indicators, registration storyboard. -->
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="using:PartyUp.UiPrototype"
+        xmlns:mi="clr-namespace:Material.Icons.Avalonia;assembly=Material.Icons.Avalonia"
+        xmlns:conv="using:Avalonia.Data.Converters"
+        x:Class="PartyUp.UiPrototype.SemiPreviewWindow"
+        x:DataType="local:SemiViewModel"
+        Title="PartyUp · Semi 修订预览（演示数据）"
+        Width="1280" Height="800" MinWidth="900" MinHeight="600"
+        FontFamily="Microsoft YaHei UI" WindowStartupLocation="CenterScreen">
+  <Window.Resources>
+    <DataTemplate x:Key="ChannelMember" x:DataType="local:PreviewMember">
+      <Border Classes="member" Classes.speaking="{Binding IsSpeaking}" Padding="8" Margin="0,0,0,5">
+        <Grid RowDefinitions="Auto,Auto" ColumnDefinitions="*,Auto">
+          <TextBlock Text="{Binding Name}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"
+                     ToolTip.Tip="{Binding Name}" Margin="0,0,6,0" VerticalAlignment="Center" />
+          <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="5" VerticalAlignment="Center">
+            <mi:MaterialIcon Kind="AccountVoice" Width="16" Height="16" ToolTip.Tip="已加入频道语音（模拟）" />
+            <mi:MaterialIcon Kind="{Binding MicrophoneIcon}" Width="16" Height="16"
+                             Classes.off="{Binding !MicrophoneEnabled}" ToolTip.Tip="{Binding MicrophoneLabel}" />
+            <mi:MaterialIcon Kind="RecordCircle" Width="16" Height="16" Classes.active="{Binding IsSpeaking}"
+                             Classes.quiet="{Binding !IsSpeaking}" ToolTip.Tip="{Binding SpeakingLabel}" />
+            <mi:MaterialIcon Kind="{Binding SpeakerIcon}" Width="16" Height="16"
+                             Classes.off="{Binding !SpeakersEnabled}" ToolTip.Tip="{Binding SpeakerLabel}" />
+            <mi:MaterialIcon Kind="MonitorShare" Width="16" Height="16" Classes.active="{Binding IsSharing}"
+                             Classes.quiet="{Binding !IsSharing}" ToolTip.Tip="{Binding ShareLabel}" />
+          </StackPanel>
+          <Button Grid.Row="1" Grid.ColumnSpan="2" Content="观看共享" Classes="Primary Small"
+                  Command="{Binding WatchCommand}" CommandParameter="{Binding ShareSource}"
+                  IsVisible="{Binding ShowWatchButton}" IsEnabled="{Binding CanWatch}"
+                  Margin="0,5,0,0" HorizontalAlignment="Left"
+                  AutomationProperties.AutomationId="{Binding ShareSource}"
+                  ToolTip.Tip="手动观看这位成员的共享；需先加入同一频道语音" />
+        </Grid>
+      </Border>
+    </DataTemplate>
+    <DataTemplate x:Key="OnlineMember" x:DataType="local:PreviewMember">
+      <Grid ColumnDefinitions="24,*" Margin="0,0,0,7">
+        <mi:MaterialIcon Kind="AccountCircle" Width="18" Height="18" VerticalAlignment="Center" />
+        <StackPanel Grid.Column="1" Spacing="1">
+          <TextBlock Text="{Binding Name}" />
+          <TextBlock Text="{Binding PresenceLabel}" Classes="caption" />
+        </StackPanel>
+      </Grid>
+    </DataTemplate>
+  </Window.Resources>
+  <Grid RowDefinitions="Auto,*,Auto,Auto">
+    <Border Padding="18,8" BorderThickness="0,0,0,1" BorderBrush="{DynamicResource SemiColorBorder}">
+      <Grid ColumnDefinitions="*,Auto">
+        <StackPanel Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">
+          <TextBlock Text="PartyUp" FontSize="20" FontWeight="Bold" Foreground="#FF5A2B" />
+          <TextBlock Text="SEMI 修订预览 · 所有成员/音视频/注册校验均为模拟" Classes="caption" VerticalAlignment="Center" />
+        </StackPanel>
+        <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8">
+          <Button Content="登录页" Command="{Binding Session.LogoutCommand}" AutomationProperties.AutomationId="ShowLogin" />
+          <Button Content="切换深浅" Command="{Binding ToggleThemeCommand}" AutomationProperties.AutomationId="ThemeSwitch" />
+        </StackPanel>
+      </Grid>
+    </Border>
+
+    <Grid Grid.Row="1">
+      <SplitView IsVisible="{Binding Session.IsLoggedIn}" IsPaneOpen="{Binding Session.ShowSettings, Mode=TwoWay}"
+                 PanePlacement="Right" DisplayMode="Overlay" OpenPaneLength="420" CompactPaneLength="0">
+        <SplitView.Pane>
+          <Border Background="{DynamicResource SemiColorBackground0}" Padding="22" BorderThickness="1,0,0,0"
+                  BorderBrush="{DynamicResource SemiColorBorder}">
+            <local:PreviewSettings />
+          </Border>
+        </SplitView.Pane>
+        <Grid x:Name="AppGrid" ColumnDefinitions="300,4,*">
+          <Border x:Name="ChannelPane" Background="{DynamicResource SemiColorFill0}" Padding="16,16,12,12">
+            <Grid RowDefinitions="Auto,*,Auto">
+              <StackPanel Spacing="7" Margin="0,0,0,14">
+                <TextBlock Text="今晚一起玩" FontWeight="SemiBold" FontSize="18" />
+                <TextBlock Text="{Binding Session.ServerAddress}" Classes="caption" TextTrimming="CharacterEllipsis" />
+                <Button Command="{Binding ChooseChannelCommand}" HorizontalAlignment="Stretch"
+                        HorizontalContentAlignment="Left" AutomationProperties.AutomationId="ChooseChannel">
+                  <StackPanel Orientation="Horizontal" Spacing="8">
+                    <mi:MaterialIcon Kind="MenuSwap" Width="18" Height="18" />
+                    <TextBlock Text="切换频道" />
+                  </StackPanel>
+                </Button>
+              </StackPanel>
+              <Grid Grid.Row="1">
+                <Grid IsVisible="{Binding ChannelPickerOpen}" RowDefinitions="Auto,*,Auto">
+                  <StackPanel Spacing="5" Margin="0,0,0,10">
+                    <TextBlock Text="服务器频道" Classes="section" />
+                    <TextBlock Text="单击浏览 · 双击加入频道语音" Classes="caption" />
+                  </StackPanel>
+                  <ListBox x:Name="ChannelList" Grid.Row="1" ItemsSource="{Binding Session.Channels}"
+                           SelectedItem="{Binding Session.BrowseChannel, Mode=TwoWay}" DoubleTapped="JoinDoubleTapped"
+                           AutomationProperties.AutomationId="Channels">
+                    <ListBox.KeyBindings>
+                      <KeyBinding Gesture="Enter" Command="{Binding JoinChannelCommand}" CommandParameter="{Binding Session.BrowseChannel}" />
+                    </ListBox.KeyBindings>
+                  </ListBox>
+                  <Button Grid.Row="2" Content="返回成员列表" Command="{Binding ShowMembersCommand}" Margin="0,8,0,8"
+                          AutomationProperties.AutomationId="ShowMembers" />
+                </Grid>
+                <ScrollViewer IsVisible="{Binding !ChannelPickerOpen}" HorizontalScrollBarVisibility="Disabled">
+                  <StackPanel Spacing="13">
+                    <StackPanel Spacing="6">
+                      <TextBlock Text="{Binding CurrentGroupTitle}" Classes="section" Foreground="{DynamicResource SemiColorPrimary}" />
+                      <TextBlock Text="{Binding Session.BrowseChannel}" Classes="caption" />
+                      <TextBlock Text="语音 · 麦克风 · 发声 · 扬声器 · 共享" Classes="caption" FontSize="10" />
+                      <ItemsControl ItemsSource="{Binding CurrentMembers}" ItemTemplate="{StaticResource ChannelMember}" />
+                    </StackPanel>
+                    <Separator Margin="0" />
+                    <StackPanel Spacing="8">
+                      <TextBlock Text="{Binding OnlineGroupTitle}" Classes="section" Foreground="{DynamicResource SemiColorSuccess}" />
+                      <ItemsControl ItemsSource="{Binding OtherOnlineMembers}" ItemTemplate="{StaticResource OnlineMember}" />
+                    </StackPanel>
+                    <Separator Margin="0" />
+                    <StackPanel Spacing="8" Opacity="0.6">
+                      <TextBlock Text="{Binding OfflineGroupTitle}" Classes="section" />
+                      <ItemsControl ItemsSource="{Binding OfflineMembers}">
+                        <ItemsControl.ItemTemplate>
+                          <DataTemplate x:DataType="local:PreviewMember">
+                            <StackPanel Orientation="Horizontal" Spacing="7" Margin="0,0,0,6">
+                              <mi:MaterialIcon Kind="AccountCircle" Width="16" Height="16" />
+                              <TextBlock Text="{Binding Name}" />
+                            </StackPanel>
+                          </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                      </ItemsControl>
+                    </StackPanel>
+                  </StackPanel>
+                </ScrollViewer>
+              </Grid>
+              <Button Grid.Row="2" HorizontalAlignment="Stretch" Margin="0,10,0,0"
+                      HorizontalContentAlignment="Stretch" AutomationProperties.AutomationId="UserCard">
+                <Button.Flyout>
+                  <MenuFlyout>
+                    <MenuItem Header="应用设置" Command="{Binding OpenSettingsCommand}" AutomationProperties.AutomationId="OpenSettings" />
+                    <MenuItem Header="退出登录" Command="{Binding Session.LogoutCommand}" />
+                  </MenuFlyout>
+                </Button.Flyout>
+                <Grid ColumnDefinitions="30,*,18" Margin="0,4">
+                  <mi:MaterialIcon Kind="AccountCircle" Width="24" Height="24" VerticalAlignment="Center" />
+                  <StackPanel Grid.Column="1" Spacing="2">
+                    <TextBlock Text="{Binding DisplayName}" FontWeight="SemiBold" />
+                    <TextBlock Text="{Binding Session.Username}" Classes="caption" />
+                  </StackPanel>
+                  <mi:MaterialIcon Grid.Column="2" Kind="ChevronDown" Width="16" Height="16" VerticalAlignment="Center" />
+                </Grid>
+              </Button>
+            </Grid>
+          </Border>
+          <GridSplitter x:Name="ChannelDivider" Grid.Column="1" ResizeDirection="Columns" />
+          <Grid x:Name="ContentGrid" Grid.Column="2" RowDefinitions="Auto,Auto,*,Auto" Margin="22,18">
+            <StackPanel Spacing="4" Margin="0,0,0,14">
+              <TextBlock Text="{Binding Session.BrowseChannel}" Classes="heading" />
+              <TextBlock Text="{Binding Session.BrowseSummary}" Classes="caption" TextWrapping="Wrap" />
+            </StackPanel>
+            <Border x:Name="WatchStage" Grid.Row="1" IsVisible="{Binding ShowWatchStage}" Height="240"
+                    Padding="14" CornerRadius="8" Background="{DynamicResource SemiColorFill0}" Margin="0,0,0,12">
+              <Grid RowDefinitions="Auto,*,Auto">
+                <Grid ColumnDefinitions="*,Auto">
+                  <TextBlock Text="{Binding Session.SelectedShare}" FontWeight="SemiBold" VerticalAlignment="Center" />
+                  <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="6">
+                    <Button Content="聊天显示/收起" Command="{Binding Session.ToggleChatCommand}" Classes="Small" />
+                    <Button Content="全屏" Command="{Binding Session.ToggleFullscreenCommand}" Classes="Small"
+                            IsEnabled="{Binding Session.IsWatching}" AutomationProperties.AutomationId="Fullscreen" />
+                    <Button Content="停止观看" Command="{Binding Session.StopWatchCommand}" Classes="Small"
+                            AutomationProperties.AutomationId="StopWatch" />
+                  </StackPanel>
+                </Grid>
+                <StackPanel Grid.Row="1" VerticalAlignment="Center" HorizontalAlignment="Center" Spacing="8">
+                  <mi:MaterialIcon Kind="MonitorShare" Width="36" Height="36" HorizontalAlignment="Center" />
+                  <TextBlock Text="{Binding Session.WatchSummary}" TextWrapping="Wrap" HorizontalAlignment="Center" />
+                  <TextBlock Text="合成画面 · 非真实采集或接收媒体" Classes="caption" HorizontalAlignment="Center" />
+                </StackPanel>
+                <ProgressBar Grid.Row="2" IsIndeterminate="True" Height="3" IsVisible="{Binding Session.IsWaitingForFrame}" />
+              </Grid>
+            </Border>
+            <ScrollViewer x:Name="ChatHistory" Grid.Row="2" HorizontalScrollBarVisibility="Disabled"
+                          IsVisible="{Binding ShowChat}" Margin="0,0,0,12">
+              <ItemsControl ItemsSource="{Binding Session.Messages}">
+                <ItemsControl.ItemTemplate>
+                  <DataTemplate x:DataType="local:DemoMessage">
+                    <Border Padding="0,12" BorderThickness="0,0,0,1" BorderBrush="{DynamicResource SemiColorFill0}">
+                      <StackPanel Spacing="6">
+                        <StackPanel Orientation="Horizontal" Spacing="12">
+                          <TextBlock Text="{Binding Author}" FontWeight="SemiBold" />
+                          <TextBlock Text="{Binding Time}" Classes="caption" VerticalAlignment="Center" />
+                        </StackPanel>
+                        <SelectableTextBlock Text="{Binding Body}" TextWrapping="Wrap" LineHeight="23" />
+                      </StackPanel>
+                    </Border>
+                  </DataTemplate>
+                </ItemsControl.ItemTemplate>
+              </ItemsControl>
+            </ScrollViewer>
+            <StackPanel x:Name="Composer" Grid.Row="3" Spacing="7" IsVisible="{Binding ShowChat}">
+              <Button Content="有新消息 · 跳到最新" IsVisible="{Binding Session.HasNewMessages}"
+                      Command="{Binding Session.JumpToLatestCommand}" Click="JumpLatest" />
+              <Button Content="发送失败 · 重试保留的原文" IsVisible="{Binding Session.HasFailedMessage}"
+                      Command="{Binding Session.RetryCommand}" IsEnabled="{Binding Session.CanRetry}" Classes="Danger" />
+              <Grid ColumnDefinitions="*,84">
+                <TextBox Text="{Binding Session.InputText, Mode=TwoWay}" AcceptsReturn="True" TextWrapping="Wrap"
+                         MinHeight="52" MaxHeight="120" PlaceholderText="发送消息到当前浏览频道…"
+                         VerticalAlignment="Stretch" AutomationProperties.AutomationId="MessageInput" />
+                <Button Grid.Column="1" Content="发送" Margin="10,0,0,0" VerticalAlignment="Stretch"
+                        VerticalContentAlignment="Center" HorizontalContentAlignment="Center"
+                        Command="{Binding Session.SendCommand}" IsEnabled="{Binding Session.CanSend}"
+                        Classes="Primary" Theme="{StaticResource SolidButton}" AutomationProperties.AutomationId="SendMessage" />
+              </Grid>
+            </StackPanel>
+          </Grid>
+        </Grid>
+      </SplitView>
+
+      <ScrollViewer IsVisible="{Binding ShowLogin}" HorizontalScrollBarVisibility="Disabled">
+        <StackPanel Width="420" HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="14" Margin="28">
+          <TextBlock Text="登录你的服务器" Classes="heading" />
+          <TextBlock Text="本地界面演示，不会发出真实登录请求。" Classes="caption" TextWrapping="Wrap" />
+          <TextBlock Text="服务器地址" />
+          <TextBox Text="{Binding Session.ServerAddress, Mode=TwoWay}" AutomationProperties.AutomationId="ServerAddress" />
+          <TextBlock Text="用户名" />
+          <TextBox Text="{Binding Session.Username, Mode=TwoWay}" AutomationProperties.AutomationId="LoginUser" />
+          <TextBlock Text="密码" />
+          <TextBox Text="{Binding Session.Password, Mode=TwoWay}" PasswordChar="●" AutomationProperties.AutomationId="LoginPassword" />
+          <TextBlock Text="{Binding Session.LoginError}" Foreground="{DynamicResource SemiColorDanger}" TextWrapping="Wrap"
+                     IsVisible="{Binding Session.LoginError, Converter={x:Static conv:StringConverters.IsNotNullOrEmpty}}" />
+          <Button Content="进入演示" Command="{Binding Session.LoginCommand}" Classes="Primary"
+                  Theme="{StaticResource SolidButton}" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+                  AutomationProperties.AutomationId="Login" />
+          <Separator />
+          <Button Content="在服务器上注册新账户" Command="{Binding Registration.BeginCommand}"
+                  HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" AutomationProperties.AutomationId="BeginRegistration" />
+        </StackPanel>
+      </ScrollViewer>
+      <Border IsVisible="{Binding ShowRegistration}">
+        <local:RegistrationView DataContext="{Binding Registration}" />
+      </Border>
+    </Grid>
+
+    <Border Grid.Row="2" IsVisible="{Binding Session.IsLoggedIn}" Padding="18,10"
+            Background="{DynamicResource SemiColorFill0}" BorderThickness="0,1,0,0" BorderBrush="{DynamicResource SemiColorBorder}">
+      <StackPanel Spacing="7">
+        <Grid ColumnDefinitions="*,Auto">
+          <StackPanel Spacing="3" Margin="0,0,12,0" VerticalAlignment="Center">
+            <TextBlock Text="{Binding Session.CallSummary}" FontWeight="SemiBold" TextWrapping="Wrap" />
+            <TextBlock Text="语音/发声/共享状态均为模拟" Classes="caption" />
+          </StackPanel>
+          <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="7" VerticalAlignment="Center">
+            <ToggleButton IsChecked="{Binding Session.IsMuted, Mode=OneWay}" Command="{Binding Session.MuteCommand}"
+                          IsEnabled="{Binding Session.IsCallActive}" AutomationProperties.AutomationId="Mute" ToolTip.Tip="切换麦克风开关">
+              <mi:MaterialIcon Kind="Microphone" Width="20" Height="20" />
+            </ToggleButton>
+            <ToggleButton IsChecked="{Binding Session.IsDeafened, Mode=OneWay}" Command="{Binding Session.DeafenCommand}"
+                          IsEnabled="{Binding Session.IsCallActive}" ToolTip.Tip="切换扬声器开关">
+              <mi:MaterialIcon Kind="VolumeHigh" Width="20" Height="20" />
+            </ToggleButton>
+            <ComboBox Width="174" ItemsSource="{Binding Session.Sources}" SelectedItem="{Binding Session.SelectedSource, Mode=TwoWay}"
+                      IsEnabled="{Binding !Session.IsPublishing}" AutomationProperties.AutomationId="ShareSource" />
+            <Button Command="{Binding Session.PublishCommand}" IsEnabled="{Binding Session.CanPublish}" AutomationProperties.AutomationId="Publish">
+              <Grid>
+                <TextBlock Text="共享屏幕" IsVisible="{Binding !Session.IsPublishing}" />
+                <TextBlock Text="停止共享" IsVisible="{Binding Session.IsPublishing}" />
+              </Grid>
+            </Button>
+            <Button Content="离开" Command="{Binding Session.LeaveCommand}" Classes="Danger" AutomationProperties.AutomationId="Leave" />
+          </StackPanel>
+        </Grid>
+        <StackPanel Orientation="Horizontal" Spacing="8" IsVisible="{Binding Session.IsTransferPending}">
+          <TextBlock Text="{Binding Session.PendingChannel, StringFormat='转移语音至 {0}？现有共享将停止。'}" VerticalAlignment="Center" />
+          <Button Content="确认转移" Command="{Binding Session.ConfirmTransferCommand}" Classes="Primary" Theme="{StaticResource SolidButton}" />
+          <Button Content="取消" Command="{Binding Session.CancelTransferCommand}" />
+        </StackPanel>
+        <Button Content="转移失败 · 返回原频道（仅浏览）" IsVisible="{Binding Session.HasTransferFailure}"
+                Command="{Binding Session.ReturnPreviousCommand}" Classes="Danger" />
+        <TextBlock Text="{Binding Session.PublishError}" IsVisible="{Binding Session.HasPublishFailure}"
+                   TextWrapping="Wrap" Foreground="{DynamicResource SemiColorDanger}" />
+      </StackPanel>
+    </Border>
+    <Expander Grid.Row="3" Header="演示工具与状态" Margin="18,0,18,7" AutomationProperties.AutomationId="DemoTools">
+      <StackPanel Spacing="8" Margin="0,8">
+        <TextBlock Text="{Binding Session.StatusText}" Classes="caption" TextWrapping="Wrap" />
+        <WrapPanel>
+          <CheckBox Content="下次发送失败" IsChecked="{Binding Session.FailNextSend, Mode=TwoWay}" Margin="0,0,14,0" />
+          <CheckBox Content="下次转移失败" IsChecked="{Binding Session.FailNextTransfer, Mode=TwoWay}" Margin="0,0,14,0" />
+          <CheckBox Content="下次发布失败" IsChecked="{Binding Session.FailNextPublish, Mode=TwoWay}" />
+        </WrapPanel>
+        <WrapPanel>
+          <Button Content="模拟断线" Command="{Binding Session.DisconnectCommand}" Margin="0,0,7,5" />
+          <Button Content="模拟重连" Command="{Binding Session.ReconnectCommand}" Margin="0,0,7,5" />
+          <Button Content="模拟自己发声" Command="{Binding SimulateSpeechCommand}" Margin="0,0,7,5" />
+          <Button Content="注入消息" Command="{Binding Session.InjectMessageCommand}" Margin="0,0,7,5" />
+          <Button Content="模拟阿岚停止共享" Command="{Binding EndAranShareCommand}" Margin="0,0,7,5" />
+        </WrapPanel>
+        <TextBox Text="{Binding SafeInspector, Mode=OneWay}" IsReadOnly="True" AcceptsReturn="True"
+                 Height="100" FontFamily="Consolas" FontSize="11" AutomationProperties.AutomationId="Inspector" />
+      </StackPanel>
+    </Expander>
+  </Grid>
+</Window>

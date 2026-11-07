@@ -1,0 +1,383 @@
+<Styles xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+  <!--
+    Throwaway v1.1 interaction prototype theme.
+    Explicit light/dark resource colors, brand orange/cream/off-black.
+    This file is included by App.axaml through <StyleInclude>.
+  -->
+  <Styles.Resources>
+    <ResourceDictionary>
+      <ResourceDictionary.ThemeDictionaries>
+        <ResourceDictionary x:Key="Default">
+          <SolidColorBrush x:Key="AppBackgroundBrush" Color="#0B0C0E" />
+          <SolidColorBrush x:Key="NavBackgroundBrush" Color="#0B0C0E" />
+          <SolidColorBrush x:Key="StageBackgroundBrush" Color="#111216" />
+          <SolidColorBrush x:Key="SurfaceBrush" Color="#181A1F" />
+          <SolidColorBrush x:Key="SurfaceAltBrush" Color="#22252B" />
+          <SolidColorBrush x:Key="MediaBackgroundBrush" Color="#07080A" />
+          <SolidColorBrush x:Key="CallBarBackgroundBrush" Color="#14161A" />
+          <SolidColorBrush x:Key="BorderBrush" Color="#2C3037" />
+          <SolidColorBrush x:Key="TextPrimaryBrush" Color="#F4F1EA" />
+          <SolidColorBrush x:Key="TextSecondaryBrush" Color="#AEB2BA" />
+          <SolidColorBrush x:Key="TextMutedBrush" Color="#838892" />
+          <SolidColorBrush x:Key="BrandBrush" Color="#FF5A2B" />
+          <SolidColorBrush x:Key="BrandTextBrush" Color="#FF8A63" />
+          <SolidColorBrush x:Key="OnBrandBrush" Color="#0B0C0E" />
+          <SolidColorBrush x:Key="DangerBrush" Color="#FF7A70" />
+          <SolidColorBrush x:Key="DangerSoftBrush" Color="#3A1D1C" />
+          <SolidColorBrush x:Key="SuccessBrush" Color="#6EE7A8" />
+          <SolidColorBrush x:Key="WarningBrush" Color="#F2C14E" />
+          <SolidColorBrush x:Key="WarningSoftBrush" Color="#3A2E14" />
+          <SolidColorBrush x:Key="SelectionBrush" Color="#2A2E36" />
+          <SolidColorBrush x:Key="ChipBrush" Color="#262A31" />
+        </ResourceDictionary>
+
+        <ResourceDictionary x:Key="Dark">
+          <SolidColorBrush x:Key="AppBackgroundBrush" Color="#0B0C0E" />
+          <SolidColorBrush x:Key="NavBackgroundBrush" Color="#0B0C0E" />
+          <SolidColorBrush x:Key="StageBackgroundBrush" Color="#111216" />
+          <SolidColorBrush x:Key="SurfaceBrush" Color="#181A1F" />
+          <SolidColorBrush x:Key="SurfaceAltBrush" Color="#22252B" />
+          <SolidColorBrush x:Key="MediaBackgroundBrush" Color="#07080A" />
+          <SolidColorBrush x:Key="CallBarBackgroundBrush" Color="#14161A" />
+          <SolidColorBrush x:Key="BorderBrush" Color="#2C3037" />
+          <SolidColorBrush x:Key="TextPrimaryBrush" Color="#F4F1EA" />
+          <SolidColorBrush x:Key="TextSecondaryBrush" Color="#AEB2BA" />
+          <SolidColorBrush x:Key="TextMutedBrush" Color="#838892" />
+          <SolidColorBrush x:Key="BrandBrush" Color="#FF5A2B" />
+          <SolidColorBrush x:Key="BrandTextBrush" Color="#FF8A63" />
+          <SolidColorBrush x:Key="OnBrandBrush" Color="#0B0C0E" />
+          <SolidColorBrush x:Key="DangerBrush" Color="#FF7A70" />
+          <SolidColorBrush x:Key="DangerSoftBrush" Color="#3A1D1C" />
+          <SolidColorBrush x:Key="SuccessBrush" Color="#6EE7A8" />
+          <SolidColorBrush x:Key="WarningBrush" Color="#F2C14E" />
+          <SolidColorBrush x:Key="WarningSoftBrush" Color="#3A2E14" />
+          <SolidColorBrush x:Key="SelectionBrush" Color="#2A2E36" />
+          <SolidColorBrush x:Key="ChipBrush" Color="#262A31" />
+        </ResourceDictionary>
+
+        <ResourceDictionary x:Key="Light">
+          <SolidColorBrush x:Key="AppBackgroundBrush" Color="#F5F2EC" />
+          <SolidColorBrush x:Key="NavBackgroundBrush" Color="#F5F2EC" />
+          <SolidColorBrush x:Key="StageBackgroundBrush" Color="#FBF9F4" />
+          <SolidColorBrush x:Key="SurfaceBrush" Color="#FFFFFF" />
+          <SolidColorBrush x:Key="SurfaceAltBrush" Color="#EDE8DE" />
+          <SolidColorBrush x:Key="MediaBackgroundBrush" Color="#0B0C0E" />
+          <SolidColorBrush x:Key="CallBarBackgroundBrush" Color="#EDE8DF" />
+          <SolidColorBrush x:Key="BorderBrush" Color="#D8D1C4" />
+          <SolidColorBrush x:Key="TextPrimaryBrush" Color="#141517" />
+          <SolidColorBrush x:Key="TextSecondaryBrush" Color="#565A61" />
+          <SolidColorBrush x:Key="TextMutedBrush" Color="#6E7278" />
+          <SolidColorBrush x:Key="BrandBrush" Color="#FF5A2B" />
+          <SolidColorBrush x:Key="BrandTextBrush" Color="#A8340C" />
+          <SolidColorBrush x:Key="OnBrandBrush" Color="#0B0C0E" />
+          <SolidColorBrush x:Key="DangerBrush" Color="#A4221A" />
+          <SolidColorBrush x:Key="DangerSoftBrush" Color="#F7E3E0" />
+          <SolidColorBrush x:Key="SuccessBrush" Color="#146B3A" />
+          <SolidColorBrush x:Key="WarningBrush" Color="#7A5200" />
+          <SolidColorBrush x:Key="WarningSoftBrush" Color="#F7EDD2" />
+          <SolidColorBrush x:Key="SelectionBrush" Color="#E4DED2" />
+          <SolidColorBrush x:Key="ChipBrush" Color="#ECE7DD" />
+        </ResourceDictionary>
+      </ResourceDictionary.ThemeDictionaries>
+
+      <!-- Brand accent for Fluent controls (selection, focus, check marks). -->
+      <Color x:Key="SystemAccentColor">#FF5A2B</Color>
+      <Color x:Key="SystemAccentColorDark1">#E04A1E</Color>
+      <Color x:Key="SystemAccentColorDark2">#C23E16</Color>
+      <Color x:Key="SystemAccentColorLight1">#FF7248</Color>
+      <Color x:Key="SystemAccentColorLight2">#FF8A63</Color>
+    </ResourceDictionary>
+  </Styles.Resources>
+
+  <!-- Window -->
+
+  <Style Selector="Window">
+    <Setter Property="Background" Value="{DynamicResource AppBackgroundBrush}" />
+    <Setter Property="FontFamily" Value="Segoe UI" />
+    <Setter Property="FontSize" Value="14" />
+  </Style>
+
+  <!-- Text -->
+
+  <Style Selector="TextBlock">
+    <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+    <Setter Property="FontSize" Value="14" />
+  </Style>
+
+  <Style Selector="TextBlock.brand">
+    <Setter Property="FontSize" Value="20" />
+    <Setter Property="FontWeight" Value="Bold" />
+    <Setter Property="Foreground" Value="{DynamicResource BrandTextBrush}" />
+  </Style>
+
+  <Style Selector="TextBlock.title">
+    <Setter Property="FontSize" Value="18" />
+    <Setter Property="FontWeight" Value="SemiBold" />
+  </Style>
+
+  <Style Selector="TextBlock.subtitle">
+    <Setter Property="FontSize" Value="15" />
+    <Setter Property="FontWeight" Value="SemiBold" />
+  </Style>
+
+  <Style Selector="TextBlock.strong">
+    <Setter Property="FontWeight" Value="SemiBold" />
+  </Style>
+
+  <Style Selector="TextBlock.hint">
+    <Setter Property="FontSize" Value="12" />
+    <Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}" />
+  </Style>
+
+  <Style Selector="TextBlock.caption">
+    <Setter Property="FontSize" Value="11" />
+    <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
+  </Style>
+
+  <Style Selector="TextBlock.mono">
+    <Setter Property="FontFamily" Value="Consolas" />
+    <Setter Property="FontSize" Value="12" />
+    <Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}" />
+  </Style>
+
+  <Style Selector="TextBlock.danger">
+    <Setter Property="Foreground" Value="{DynamicResource DangerBrush}" />
+  </Style>
+
+  <Style Selector="TextBlock.warning">
+    <Setter Property="Foreground" Value="{DynamicResource WarningBrush}" />
+  </Style>
+
+  <Style Selector="TextBlock.brand-text">
+    <Setter Property="Foreground" Value="{DynamicResource BrandTextBrush}" />
+  </Style>
+
+  <Style Selector="TextBlock.on-brand">
+    <Setter Property="Foreground" Value="{DynamicResource OnBrandBrush}" />
+  </Style>
+
+  <!-- Surfaces -->
+
+  <Style Selector="Border.card">
+    <Setter Property="Background" Value="{DynamicResource SurfaceBrush}" />
+    <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}" />
+    <Setter Property="BorderThickness" Value="1" />
+    <Setter Property="CornerRadius" Value="6" />
+    <Setter Property="Padding" Value="14" />
+  </Style>
+
+  <Style Selector="Border.panel">
+    <Setter Property="Background" Value="{DynamicResource SurfaceBrush}" />
+    <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}" />
+    <Setter Property="BorderThickness" Value="1" />
+    <Setter Property="CornerRadius" Value="8" />
+    <Setter Property="Padding" Value="16" />
+  </Style>
+
+  <Style Selector="Border.nav-rail">
+    <Setter Property="Background" Value="{DynamicResource NavBackgroundBrush}" />
+    <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}" />
+    <Setter Property="BorderThickness" Value="0,0,1,0" />
+  </Style>
+
+  <Style Selector="Border.topnav">
+    <Setter Property="Background" Value="{DynamicResource NavBackgroundBrush}" />
+    <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}" />
+    <Setter Property="BorderThickness" Value="0,0,0,1" />
+  </Style>
+
+  <Style Selector="Border.callbar">
+    <Setter Property="Background" Value="{DynamicResource CallBarBackgroundBrush}" />
+    <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}" />
+    <Setter Property="BorderThickness" Value="0,1,0,0" />
+    <Setter Property="Padding" Value="12,10" />
+  </Style>
+
+  <Style Selector="Border.info-side">
+    <Setter Property="Background" Value="{DynamicResource AppBackgroundBrush}" />
+    <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}" />
+    <Setter Property="BorderThickness" Value="1,0,0,0" />
+    <Setter Property="Padding" Value="12" />
+  </Style>
+
+  <Style Selector="Border.media-stage">
+    <Setter Property="Background" Value="{DynamicResource MediaBackgroundBrush}" />
+    <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}" />
+    <Setter Property="BorderThickness" Value="1" />
+    <Setter Property="CornerRadius" Value="8" />
+    <Setter Property="ClipToBounds" Value="True" />
+  </Style>
+
+  <Style Selector="Border.chip">
+    <Setter Property="Background" Value="{DynamicResource ChipBrush}" />
+    <Setter Property="CornerRadius" Value="10" />
+    <Setter Property="Padding" Value="8,3" />
+  </Style>
+
+  <Style Selector="Border.notice">
+    <Setter Property="Background" Value="{DynamicResource SurfaceAltBrush}" />
+    <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}" />
+    <Setter Property="BorderThickness" Value="1" />
+    <Setter Property="CornerRadius" Value="6" />
+    <Setter Property="Padding" Value="10,8" />
+  </Style>
+
+  <Style Selector="Border.warning-notice">
+    <Setter Property="Background" Value="{DynamicResource WarningSoftBrush}" />
+    <Setter Property="BorderBrush" Value="{DynamicResource WarningBrush}" />
+    <Setter Property="BorderThickness" Value="1" />
+    <Setter Property="CornerRadius" Value="6" />
+    <Setter Property="Padding" Value="10,8" />
+  </Style>
+
+  <Style Selector="Border.danger-notice">
+    <Setter Property="Background" Value="{DynamicResource DangerSoftBrush}" />
+    <Setter Property="BorderBrush" Value="{DynamicResource DangerBrush}" />
+    <Setter Property="BorderThickness" Value="1" />
+    <Setter Property="CornerRadius" Value="6" />
+    <Setter Property="Padding" Value="10,8" />
+  </Style>
+
+  <Style Selector="Border.demo-bar">
+    <Setter Property="Background" Value="{DynamicResource SurfaceAltBrush}" />
+    <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}" />
+    <Setter Property="BorderThickness" Value="0,0,0,1" />
+    <Setter Property="Padding" Value="12,8" />
+  </Style>
+
+  <Style Selector="Border.brand-chip">
+    <Setter Property="Background" Value="{DynamicResource BrandBrush}" />
+    <Setter Property="CornerRadius" Value="4" />
+    <Setter Property="Padding" Value="7,3" />
+  </Style>
+
+  <Style Selector="Border.inspector">
+    <Setter Property="Background" Value="{DynamicResource SurfaceBrush}" />
+    <Setter Property="BorderBrush" Value="{DynamicResource BrandBrush}" />
+    <Setter Property="BorderThickness" Value="4,0,0,0" />
+  </Style>
+
+  <Style Selector="Border.avatar">
+    <Setter Property="Background" Value="{DynamicResource BrandBrush}" />
+    <Setter Property="CornerRadius" Value="14" />
+    <Setter Property="Width" Value="28" />
+    <Setter Property="Height" Value="28" />
+  </Style>
+
+  <!-- Controls -->
+
+  <Style Selector="Button">
+    <Setter Property="CornerRadius" Value="6" />
+    <Setter Property="Padding" Value="12,6" />
+  </Style>
+
+  <Style Selector="Button.primary">
+    <Setter Property="Background" Value="{DynamicResource BrandBrush}" />
+    <Setter Property="Foreground" Value="{DynamicResource OnBrandBrush}" />
+    <Setter Property="FontWeight" Value="SemiBold" />
+  </Style>
+
+  <Style Selector="Button.primary TextBlock">
+    <Setter Property="Foreground" Value="{DynamicResource OnBrandBrush}" />
+  </Style>
+
+  <Style Selector="Button.subtle">
+    <Setter Property="Background" Value="Transparent" />
+    <Setter Property="BorderBrush" Value="Transparent" />
+  </Style>
+
+  <Style Selector="Button.danger">
+    <Setter Property="Background" Value="Transparent" />
+    <Setter Property="BorderBrush" Value="{DynamicResource DangerBrush}" />
+    <Setter Property="Foreground" Value="{DynamicResource DangerBrush}" />
+  </Style>
+
+  <Style Selector="Button.danger TextBlock">
+    <Setter Property="Foreground" Value="{DynamicResource DangerBrush}" />
+  </Style>
+
+  <Style Selector="Button.tool">
+    <Setter Property="Padding" Value="8,3" />
+    <Setter Property="FontSize" Value="12" />
+  </Style>
+
+  <Style Selector="Button.nav">
+    <Setter Property="HorizontalAlignment" Value="Stretch" />
+    <Setter Property="HorizontalContentAlignment" Value="Left" />
+    <Setter Property="Background" Value="Transparent" />
+    <Setter Property="BorderBrush" Value="Transparent" />
+    <Setter Property="Padding" Value="10,7" />
+  </Style>
+
+  <Style Selector="Button:disabled">
+    <Setter Property="Opacity" Value="0.45" />
+  </Style>
+
+  <Style Selector="TextBox">
+    <Setter Property="MinHeight" Value="32" />
+    <Setter Property="CornerRadius" Value="6" />
+  </Style>
+
+  <Style Selector="ComboBox">
+    <Setter Property="MinHeight" Value="30" />
+    <Setter Property="CornerRadius" Value="6" />
+  </Style>
+
+  <Style Selector="CheckBox">
+    <Setter Property="FontSize" Value="13" />
+  </Style>
+
+  <Style Selector="CheckBox:disabled">
+    <Setter Property="Opacity" Value="0.5" />
+  </Style>
+
+  <Style Selector="ComboBox:disabled">
+    <Setter Property="Opacity" Value="0.5" />
+  </Style>
+
+  <Style Selector="TextBox:disabled">
+    <Setter Property="Opacity" Value="0.55" />
+  </Style>
+
+  <Style Selector="ListBox">
+    <Setter Property="Background" Value="Transparent" />
+    <Setter Property="BorderThickness" Value="0" />
+  </Style>
+
+  <Style Selector="ListBoxItem">
+    <Setter Property="Padding" Value="8,6" />
+    <Setter Property="CornerRadius" Value="6" />
+    <Setter Property="Margin" Value="0,1" />
+  </Style>
+
+  <Style Selector="ListBoxItem:selected">
+    <Setter Property="Background" Value="{DynamicResource SelectionBrush}" />
+    <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+  </Style>
+
+  <Style Selector="ScrollViewer">
+    <Setter Property="Background" Value="Transparent" />
+  </Style>
+
+  <!-- Larger text option: reflow instead of truncating, and keep hints legible. -->
+  <Style Selector="Window.prototypeLargeText TextBlock">
+    <Setter Property="FontSize" Value="16" />
+  </Style>
+
+  <Style Selector="Window.prototypeLargeText TextBlock.hint">
+    <Setter Property="FontSize" Value="13" />
+  </Style>
+
+  <Style Selector="Window.prototypeLargeText TextBlock.title">
+    <Setter Property="FontSize" Value="21" />
+  </Style>
+
+  <Style Selector="Window.prototypeLargeText TextBlock.caption">
+    <Setter Property="FontSize" Value="12" />
+  </Style>
+
+  <Style Selector="Window.prototypeLargeText TextBlock.mono">
+    <Setter Property="FontSize" Value="13" />
+  </Style>
+</Styles>

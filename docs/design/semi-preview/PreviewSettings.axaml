@@ -1,0 +1,44 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:local="using:PartyUp.UiPrototype"
+             x:Class="PartyUp.UiPrototype.PreviewSettings" x:DataType="local:SemiViewModel">
+  <Grid RowDefinitions="Auto,*">
+    <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,18">
+      <TextBlock Text="应用设置" Classes="heading" VerticalAlignment="Center" />
+      <Button Grid.Column="1" Content="关闭" Command="{Binding CloseSettingsCommand}" AutomationProperties.AutomationId="CloseSettings" />
+    </Grid>
+    <ScrollViewer Grid.Row="1" HorizontalScrollBarVisibility="Disabled">
+      <StackPanel Spacing="14" Margin="0,0,8,12">
+        <TextBlock Text="外观即时生效，以下系统功能仍为演示；不会中断通话状态。" Classes="caption" TextWrapping="Wrap" />
+        <TextBlock Text="外观" Classes="section" />
+        <TextBlock Text="主题" />
+        <ComboBox HorizontalAlignment="Stretch" ItemsSource="{x:Static local:SemiPreviewWindow.ThemeChoices}"
+                  SelectedItem="{Binding Session.ThemeChoice, Mode=TwoWay}" AutomationProperties.AutomationId="ThemeChoice" />
+        <TextBlock Text="文字大小" />
+        <ComboBox HorizontalAlignment="Stretch" ItemsSource="{x:Static local:SemiPreviewWindow.TextChoices}"
+                  SelectedItem="{Binding Session.TextSizeChoice, Mode=TwoWay}" />
+        <Separator />
+        <TextBlock Text="音频与输入（模拟）" Classes="section" />
+        <TextBlock Text="输入设备" />
+        <ComboBox HorizontalAlignment="Stretch" ItemsSource="{x:Static local:SemiPreviewWindow.DeviceChoices}"
+                  SelectedItem="{Binding Session.InputDeviceChoice, Mode=TwoWay}" />
+        <TextBlock Text="输出设备" />
+        <ComboBox HorizontalAlignment="Stretch" ItemsSource="{x:Static local:SemiPreviewWindow.DeviceChoices}"
+                  SelectedItem="{Binding Session.OutputDeviceChoice, Mode=TwoWay}" />
+        <TextBlock Text="输入方式" />
+        <ComboBox HorizontalAlignment="Stretch" ItemsSource="{x:Static local:SemiPreviewWindow.InputChoices}"
+                  SelectedItem="{Binding Session.InputModeChoice, Mode=TwoWay}" />
+        <TextBlock Text="未访问麦克风或播放设备；按住说话未接全局键。内核/服务端缺口单独登记。" Classes="caption" TextWrapping="Wrap" />
+        <Separator />
+        <TextBlock Text="窗口与启动（模拟）" Classes="section" />
+        <CheckBox Content="关闭后留在托盘" IsChecked="{Binding Session.CloseToTray, Mode=TwoWay}" />
+        <CheckBox Content="开机启动" IsChecked="{Binding Session.StartOnLogin, Mode=TwoWay}" />
+        <TextBlock Text="这里只改变内存演示值；关闭窗口仍会退出，不会注册托盘或启动项。" Classes="caption" TextWrapping="Wrap" />
+        <Separator />
+        <TextBlock Text="关于预览" Classes="section" />
+        <TextBlock Text="Semi.Avalonia 12.1.0.1 · Avalonia 12.1.4。状态图标来自 Material.Icons.Avalonia；邀请链接由 System.Uri 和 Microsoft.AspNetCore.WebUtilities 解析。"
+                   Classes="caption" TextWrapping="Wrap" />
+      </StackPanel>
+    </ScrollViewer>
+  </Grid>
+</UserControl>

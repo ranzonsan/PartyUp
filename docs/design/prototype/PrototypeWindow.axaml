@@ -1,0 +1,1269 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:PartyUp.UiPrototype"
+        xmlns:conv="using:Avalonia.Data.Converters"
+        x:Class="PartyUp.UiPrototype.PrototypeWindow"
+        x:DataType="vm:DemoState"
+        Title="PartyUp v1.1 交互原型 · 演示数据"
+        Width="1280"
+        Height="800"
+        MinWidth="900"
+        MinHeight="600"
+        FontSize="14"
+        Background="{DynamicResource AppBackgroundBrush}"
+        WindowStartupLocation="CenterScreen">
+  <!--
+    THROWAWAY v1.1 INTERACTION PROTOTYPE.
+    Every state transition is synthetic and owned by DemoState.
+    No network, credentials, audio devices, capture, tray, startup or
+    global-shortcut hooks are used. The layout variant selector and the
+    inspector are prototype tools, deliberately kept outside the product area.
+  -->
+  <Window.Resources>
+    <!-- ============================================================ call bar -->
+    <DataTemplate x:Key="CallBarTemplate" x:DataType="vm:DemoState">
+      <Grid RowDefinitions="Auto,Auto">
+        <StackPanel Grid.Row="0" Spacing="3" Margin="0,0,0,8">
+          <TextBlock Text="{Binding CallSummary}" FontWeight="SemiBold" TextWrapping="Wrap" />
+          <TextBlock Classes="hint"
+                     Text="{Binding StatusText}"
+                     IsVisible="{Binding StatusText, Converter={x:Static conv:StringConverters.IsNotNullOrEmpty}}"
+                     TextWrapping="Wrap" />
+          <TextBlock Classes="danger" Text="{Binding PublishError}"
+                     IsVisible="{Binding HasPublishFailure}" TextWrapping="Wrap" />
+          <TextBlock Classes="caption"
+                     Text="通话控制为本地模拟；断线时静音、闭音、离开与退出仍然可用。"
+                     TextWrapping="Wrap" />
+        </StackPanel>
+
+        <StackPanel Grid.Row="1" Spacing="8">
+          <!-- transfer confirmation: old call stays until confirmed -->
+          <Border Classes="warning-notice" IsVisible="{Binding IsTransferPending}">
+            <StackPanel Spacing="6">
+              <TextBlock FontWeight="SemiBold"
+                         Text="{Binding PendingChannel, StringFormat='转移确认：离开当前通话并加入「{0}」？'}"
+                         TextWrapping="Wrap" />
+              <TextBlock Classes="hint"
+                         Text="正在共享时转移会先停止当前共享与观看。确认后旧通话立即清理；若失败会落到未加入通话，原共享需手动重开，不会自动重连或重新发布。"
+                         TextWrapping="Wrap" />
+              <StackPanel Orientation="Horizontal" Spacing="8">
+                <Button Classes="primary" Content="确认转移（模拟）" Command="{Binding ConfirmTransferCommand}" />
+                <Button Content="取消，保持原状" Command="{Binding CancelTransferCommand}" />
+              </StackPanel>
+            </StackPanel>
+          </Border>
+
+          <!-- transfer failure: explicitly not in a call -->
+          <Border Classes="danger-notice" IsVisible="{Binding HasTransferFailure}">
+            <StackPanel Spacing="6">
+              <TextBlock Classes="danger"
+                         Text="转移失败（模拟）：旧通话、共享与观看已停止，当前未加入通话。"
+                         TextWrapping="Wrap" />
+              <TextBlock Classes="hint"
+                         Text="返回原频道只恢复文字浏览，不会自动重新加入通话或重新共享。"
+                         TextWrapping="Wrap" />
+              <StackPanel Orientation="Horizontal" Spacing="8">
+                <Button Content="{Binding LastCallChannel, StringFormat='返回 {0}（仅浏览）'}"
+                        Command="{Binding ReturnPreviousCommand}" />
+                <Button Classes="primary"
+                        Content="{Binding BrowseChannel, StringFormat='重新加入「{0}」语音（模拟）'}"
+                        Command="{Binding JoinCommand}" />
+              </StackPanel>
+            </StackPanel>
+          </Border>
+
+          <WrapPanel>
+            <Button Classes="primary"
+                    Margin="0,0,6,6"
+                    IsVisible="{Binding !IsCallActive}"
+                    Content="{Binding BrowseChannel, StringFormat='加入「{0}」语音（模拟）'}"
+                    Command="{Binding JoinCommand}" />
+
+            <Button Margin="0,0,6,6"
+                    IsVisible="{Binding IsCallActive}"
+                    Content="离开通话（本地结束）"
+                    Command="{Binding LeaveCommand}"
+                    Classes="danger" />
+
+            <Button Margin="0,0,6,6" Command="{Binding MuteCommand}">
+              <StackPanel Orientation="Horizontal" Spacing="6">
+                <Ellipse Width="8" Height="8" VerticalAlignment="Center"
+                         Fill="{DynamicResource DangerBrush}" IsVisible="{Binding IsMuted}" />
+                <Ellipse Width="8" Height="8" VerticalAlignment="Center"
+                         Fill="{DynamicResource TextMutedBrush}" IsVisible="{Binding !IsMuted}" />
+                <TextBlock Text="麦克风" />
+                <TextBlock Classes="danger" Text="已静音" IsVisible="{Binding IsMuted}" />
+                <TextBlock Classes="hint" Text="开" IsVisible="{Binding !IsMuted}" />
+              </StackPanel>
+            </Button>
+
+            <Button Margin="0,0,6,6" Command="{Binding DeafenCommand}">
+              <StackPanel Orientation="Horizontal" Spacing="6">
+                <Ellipse Width="8" Height="8" VerticalAlignment="Center"
+                         Fill="{DynamicResource DangerBrush}" IsVisible="{Binding IsDeafened}" />
+                <Ellipse Width="8" Height="8" VerticalAlignment="Center"
+                         Fill="{DynamicResource TextMutedBrush}" IsVisible="{Binding !IsDeafened}" />
+                <TextBlock Text="扬声器" />
+                <TextBlock Classes="danger" Text="已关闭" IsVisible="{Binding IsDeafened}" />
+                <TextBlock Classes="hint" Text="开" IsVisible="{Binding !IsDeafened}" />
+              </StackPanel>
+            </Button>
+
+            <ComboBox Width="180" Margin="0,0,6,6"
+                      AutomationProperties.AutomationId="PublishSource"
+                      ItemsSource="{Binding Sources}"
+                      SelectedItem="{Binding SelectedSource, Mode=TwoWay}"
+                      IsEnabled="{Binding !IsPublishing}" />
+            <Button Margin="0,0,6,6"
+                    Command="{Binding PublishCommand}"
+                    IsEnabled="{Binding CanPublish}">
+              <StackPanel Orientation="Horizontal" Spacing="6">
+                <TextBlock Text="共享屏幕" />
+                <TextBlock Classes="brand-text" Text="发布中（模拟）" IsVisible="{Binding IsPublishing}" />
+                <TextBlock Classes="hint" Text="开始（模拟）" IsVisible="{Binding !IsPublishing}" />
+              </StackPanel>
+            </Button>
+
+            <Button Margin="0,0,6,6"
+                    Classes="primary"
+                    Content="观看所选共享（模拟）"
+                    Command="{Binding WatchCommand}"
+                    IsEnabled="{Binding CanWatch}" />
+
+            <Button Margin="0,0,6,6"
+                    IsVisible="{Binding IsWatching}"
+                    Command="{Binding StopWatchCommand}">
+              <StackPanel Orientation="Horizontal" Spacing="6">
+                <TextBlock Text="停止观看并返回聊天" />
+              </StackPanel>
+            </Button>
+
+            <Button Margin="0,0,6,6"
+                    IsVisible="{Binding IsWatching}"
+                    Command="{Binding ToggleFullscreenCommand}">
+              <StackPanel Orientation="Horizontal" Spacing="6">
+                <TextBlock Text="全屏观看（主窗内）" IsVisible="{Binding !IsFullScreen}" />
+                <TextBlock Text="退出全屏（Esc）" IsVisible="{Binding IsFullScreen}" />
+              </StackPanel>
+            </Button>
+
+            <Button Margin="0,0,6,6"
+                    Classes="tool"
+                    Content="设置"
+                    Command="{Binding OpenSettingsCommand}"
+                    IsVisible="{Binding !ShowSettings}" />
+            <Button Margin="0,0,6,6"
+                    Classes="tool"
+                    Content="关闭设置"
+                    Command="{Binding CloseSettingsCommand}"
+                    IsVisible="{Binding ShowSettings}" />
+            <Button Margin="0,0,6,6"
+                    Classes="tool"
+                    Content="模拟断线"
+                    Command="{Binding DisconnectCommand}"
+                    IsVisible="{Binding IsConnected}" />
+            <Button Margin="0,0,6,6"
+                    Classes="tool primary"
+                    Content="模拟重连"
+                    Command="{Binding ReconnectCommand}"
+                    IsVisible="{Binding !IsConnected}" />
+            <Button Margin="0,0,6,6"
+                    Classes="tool"
+                    Content="退出登录"
+                    Command="{Binding LogoutCommand}" />
+          </WrapPanel>
+        </StackPanel>
+      </Grid>
+    </DataTemplate>
+
+    <!-- ====================================================== context sidebar -->
+    <DataTemplate x:Key="ContextSideTemplate" x:DataType="vm:DemoState">
+      <ScrollViewer HorizontalScrollBarVisibility="Disabled">
+        <StackPanel Spacing="10">
+          <TextBlock Text="当前通话" Classes="subtitle" />
+          <TextBlock Text="{Binding CallSummary}" TextWrapping="Wrap" />
+          <StackPanel Orientation="Horizontal" Spacing="6">
+            <Button Classes="primary"
+                    Content="加入语音（模拟）"
+                    Command="{Binding JoinCommand}"
+                    IsVisible="{Binding !IsCallActive}" />
+            <Button Classes="danger"
+                    Content="离开"
+                    Command="{Binding LeaveCommand}"
+                    IsVisible="{Binding IsCallActive}" />
+            <Button Content="设置" Command="{Binding OpenSettingsCommand}" Classes="tool" />
+          </StackPanel>
+
+          <Border Height="1" Background="{DynamicResource BorderBrush}" />
+
+          <TextBlock Text="共享 · 仅当前通话频道" Classes="subtitle" />
+          <TextBlock Classes="hint"
+                     Text="未加入通话时不可观看；这里只显示当前通话频道的共享，不混入正在浏览频道的成员列表。"
+                     TextWrapping="Wrap" />
+          <ListBox ItemsSource="{Binding Shares}"
+                   SelectedItem="{Binding SelectedShare, Mode=TwoWay}"
+                   MaxHeight="150" />
+          <TextBlock Classes="hint" Text="{Binding Shares.Count, StringFormat='共享目标（演示） {0} 个；仅当前通话频道可观看。'}" />
+          <Button Content="观看所选共享（模拟）"
+                  Command="{Binding WatchCommand}"
+                  IsEnabled="{Binding CanWatch}"
+                  HorizontalAlignment="Stretch" />
+          <Button Content="停止观看"
+                  Command="{Binding StopWatchCommand}"
+                  IsVisible="{Binding IsWatching}"
+                  HorizontalAlignment="Stretch" />
+
+          <Border Height="1" Background="{DynamicResource BorderBrush}" />
+
+          <TextBlock Text="成员（示例）" Classes="subtitle" />
+          <StackPanel Spacing="8">
+            <Grid ColumnDefinitions="Auto,*">
+              <Border Classes="avatar">
+                <TextBlock Text="阿" Classes="on-brand" HorizontalAlignment="Center" VerticalAlignment="Center" />
+              </Border>
+              <StackPanel Grid.Column="1" Margin="8,0,0,0" Spacing="1">
+                <TextBlock Text="阿岚" />
+                <TextBlock Text="示例成员 · 非服务器数据" Classes="caption" />
+              </StackPanel>
+            </Grid>
+            <Grid ColumnDefinitions="Auto,*">
+              <Border Classes="avatar">
+                <TextBlock Text="满" Classes="on-brand" HorizontalAlignment="Center" VerticalAlignment="Center" />
+              </Border>
+              <StackPanel Grid.Column="1" Margin="8,0,0,0" Spacing="1">
+                <TextBlock Text="小满" />
+                <TextBlock Text="示例成员 · 非服务器数据" Classes="caption" />
+              </StackPanel>
+            </Grid>
+            <Grid ColumnDefinitions="Auto,*">
+              <Border Classes="avatar">
+                <TextBlock Text="我" Classes="on-brand" HorizontalAlignment="Center" VerticalAlignment="Center" />
+              </Border>
+              <StackPanel Grid.Column="1" Margin="8,0,0,0" Spacing="1">
+                <TextBlock Text="我（演示账号）" />
+                <TextBlock Text="示例成员 · 非服务器数据" Classes="caption" />
+              </StackPanel>
+            </Grid>
+          </StackPanel>
+          <TextBlock Classes="caption"
+                     Text="成员、共享与通话状态均为合成演示数据，不代表真实服务器。"
+                     TextWrapping="Wrap" />
+        </StackPanel>
+      </ScrollViewer>
+    </DataTemplate>
+
+    <!-- ========================================================= text sidebar -->
+    <DataTemplate x:Key="ChatSideTemplate" x:DataType="vm:DemoState">
+      <Grid RowDefinitions="Auto,*,Auto" Margin="4">
+        <StackPanel Grid.Row="0" Spacing="2">
+          <TextBlock Text="{Binding BrowseChannel, StringFormat='文字 · {0}'}" FontWeight="SemiBold" />
+          <TextBlock Classes="hint" Text="{Binding BrowseSummary}" TextWrapping="Wrap" />
+          <TextBlock Classes="caption"
+                     Text="侧栏只影响文字浏览与草稿；观看目标与通话归属保持独立。"
+                     TextWrapping="Wrap" Margin="0,2,0,0" />
+        </StackPanel>
+
+        <ScrollViewer Grid.Row="1" Margin="0,8">
+          <ItemsControl ItemsSource="{Binding Messages}">
+            <ItemsControl.ItemTemplate>
+              <DataTemplate x:DataType="vm:DemoMessage">
+                <StackPanel Margin="0,0,0,8" Spacing="2">
+                  <StackPanel Orientation="Horizontal" Spacing="6">
+                    <TextBlock Text="{Binding Author}" FontWeight="SemiBold" />
+                    <TextBlock Text="{Binding Time}" Classes="caption" />
+                  </StackPanel>
+                  <TextBlock Text="{Binding Body}" TextWrapping="Wrap" />
+                </StackPanel>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+        </ScrollViewer>
+
+        <StackPanel Grid.Row="2" Spacing="6">
+          <Border Classes="warning-notice" IsVisible="{Binding HasFailedMessage}">
+            <TextBlock Classes="hint"
+                       Text="上一条消息发送失败（模拟）；原文仍保留，可重试。"
+                       TextWrapping="Wrap" />
+          </Border>
+          <Grid ColumnDefinitions="*,Auto">
+            <TextBox x:Name="SideMessageInput"
+                     Grid.Column="0"
+                     Margin="0,0,6,0"
+                     Text="{Binding InputText, Mode=TwoWay}"
+                     PlaceholderText="输入消息（演示）"
+                     AcceptsReturn="False" />
+            <Button Grid.Column="1"
+                    Classes="primary"
+                    Content="发送"
+                    Command="{Binding SendCommand}"
+                    IsEnabled="{Binding CanSend}" />
+          </Grid>
+          <StackPanel Orientation="Horizontal" Spacing="6" IsVisible="{Binding HasFailedMessage}">
+            <Button Classes="tool" Content="重试上一条（模拟）" Command="{Binding RetryCommand}" IsEnabled="{Binding CanRetry}" />
+          </StackPanel>
+          <TextBlock Classes="caption" Text="合成演示数据；不连接服务器，不写盘。" />
+        </StackPanel>
+      </Grid>
+    </DataTemplate>
+
+    <!-- ============================================================= chat -->
+    <DataTemplate x:Key="ChatScreenTemplate" x:DataType="vm:DemoState">
+      <Grid RowDefinitions="Auto,*,Auto" Margin="14">
+        <Grid Grid.Row="0" ColumnDefinitions="*,Auto" RowDefinitions="Auto,Auto">
+          <StackPanel Grid.Row="0" Grid.Column="0" Spacing="2">
+            <TextBlock Classes="title" Text="{Binding BrowseChannel, StringFormat='浏览 · {0}'}" />
+            <TextBlock Classes="hint" Text="{Binding BrowseSummary}" TextWrapping="Wrap" />
+            <TextBlock Classes="caption" Text="{Binding Messages.Count, StringFormat='消息 {0} 条（演示）'}" />
+          </StackPanel>
+          <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" Spacing="6" VerticalAlignment="Top">
+            <Button Classes="tool" Content="设置" Command="{Binding OpenSettingsCommand}" />
+            <Button Classes="tool" Content="退出登录" Command="{Binding LogoutCommand}" />
+          </StackPanel>
+          <WrapPanel Grid.Row="1" Grid.ColumnSpan="2" Margin="0,10,0,0">
+            <TextBlock Classes="hint" Text="共享" VerticalAlignment="Center" Margin="0,0,6,0" />
+            <ComboBox Width="190"
+                      Margin="0,0,6,0"
+                      ItemsSource="{Binding Shares}"
+                      SelectedItem="{Binding SelectedShare, Mode=TwoWay}"
+                      PlaceholderText="选择共享目标" />
+            <Button Classes="primary"
+                    Margin="0,0,10,0"
+                    Content="观看所选共享（模拟）"
+                    Command="{Binding WatchCommand}"
+                    IsEnabled="{Binding CanWatch}" />
+            <TextBlock Classes="hint"
+                       Text="仅当前通话频道；未加入通话时不可观看。"
+                       VerticalAlignment="Center" />
+          </WrapPanel>
+        </Grid>
+
+        <Grid Grid.Row="1" Margin="0,12">
+          <ScrollViewer HorizontalScrollBarVisibility="Disabled">
+            <ItemsControl ItemsSource="{Binding Messages}">
+              <ItemsControl.ItemTemplate>
+                <DataTemplate x:DataType="vm:DemoMessage">
+                  <Border Margin="0,0,0,10" Padding="0,0,0,8">
+                    <StackPanel Spacing="3">
+                      <StackPanel Orientation="Horizontal" Spacing="8">
+                        <TextBlock Text="{Binding Author}" FontWeight="SemiBold" />
+                        <TextBlock Text="{Binding Time}" Classes="caption" VerticalAlignment="Center" />
+                      </StackPanel>
+                      <TextBlock Text="{Binding Body}" TextWrapping="Wrap" />
+                    </StackPanel>
+                  </Border>
+                </DataTemplate>
+              </ItemsControl.ItemTemplate>
+            </ItemsControl>
+          </ScrollViewer>
+        </Grid>
+
+        <StackPanel Grid.Row="2" Spacing="8">
+          <Border Classes="warning-notice" IsVisible="{Binding HasFailedMessage}">
+            <Grid ColumnDefinitions="*,Auto">
+              <TextBlock Text="上一条消息发送失败（模拟）。原文保留在草稿中，可重试。"
+                         TextWrapping="Wrap"
+                         VerticalAlignment="Center" />
+              <Button Grid.Column="1"
+                      Margin="10,0,0,0"
+                      Content="重试（模拟）"
+                      Command="{Binding RetryCommand}"
+                      IsEnabled="{Binding CanRetry}" />
+            </Grid>
+          </Border>
+
+          <Border Classes="warning-notice" IsVisible="{Binding !IsConnected}">
+            <TextBlock Text="断线（模拟）：可继续写草稿；发送与新共享/观看暂停；本地静音、闭音、离开和退出登录仍可用。"
+                       TextWrapping="Wrap" />
+          </Border>
+
+          <Grid ColumnDefinitions="*,Auto">
+            <TextBox x:Name="MessageInput"
+                     Grid.Column="0"
+                     Margin="0,0,8,0"
+                     Text="{Binding InputText, Mode=TwoWay}"
+                     PlaceholderText="输入消息（演示，不会发送到服务器）"
+                     AcceptsReturn="False" />
+            <Button Grid.Column="1"
+                    Classes="primary"
+                    Content="发送（模拟）"
+                    Command="{Binding SendCommand}"
+                    IsEnabled="{Binding CanSend}" />
+          </Grid>
+
+          <Grid ColumnDefinitions="*,Auto">
+            <TextBlock Classes="caption"
+                       Text="Enter 发送；草稿按频道保留；演示数据，不连接服务器。"
+                       VerticalAlignment="Center" />
+            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="6">
+              <TextBlock Classes="warning"
+                         Text="有新消息（模拟）"
+                         IsVisible="{Binding HasNewMessages}"
+                         VerticalAlignment="Center" />
+              <Button Classes="tool" Content="回到最新" Command="{Binding JumpToLatestCommand}" />
+              <Button Classes="tool" Content="标记已读" Command="{Binding MarkReadingHistoryCommand}" />
+            </StackPanel>
+          </Grid>
+        </StackPanel>
+      </Grid>
+    </DataTemplate>
+
+    <!-- ============================================================ watch -->
+    <DataTemplate x:Key="WatchScreenTemplate" x:DataType="vm:DemoState">
+      <Grid RowDefinitions="Auto,Auto,*" ColumnDefinitions="*,Auto" Margin="14">
+        <StackPanel Grid.Row="0" Grid.Column="0" Spacing="2">
+          <TextBlock Classes="title" Text="观看共享（演示）" />
+          <TextBlock Text="{Binding WatchSummary}" TextWrapping="Wrap" />
+          <TextBlock Classes="hint"
+                     Text="{Binding CallSummary}"
+                     TextWrapping="Wrap" />
+        </StackPanel>
+
+        <WrapPanel Grid.Row="1" Grid.Column="0" Margin="0,8,0,0">
+          <ComboBox Width="180"
+                    Margin="0,0,6,0"
+                    ItemsSource="{Binding Shares}"
+                    SelectedItem="{Binding SelectedShare, Mode=TwoWay}" />
+          <Button Margin="0,0,6,0"
+                  Content="切换观看目标（模拟）"
+                  Command="{Binding WatchCommand}"
+                  IsEnabled="{Binding CanWatch}" />
+          <Button Margin="0,0,6,0"
+                  Content="全屏观看"
+                  Command="{Binding ToggleFullscreenCommand}"
+                  IsVisible="{Binding !IsFullScreen}" />
+          <Button Margin="0,0,6,0"
+                  Content="退出全屏（Esc）"
+                  Command="{Binding ToggleFullscreenCommand}"
+                  IsVisible="{Binding IsFullScreen}"
+                  Classes="primary" />
+          <Button Margin="0,0,6,0"
+                  Content="收起聊天侧栏"
+                  Command="{Binding ToggleChatCommand}"
+                  IsVisible="{Binding IsChatVisible}" />
+          <Button Margin="0,0,6,0"
+                  Content="展开聊天侧栏"
+                  Command="{Binding ToggleChatCommand}"
+                  IsVisible="{Binding !IsChatVisible}" />
+          <Button Margin="0,0,6,0"
+                  Content="停止观看并返回聊天"
+                  Command="{Binding StopWatchCommand}"
+                  Classes="danger" />
+          <Button Margin="0,0,6,0"
+                  Content="模拟共享者结束"
+                  Command="{Binding EndShareCommand}" />
+        </WrapPanel>
+
+        <Border Grid.Row="2" Grid.Column="0" Classes="media-stage" Margin="0,10,10,0">
+          <Grid RowDefinitions="Auto,*,Auto" Margin="14">
+            <Grid ColumnDefinitions="*,Auto">
+              <StackPanel Spacing="2">
+                <TextBlock FontWeight="SemiBold"
+                           Foreground="#F4F1EA"
+                           Text="{Binding SelectedShare, StringFormat='演示画面：{0}'}" />
+                <TextBlock FontSize="12"
+                           Foreground="#AEB2BA"
+                           Text="合成图形 · 非真实屏幕采集 · 未连接媒体引擎" />
+              </StackPanel>
+              <Border Grid.Column="1" Background="#262A31" CornerRadius="10" Padding="8,3" VerticalAlignment="Top">
+                <TextBlock FontSize="11" Foreground="#FF8A63" Text="PROTOTYPE · 演示数据" />
+              </Border>
+            </Grid>
+
+            <Border Grid.Row="1"
+                    Margin="0,12"
+                    HorizontalAlignment="Stretch"
+                    VerticalAlignment="Center"
+                    MaxWidth="520"
+                    Background="#181A1F"
+                    BorderBrush="#2C3037"
+                    BorderThickness="1"
+                    CornerRadius="8">
+              <Grid RowDefinitions="Auto,*">
+                <Border Background="#22252B" Height="30" CornerRadius="8,8,0,0">
+                  <StackPanel Orientation="Horizontal" Spacing="6" Margin="10,0" VerticalAlignment="Center">
+                    <Ellipse Width="8" Height="8" Fill="#FF5A2B" />
+                    <Ellipse Width="8" Height="8" Fill="#3A3F47" />
+                    <Ellipse Width="8" Height="8" Fill="#3A3F47" />
+                    <TextBlock FontSize="11" Foreground="#AEB2BA" Text="演示窗口 · 非真实桌面" />
+                  </StackPanel>
+                </Border>
+                <StackPanel Grid.Row="1" Margin="16" Spacing="10">
+                  <Border Height="12" Width="170" HorizontalAlignment="Left" Background="#2C3037" CornerRadius="2" />
+                  <Border Height="10" Width="250" HorizontalAlignment="Left" Background="#23272E" CornerRadius="2" />
+                  <Grid ColumnDefinitions="*,*,*" Margin="0,8,0,0">
+                    <Border Grid.Column="0" Height="56" Margin="0,0,8,0" Background="#20242A" CornerRadius="4" />
+                    <Border Grid.Column="1" Height="56" Margin="4,0" Background="#20242A" CornerRadius="4" />
+                    <Border Grid.Column="2" Height="56" Margin="8,0,0,0" Background="#20242A" CornerRadius="4" />
+                  </Grid>
+                  <TextBlock FontSize="11" Foreground="#838892" Text="静态占位图形，不是屏幕帧，也不显示 FPS / 码率。" TextWrapping="Wrap" />
+                </StackPanel>
+              </Grid>
+            </Border>
+
+            <Grid Grid.Row="2" ColumnDefinitions="*,Auto">
+              <TextBlock FontSize="12" Foreground="#AEB2BA"
+                         Text="停止观看会清除画面并回到文字聊天；切换目标先清旧画面，再等待新首帧。"
+                         TextWrapping="Wrap" />
+              <TextBlock Grid.Column="1" FontSize="11" Foreground="#838892" Margin="10,0,0,0"
+                         Text="未连接真实媒体服务" VerticalAlignment="Bottom" />
+            </Grid>
+          </Grid>
+        </Border>
+
+        <Border Grid.Row="0" Grid.RowSpan="3" Grid.Column="1"
+                Width="320"
+                Classes="info-side"
+                IsVisible="{Binding IsChatVisible}">
+          <Grid RowDefinitions="Auto,*,Auto" Margin="4">
+            <StackPanel Grid.Row="0" Spacing="2">
+              <TextBlock FontWeight="SemiBold"
+                         Text="{Binding BrowseChannel, StringFormat='文字 · {0}'}" />
+              <TextBlock Classes="hint" Text="浏览频道可不同于通话频道；输入只进入正在浏览的频道。" TextWrapping="Wrap" />
+            </StackPanel>
+
+            <ScrollViewer Grid.Row="1" Margin="0,8">
+              <ItemsControl ItemsSource="{Binding Messages}">
+                <ItemsControl.ItemTemplate>
+                  <DataTemplate x:DataType="vm:DemoMessage">
+                    <StackPanel Margin="0,0,0,8" Spacing="2">
+                      <StackPanel Orientation="Horizontal" Spacing="6">
+                        <TextBlock Text="{Binding Author}" FontWeight="SemiBold" />
+                        <TextBlock Text="{Binding Time}" Classes="caption" />
+                      </StackPanel>
+                      <TextBlock Text="{Binding Body}" TextWrapping="Wrap" />
+                    </StackPanel>
+                  </DataTemplate>
+                </ItemsControl.ItemTemplate>
+              </ItemsControl>
+            </ScrollViewer>
+
+            <StackPanel Grid.Row="2" Spacing="6">
+              <Border Classes="warning-notice" IsVisible="{Binding HasFailedMessage}">
+                <TextBlock Classes="hint" Text="上一条消息发送失败（模拟）；原文仍保留。" TextWrapping="Wrap" />
+              </Border>
+              <Grid ColumnDefinitions="*,Auto">
+                <TextBox x:Name="WatchMessageInput"
+                         Grid.Column="0"
+                         Margin="0,0,6,0"
+                         Text="{Binding InputText, Mode=TwoWay}"
+                         PlaceholderText="输入消息（演示）" />
+                <Button Grid.Column="1"
+                        Classes="primary"
+                        Content="发送"
+                        Command="{Binding SendCommand}"
+                        IsEnabled="{Binding CanSend}" />
+              </Grid>
+              <Button Classes="tool" Content="重试上一条（模拟）" Command="{Binding RetryCommand}"
+                      IsEnabled="{Binding CanRetry}" IsVisible="{Binding HasFailedMessage}"
+                      HorizontalAlignment="Left" />
+              <TextBlock Classes="caption" Text="停止观看不会发送草稿。" />
+            </StackPanel>
+          </Grid>
+        </Border>
+      </Grid>
+    </DataTemplate>
+
+    <!-- ========================================================= settings -->
+    <DataTemplate x:Key="SettingsScreenTemplate" x:DataType="vm:DemoState">
+      <Grid RowDefinitions="Auto,*" Margin="14">
+        <Grid Grid.Row="0" ColumnDefinitions="*,Auto">
+          <StackPanel Spacing="2">
+            <TextBlock Classes="title" Text="设置（模拟）" />
+            <TextBlock Classes="hint"
+                       Text="查看设置不会结束当前通话或观看；关闭后返回此前的聊天/观看任务。所有分组均为演示，不写配置、不注册系统能力。"
+                       TextWrapping="Wrap" />
+          </StackPanel>
+          <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="6" VerticalAlignment="Top">
+            <Button Content="关闭设置" Command="{Binding CloseSettingsCommand}" Classes="primary" />
+            <Button Content="退出登录" Command="{Binding LogoutCommand}" Classes="tool" />
+          </StackPanel>
+        </Grid>
+
+        <ScrollViewer Grid.Row="1" Margin="0,10,0,0" HorizontalScrollBarVisibility="Disabled">
+          <StackPanel Spacing="6" MaxWidth="900">
+            <Border Classes="notice" IsVisible="{Binding IsCallActive}">
+              <Grid ColumnDefinitions="*,Auto">
+                <TextBlock Text="{Binding CallSummary}" TextWrapping="Wrap" VerticalAlignment="Center" />
+                <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="6">
+                  <Button Classes="tool" Content="静音" Command="{Binding MuteCommand}" />
+                  <Button Classes="tool" Content="闭音" Command="{Binding DeafenCommand}" />
+                  <Button Classes="tool danger" Content="离开" Command="{Binding LeaveCommand}" />
+                </StackPanel>
+              </Grid>
+            </Border>
+
+            <TextBlock Text="外观" Classes="subtitle" Margin="0,8,0,0" />
+            <Grid ColumnDefinitions="220,*">
+              <TextBlock Text="主题" VerticalAlignment="Center" />
+              <StackPanel Grid.Column="1" Spacing="3">
+                <ComboBox Width="220" HorizontalAlignment="Left"
+                          ItemsSource="{x:Static vm:PrototypeWindow.ThemeOptions}"
+                          SelectedItem="{Binding ThemeChoice, Mode=TwoWay}" />
+                <TextBlock Classes="hint" Text="深色 / 浅色 / 跟随系统。立即应用于整个原型。" />
+              </StackPanel>
+            </Grid>
+            <Grid ColumnDefinitions="220,*">
+              <TextBlock Text="文字大小" VerticalAlignment="Center" />
+              <StackPanel Grid.Column="1" Spacing="3">
+                <ComboBox Width="220" HorizontalAlignment="Left"
+                          ItemsSource="{x:Static vm:PrototypeWindow.TextSizeOptions}"
+                          SelectedItem="{Binding TextSizeChoice, Mode=TwoWay}" />
+                <TextBlock Classes="hint" Text="大号会增大正文与辅助文字并允许重排，不缩字硬塞。" />
+              </StackPanel>
+            </Grid>
+
+            <Border Height="1" Background="{DynamicResource BorderBrush}" Margin="0,10" />
+
+            <TextBlock Text="音频" Classes="subtitle" />
+            <Grid ColumnDefinitions="220,*">
+              <TextBlock Text="输入设备" VerticalAlignment="Center" />
+              <StackPanel Grid.Column="1" Spacing="3">
+                <ComboBox Width="300" HorizontalAlignment="Left"
+                          ItemsSource="{x:Static vm:PrototypeWindow.InputDeviceOptions}"
+                          SelectedItem="{Binding InputDeviceChoice, Mode=TwoWay}" />
+                <TextBlock Classes="hint" Text="模拟列表，不枚举真实设备。" />
+              </StackPanel>
+            </Grid>
+            <Grid ColumnDefinitions="220,*">
+              <TextBlock Text="输出设备" VerticalAlignment="Center" />
+              <StackPanel Grid.Column="1" Spacing="3">
+                <ComboBox Width="300" HorizontalAlignment="Left"
+                          ItemsSource="{x:Static vm:PrototypeWindow.OutputDeviceOptions}"
+                          SelectedItem="{Binding OutputDeviceChoice, Mode=TwoWay}" />
+                <TextBlock Classes="hint" Text="模拟列表；不播放测试音。" />
+              </StackPanel>
+            </Grid>
+            <Grid ColumnDefinitions="220,*">
+              <TextBlock Text="输入模式" VerticalAlignment="Center" />
+              <StackPanel Grid.Column="1" Spacing="3">
+                <ComboBox Width="220" HorizontalAlignment="Left"
+                          ItemsSource="{x:Static vm:PrototypeWindow.InputModeOptions}"
+                          SelectedItem="{Binding InputModeChoice, Mode=TwoWay}" />
+                <TextBlock Classes="hint" Text="默认自由说话；按住说话为演示文本，不监听窗口外按键。" />
+              </StackPanel>
+            </Grid>
+            <WrapPanel Margin="0,6,0,0">
+              <Button Classes="tool" Content="模拟设备拔出" Command="{Binding InjectDeviceRemovalCommand}" Margin="0,0,6,6" />
+              <Button Classes="tool" Content="电平 / 播放测试（模拟）"
+                      Command="{Binding ShowMockNoticeCommand}"
+                      CommandParameter="麦克风电平与扬声器测试（模拟）"
+                      Margin="0,0,6,6" />
+            </WrapPanel>
+            <Border Classes="notice" Margin="0,4,0,0"
+                    IsVisible="{Binding DeviceNotice, Converter={x:Static conv:StringConverters.IsNotNullOrEmpty}}">
+              <TextBlock Text="{Binding DeviceNotice}" Classes="hint" TextWrapping="Wrap" />
+            </Border>
+            <TextBlock Classes="caption"
+                       Text="设备、电平与播放测试不访问真实硬件，不产生系统音频效果。"
+                       TextWrapping="Wrap" />
+
+            <Border Height="1" Background="{DynamicResource BorderBrush}" Margin="0,10" />
+
+            <TextBlock Text="快捷键" Classes="subtitle" />
+            <Grid ColumnDefinitions="220,*">
+              <TextBlock Text="全局麦克风静音" VerticalAlignment="Center" />
+              <TextBlock Grid.Column="1" Classes="hint" Text="未绑定（演示）。原型不监听全局按键。" VerticalAlignment="Center" />
+            </Grid>
+            <Grid ColumnDefinitions="220,*">
+              <TextBlock Text="全局关闭扬声器" VerticalAlignment="Center" />
+              <TextBlock Grid.Column="1" Classes="hint" Text="未绑定（演示）。" VerticalAlignment="Center" />
+            </Grid>
+            <Grid ColumnDefinitions="220,*">
+              <TextBlock Text="按住说话" VerticalAlignment="Center" />
+              <TextBlock Grid.Column="1" Classes="hint" Text="未绑定（演示）；窗口内按键不冒充全局快捷键。" VerticalAlignment="Center" />
+            </Grid>
+            <Grid ColumnDefinitions="220,*">
+              <TextBlock Text="显示主窗口" VerticalAlignment="Center" />
+              <TextBlock Grid.Column="1" Classes="hint" Text="未绑定（演示）。" VerticalAlignment="Center" />
+            </Grid>
+            <Button Classes="tool" HorizontalAlignment="Left" Margin="0,6,0,0"
+                    Content="尝试绑定快捷键（模拟）"
+                    Command="{Binding ShowMockNoticeCommand}"
+                    CommandParameter="全局快捷键绑定（模拟）" />
+            <TextBlock Classes="caption" Text="原型不注册全局钩子，不抢占游戏按键，不产生冲突提示以外的行为。" TextWrapping="Wrap" />
+
+            <Border Height="1" Background="{DynamicResource BorderBrush}" Margin="0,10" />
+
+            <TextBlock Text="窗口与启动" Classes="subtitle" />
+            <CheckBox Content="关闭窗口时收至托盘（演示，默认开）" IsChecked="{Binding CloseToTray, Mode=TwoWay}" />
+            <CheckBox Content="开机启动（演示）" IsChecked="{Binding StartOnLogin, Mode=TwoWay}" />
+            <CheckBox Content="启动时静默进入托盘（演示）" IsChecked="{Binding StartHidden, Mode=TwoWay}" />
+            <TextBlock Classes="caption"
+                       Text="原型不注册托盘、不写启动项、不保存凭据；关闭行为不会实际隐藏窗口。"
+                       TextWrapping="Wrap" />
+
+            <Border Height="1" Background="{DynamicResource BorderBrush}" Margin="0,10" />
+
+            <TextBlock Text="关于与诊断" Classes="subtitle" />
+            <Grid ColumnDefinitions="220,*">
+              <TextBlock Text="版本" VerticalAlignment="Center" />
+              <TextBlock Grid.Column="1" Text="交互原型构建 · 无发布版本号" VerticalAlignment="Center" />
+            </Grid>
+            <Grid ColumnDefinitions="220,*">
+              <TextBlock Text="语音传输路径" VerticalAlignment="Center" />
+              <TextBlock Grid.Column="1" Classes="hint" Text="relay（服务端裁决，演示文本；客户端无切换开关）" TextWrapping="Wrap" />
+            </Grid>
+            <Grid ColumnDefinitions="220,*">
+              <TextBlock Text="屏幕共享路径" VerticalAlignment="Center" />
+              <TextBlock Grid.Column="1" Classes="hint" Text="direct（演示文本；自动回落历史未接入）" TextWrapping="Wrap" />
+            </Grid>
+            <Grid ColumnDefinitions="220,*">
+              <TextBlock Text="诊断与路径历史" VerticalAlignment="Center" />
+              <TextBlock Grid.Column="1" Classes="hint" Text="原型未接入，不显示虚构时间线或采集计数。" TextWrapping="Wrap" />
+            </Grid>
+            <TextBlock Classes="caption"
+                       Text="设置章节均为模拟；正式实现所需的设备、托盘、启动与快捷键能力尚未在本原型验证。"
+                       TextWrapping="Wrap" />
+            <Button Classes="tool" HorizontalAlignment="Left"
+                    Content="关于与诊断说明（模拟）"
+                    Command="{Binding ShowMockNoticeCommand}"
+                    CommandParameter="关于与诊断（模拟）" />
+
+            <Border Height="1" Background="{DynamicResource BorderBrush}" Margin="0,10" />
+
+            <TextBlock Text="账号" Classes="subtitle" />
+            <Grid ColumnDefinitions="220,*">
+              <TextBlock Text="当前演示账号" VerticalAlignment="Center" />
+              <TextBlock Grid.Column="1" Text="{Binding Username}" VerticalAlignment="Center" />
+            </Grid>
+            <Button Classes="danger" HorizontalAlignment="Left" Margin="0,6,0,0"
+                    Content="退出登录（清理模拟状态）"
+                    Command="{Binding LogoutCommand}" />
+            <TextBlock Classes="caption"
+                       Text="退出会清空模拟身份、会话、草稿与媒体状态并返回登录；不保留任何持久化数据。"
+                       TextWrapping="Wrap" />
+            <TextBlock Classes="caption"
+                       Text="PROTOTYPE · 演示数据 · 未连接真实服务。关闭设置不会结束通话。"
+                       Margin="0,10,0,14" />
+          </StackPanel>
+        </ScrollViewer>
+      </Grid>
+    </DataTemplate>
+
+    <!-- ============================================ C: call-stage-first main -->
+    <DataTemplate x:Key="CallStageScreenTemplate" x:DataType="vm:DemoState">
+      <Grid RowDefinitions="Auto,*" Margin="14">
+        <StackPanel Grid.Row="0" Spacing="2">
+          <TextBlock Classes="title" Text="通话舞台（演示）" />
+          <TextBlock Text="{Binding CallSummary}" TextWrapping="Wrap" />
+          <TextBlock Classes="hint"
+                     Text="布局 C：通话舞台优先，文字侧栏。主区始终显示通话归属与共享入口；右侧只负责文字。"
+                     TextWrapping="Wrap" />
+        </StackPanel>
+
+        <ScrollViewer Grid.Row="1" Margin="0,10,0,0" HorizontalScrollBarVisibility="Disabled">
+          <StackPanel Spacing="10">
+            <Border Classes="warning-notice" IsVisible="{Binding !IsCallActive}">
+              <TextBlock Text="未加入通话：加入后可观看当前通话频道的共享，但不会自动接收画面；浏览其他频道不会改变观看目标。"
+                         TextWrapping="Wrap" />
+            </Border>
+
+            <Border Classes="panel">
+              <Grid ColumnDefinitions="*,Auto">
+                <StackPanel Spacing="3">
+                  <TextBlock Text="通话归属" Classes="subtitle" />
+                  <TextBlock Text="{Binding CallSummary}" FontWeight="SemiBold" TextWrapping="Wrap" />
+                  <TextBlock Classes="hint"
+                             Text="{Binding StatusText}"
+                             IsVisible="{Binding StatusText, Converter={x:Static conv:StringConverters.IsNotNullOrEmpty}}"
+                             TextWrapping="Wrap" />
+                </StackPanel>
+                <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="6" VerticalAlignment="Top">
+                  <Button Classes="primary" Content="加入语音（模拟）" Command="{Binding JoinCommand}" IsVisible="{Binding !IsCallActive}" />
+                  <Button Classes="danger" Content="离开" Command="{Binding LeaveCommand}" IsVisible="{Binding IsCallActive}" />
+                  <Button Classes="tool" Content="设置" Command="{Binding OpenSettingsCommand}" />
+                </StackPanel>
+              </Grid>
+            </Border>
+
+            <Grid ColumnDefinitions="*,*">
+              <Border Grid.Column="0" Classes="panel" Margin="0,0,6,0">
+                <StackPanel Spacing="8">
+                  <TextBlock Text="参与者（示例）" Classes="subtitle" />
+                  <TextBlock Classes="hint" Text="示例成员，不是服务器成员列表。" />
+                  <StackPanel Spacing="6">
+                    <Grid ColumnDefinitions="Auto,*">
+                      <Border Classes="avatar"><TextBlock Text="阿" Classes="on-brand" HorizontalAlignment="Center" VerticalAlignment="Center" /></Border>
+                      <TextBlock Grid.Column="1" Margin="8,0,0,0" Text="阿岚 · 示例" VerticalAlignment="Center" />
+                    </Grid>
+                    <Grid ColumnDefinitions="Auto,*">
+                      <Border Classes="avatar"><TextBlock Text="满" Classes="on-brand" HorizontalAlignment="Center" VerticalAlignment="Center" /></Border>
+                      <TextBlock Grid.Column="1" Margin="8,0,0,0" Text="小满 · 示例" VerticalAlignment="Center" />
+                    </Grid>
+                    <Grid ColumnDefinitions="Auto,*">
+                      <Border Classes="avatar"><TextBlock Text="我" Classes="on-brand" HorizontalAlignment="Center" VerticalAlignment="Center" /></Border>
+                      <TextBlock Grid.Column="1" Margin="8,0,0,0" Text="我（演示账号）" VerticalAlignment="Center" />
+                    </Grid>
+                  </StackPanel>
+                  <TextBlock Text="语音活动（静态示意，非真实电平）" Classes="caption" Margin="0,4,0,0" />
+                  <StackPanel Orientation="Horizontal" Spacing="4" Height="34" VerticalAlignment="Bottom">
+                    <Border Width="6" Height="12" Background="{DynamicResource BrandBrush}" CornerRadius="2" VerticalAlignment="Bottom" />
+                    <Border Width="6" Height="22" Background="{DynamicResource BrandBrush}" CornerRadius="2" VerticalAlignment="Bottom" />
+                    <Border Width="6" Height="30" Background="{DynamicResource BrandBrush}" CornerRadius="2" VerticalAlignment="Bottom" />
+                    <Border Width="6" Height="16" Background="{DynamicResource BrandBrush}" CornerRadius="2" VerticalAlignment="Bottom" />
+                    <Border Width="6" Height="26" Background="{DynamicResource BrandBrush}" CornerRadius="2" VerticalAlignment="Bottom" />
+                    <Border Width="6" Height="10" Background="{DynamicResource BrandBrush}" CornerRadius="2" VerticalAlignment="Bottom" />
+                    <Border Width="6" Height="20" Background="{DynamicResource BrandBrush}" CornerRadius="2" VerticalAlignment="Bottom" />
+                  </StackPanel>
+                  <TextBlock Classes="caption" Text="不显示真实电平、FPS 或码率。" TextWrapping="Wrap" />
+                </StackPanel>
+              </Border>
+
+              <Border Grid.Column="1" Classes="panel" Margin="6,0,0,0">
+                <StackPanel Spacing="8">
+                  <TextBlock Text="共享 · 仅当前通话频道" Classes="subtitle" />
+                  <TextBlock Classes="hint" Text="未加入通话时不能观看；浏览其他频道不改变此列表归属。" TextWrapping="Wrap" />
+                  <ListBox ItemsSource="{Binding Shares}"
+                           SelectedItem="{Binding SelectedShare, Mode=TwoWay}"
+                           MaxHeight="140" />
+                  <TextBlock Classes="hint" Text="{Binding Shares.Count, StringFormat='共享目标（演示） {0} 个；仅当前通话频道可观看。'}" />
+                  <Button Content="观看所选共享（模拟）"
+                          Command="{Binding WatchCommand}"
+                          IsEnabled="{Binding CanWatch}"
+                          HorizontalAlignment="Stretch" />
+                  <Button Content="停止观看并返回聊天"
+                          Command="{Binding StopWatchCommand}"
+                          IsVisible="{Binding IsWatching}"
+                          HorizontalAlignment="Stretch" />
+                  <Button Content="模拟共享者结束"
+                          Command="{Binding EndShareCommand}"
+                          HorizontalAlignment="Stretch" />
+                  <TextBlock Classes="caption"
+                             Text="共享选择、首帧等待与失败均为演示状态；不访问真实采集。"
+                             TextWrapping="Wrap" />
+                </StackPanel>
+              </Border>
+            </Grid>
+
+            <Border Classes="notice">
+              <StackPanel Spacing="4">
+                <TextBlock Text="为什么这是布局 C" Classes="subtitle" />
+                <TextBlock Classes="hint"
+                           Text="通话舞台与共享入口在主区优先；文字消息被放在右侧栏。A 为频道轨+主区+底部通话条；B 为顶部频道导航+宽主区+底部通话条。三种结构共享同一状态与行为。"
+                           TextWrapping="Wrap" />
+                <TextBlock Classes="caption"
+                           Text="切换布局只改变层级与宽度，不改变通话归属、共享目标或文字频道。"
+                           TextWrapping="Wrap" />
+              </StackPanel>
+            </Border>
+
+            <TextBlock Classes="caption"
+                       Text="PROTOTYPE · 演示数据 · 未连接真实服务。通话控制位于底部通话条。"
+                       Margin="0,0,0,12" />
+          </StackPanel>
+        </ScrollViewer>
+      </Grid>
+    </DataTemplate>
+  </Window.Resources>
+
+  <Grid RowDefinitions="Auto,*">
+    <!-- ================================================= prototype toolbar -->
+    <Border x:Name="DemoBar" Grid.Row="0" Classes="demo-bar">
+      <StackPanel Spacing="6">
+        <WrapPanel>
+          <Border Classes="brand-chip" Margin="0,0,8,4">
+            <TextBlock Text="PROTOTYPE" Classes="on-brand" FontWeight="SemiBold" FontSize="11" />
+          </Border>
+          <TextBlock Text="交互原型 · 演示数据 · 未连接真实服务"
+                     FontWeight="SemiBold"
+                     VerticalAlignment="Center"
+                     Margin="0,0,12,4" />
+          <TextBlock Text="所有状态为合成演示，不代表真实网络、设备或媒体结果。"
+                     Classes="hint"
+                     VerticalAlignment="Center"
+                     Margin="0,0,12,4" />
+          <TextBlock Text="布局、主题、字号与场景工具仅属于原型，不在产品界面内。"
+                     Classes="caption"
+                     VerticalAlignment="Center"
+                     Margin="0,0,0,4" />
+        </WrapPanel>
+
+        <WrapPanel>
+          <TextBlock Classes="hint" Text="布局方向" VerticalAlignment="Center" Margin="0,0,4,4" />
+          <ComboBox Width="70" Margin="0,0,8,4"
+                    ItemsSource="{x:Static vm:PrototypeWindow.VariantOptions}"
+                    SelectedItem="{Binding Variant, Mode=TwoWay}" />
+          <TextBlock Classes="caption"
+                     Text="A 频道轨+主区+通话条 · B 顶部频道导航+宽主区 · C 通话舞台优先+文字侧栏"
+                     VerticalAlignment="Center"
+                     Margin="0,0,12,4" />
+          <TextBlock Classes="hint" Text="主题" VerticalAlignment="Center" Margin="0,0,4,4" />
+          <ComboBox Width="110" Margin="0,0,8,4"
+                    ItemsSource="{x:Static vm:PrototypeWindow.ThemeOptions}"
+                    SelectedItem="{Binding ThemeChoice, Mode=TwoWay}" />
+          <TextBlock Classes="hint" Text="字号" VerticalAlignment="Center" Margin="0,0,4,4" />
+          <ComboBox Width="90" Margin="0,0,8,4"
+                    ItemsSource="{x:Static vm:PrototypeWindow.TextSizeOptions}"
+                    SelectedItem="{Binding TextSizeChoice, Mode=TwoWay}" />
+          <CheckBox Content="显示检查区" IsChecked="{Binding ShowInspector, Mode=TwoWay}" Margin="0,0,0,4" />
+        </WrapPanel>
+
+        <ScrollViewer HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled">
+          <StackPanel Orientation="Horizontal">
+          <TextBlock Classes="hint" Text="场景工具" VerticalAlignment="Center" Margin="0,0,6,4" />
+          <Button Classes="tool" Content="注入新消息" Command="{Binding InjectMessageCommand}" Margin="0,0,6,4" />
+          <Button Classes="tool" Content="标记历史已读" Command="{Binding MarkReadingHistoryCommand}" Margin="0,0,6,4" />
+          <Button Classes="tool" Content="回到最新" Command="{Binding JumpToLatestCommand}" Margin="0,0,6,4" />
+          <Button Classes="tool" Content="设备拔出" Command="{Binding InjectDeviceRemovalCommand}" Margin="0,0,6,4" />
+          <Button Classes="tool" Content="模拟断线" Command="{Binding DisconnectCommand}" Margin="0,0,6,4" />
+          <Button Classes="tool" Content="模拟重连" Command="{Binding ReconnectCommand}" Margin="0,0,6,4" />
+          <Button Classes="tool" Content="模拟共享结束" Command="{Binding EndShareCommand}" Margin="0,0,6,4" />
+          <Button Classes="tool" Content="模拟说明" Command="{Binding ShowMockNoticeCommand}"
+                  CommandParameter="设备 / 快捷键 / 托盘 / 启动（模拟）" Margin="0,0,12,4" />
+          <Button Classes="tool" Content="演示登录"
+                  Command="{Binding LoginCommand}"
+                  IsVisible="{Binding !IsLoggedIn}"
+                  Margin="0,0,6,4" />
+          <Button Classes="tool" Content="加入浏览频道"
+                  Command="{Binding JoinCommand}"
+                  IsVisible="{Binding IsLoggedIn}"
+                  Margin="0,0,6,4" />
+          <Button Classes="tool" Content="打开设置"
+                  Command="{Binding OpenSettingsCommand}"
+                  IsVisible="{Binding IsLoggedIn}"
+                  Margin="0,0,12,4" />
+          <CheckBox Content="下次发布失败" IsChecked="{Binding FailNextPublish, Mode=TwoWay}" Margin="0,0,10,4" />
+          <CheckBox Content="下次发送失败" IsChecked="{Binding FailNextSend, Mode=TwoWay}" Margin="0,0,10,4" />
+          <CheckBox Content="下次转移失败" IsChecked="{Binding FailNextTransfer, Mode=TwoWay}" Margin="0,0,0,4" />
+          </StackPanel>
+        </ScrollViewer>
+      </StackPanel>
+    </Border>
+
+    <Grid Grid.Row="1">
+      <!-- ========================================================= login -->
+      <Grid x:Name="LoginHost" IsVisible="{Binding !IsLoggedIn}" Margin="24">
+        <ScrollViewer HorizontalScrollBarVisibility="Disabled">
+          <Border Classes="panel"
+                  MaxWidth="420"
+                  Padding="24"
+                  HorizontalAlignment="Center"
+                  VerticalAlignment="Center">
+            <StackPanel Spacing="12">
+              <StackPanel Spacing="5">
+                <TextBlock Text="PartyUp" Classes="brand" FontSize="28" />
+                <TextBlock Text="自托管开黑频道 · 交互原型" Classes="hint" />
+                <Border Classes="brand-chip" HorizontalAlignment="Left">
+                  <TextBlock Text="PROTOTYPE · 演示数据 · 未连接真实服务" Classes="on-brand" FontSize="11" />
+                </Border>
+              </StackPanel>
+
+              <Border Height="1" Background="{DynamicResource BorderBrush}" />
+
+              <StackPanel Spacing="4">
+                <TextBlock Text="服务器地址" Classes="hint" />
+                <TextBox Text="{Binding ServerAddress, Mode=TwoWay}" PlaceholderText="example.invalid" />
+              </StackPanel>
+              <StackPanel Spacing="4">
+                <TextBlock Text="用户名" Classes="hint" />
+                <TextBox Text="{Binding Username, Mode=TwoWay}" PlaceholderText="demo" />
+              </StackPanel>
+              <StackPanel Spacing="4">
+                <TextBlock Text="密码" Classes="hint" />
+                <TextBox Text="{Binding Password, Mode=TwoWay}" PasswordChar="●" />
+              </StackPanel>
+
+              <CheckBox Content="注册新账号（演示）" IsChecked="{Binding IsRegistering, Mode=TwoWay}" />
+              <StackPanel Spacing="4" IsVisible="{Binding IsRegistering}">
+                <TextBlock Text="邀请码" Classes="hint" />
+                <TextBox Text="{Binding InviteCode, Mode=TwoWay}" PlaceholderText="演示邀请码 DEMO-2026" />
+                <TextBlock Classes="caption" Text="无效邀请码会在原处报错；不发送真实注册请求。" />
+              </StackPanel>
+
+              <Border Classes="danger-notice"
+                      IsVisible="{Binding LoginError, Converter={x:Static conv:StringConverters.IsNotNullOrEmpty}}">
+                <TextBlock Text="{Binding LoginError}" Classes="danger" TextWrapping="Wrap" />
+              </Border>
+
+              <Button Command="{Binding LoginCommand}"
+                      IsEnabled="{Binding !IsBusy}"
+                      Classes="primary"
+                      HorizontalAlignment="Stretch">
+                <Grid>
+                  <TextBlock Text="进入演示" IsVisible="{Binding !IsBusy}" HorizontalAlignment="Center" />
+                  <TextBlock Text="登录中…（模拟）" IsVisible="{Binding IsBusy}" HorizontalAlignment="Center" />
+                </Grid>
+              </Button>
+
+              <TextBlock Classes="hint"
+                         Text="不发送真实登录请求；输入只保留在内存。空字段或无效邀请码会就近显示错误。"
+                         TextWrapping="Wrap" />
+              <TextBlock Classes="caption"
+                         Text="界面原型，无发布版本号。主题与文字大小可在上方演示工具栏切换；登录界面不显示通话工具条。"
+                         TextWrapping="Wrap" />
+            </StackPanel>
+          </Border>
+        </ScrollViewer>
+      </Grid>
+
+      <!-- ========================================================== app -->
+      <Grid x:Name="AppHost" IsVisible="{Binding IsLoggedIn}">
+        <!-- A: channel rail + stage + info side + bottom call bar -->
+        <Grid x:Name="ShellA" IsVisible="False" RowDefinitions="*,Auto" ColumnDefinitions="232,*,288">
+          <Border x:Name="NavRailA" Grid.Row="0" Grid.Column="0" Classes="nav-rail">
+            <Grid RowDefinitions="Auto,*,Auto">
+              <StackPanel Margin="14,14,14,10" Spacing="3">
+                <TextBlock Text="PartyUp" Classes="brand" />
+                <TextBlock Text="演示服务器 · example.invalid" Classes="caption" />
+                <TextBlock Classes="hint" Text="已连接（模拟）" IsVisible="{Binding IsConnected}" />
+                <TextBlock Classes="danger" Text="断线（模拟）" IsVisible="{Binding !IsConnected}" />
+              </StackPanel>
+
+              <StackPanel Grid.Row="1" Margin="8,4">
+                <TextBlock Text="频道 · 点击仅浏览" Classes="caption" Margin="8,0,0,4" />
+                <ListBox ItemsSource="{Binding Channels}"
+                         SelectedItem="{Binding BrowseChannel, Mode=TwoWay}" />
+                <TextBlock Classes="hint"
+                           Text="切换频道不会加入、离开或转移通话；显式点击加入才改变通话。"
+                           TextWrapping="Wrap"
+                           Margin="8,6,8,0" />
+              </StackPanel>
+
+              <StackPanel Grid.Row="2" Margin="10,8,10,12" Spacing="8">
+                <Border Classes="card" Padding="10">
+                  <Grid ColumnDefinitions="Auto,*">
+                    <Border Classes="avatar">
+                      <TextBlock Text="我" Classes="on-brand" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                    </Border>
+                    <StackPanel Grid.Column="1" Margin="8,0,0,0" Spacing="1">
+                      <TextBlock Text="{Binding Username}" FontWeight="SemiBold" />
+                      <StackPanel Orientation="Horizontal" Spacing="6">
+                        <TextBlock Classes="danger" Text="麦克风已静音" IsVisible="{Binding IsMuted}" />
+                        <TextBlock Classes="hint" Text="麦克风开" IsVisible="{Binding !IsMuted}" />
+                        <TextBlock Classes="warning" Text="扬声器关" IsVisible="{Binding IsDeafened}" />
+                      </StackPanel>
+                    </StackPanel>
+                  </Grid>
+                </Border>
+                <Grid ColumnDefinitions="*,*">
+                  <Button Grid.Column="0" Content="静音" Command="{Binding MuteCommand}" Margin="0,0,4,0" />
+                  <Button Grid.Column="1" Content="闭音" Command="{Binding DeafenCommand}" Margin="4,0,0,0" />
+                </Grid>
+                <Button Content="设置" Command="{Binding OpenSettingsCommand}" HorizontalAlignment="Stretch" />
+                <Button Content="退出登录" Command="{Binding LogoutCommand}" Classes="subtle" HorizontalAlignment="Stretch" />
+              </StackPanel>
+            </Grid>
+          </Border>
+
+          <ContentControl x:Name="StageA"
+                          Grid.Row="0"
+                          Grid.Column="1"
+                          Content="{Binding}"
+                          HorizontalContentAlignment="Stretch"
+                          VerticalContentAlignment="Stretch" />
+
+          <Border x:Name="SideA" Grid.Row="0" Grid.Column="2" Classes="info-side">
+            <ContentControl Content="{Binding}"
+                            ContentTemplate="{StaticResource ContextSideTemplate}"
+                            HorizontalContentAlignment="Stretch"
+                            VerticalContentAlignment="Stretch" />
+          </Border>
+
+          <Border Grid.Row="1" Grid.ColumnSpan="3" Classes="callbar">
+            <ContentControl Content="{Binding}"
+                            ContentTemplate="{StaticResource CallBarTemplate}"
+                            HorizontalContentAlignment="Stretch"
+                            VerticalContentAlignment="Stretch" />
+          </Border>
+        </Grid>
+
+        <!-- B: top channel navigation + wide stage + bottom call bar -->
+        <Grid x:Name="ShellB" IsVisible="False" RowDefinitions="Auto,*,Auto" ColumnDefinitions="*,288">
+          <Border x:Name="TopNavB" Grid.Row="0" Grid.ColumnSpan="2" Classes="topnav">
+            <Grid ColumnDefinitions="Auto,*,Auto" Margin="12,8">
+              <StackPanel Orientation="Horizontal" Spacing="12">
+                <TextBlock Text="PartyUp" Classes="brand" VerticalAlignment="Center" />
+                <ScrollViewer HorizontalScrollBarVisibility="Auto"
+                              VerticalScrollBarVisibility="Disabled"
+                              MaxWidth="560">
+                  <ListBox ItemsSource="{Binding Channels}"
+                           SelectedItem="{Binding BrowseChannel, Mode=TwoWay}">
+                    <ListBox.ItemsPanel>
+                      <ItemsPanelTemplate>
+                        <StackPanel Orientation="Horizontal" />
+                      </ItemsPanelTemplate>
+                    </ListBox.ItemsPanel>
+                  </ListBox>
+                </ScrollViewer>
+              </StackPanel>
+              <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                <TextBlock Classes="hint" Text="已连接（模拟）" IsVisible="{Binding IsConnected}" VerticalAlignment="Center" />
+                <TextBlock Classes="danger" Text="断线（模拟）" IsVisible="{Binding !IsConnected}" VerticalAlignment="Center" />
+                <Button Classes="tool" Content="设置" Command="{Binding OpenSettingsCommand}" />
+                <Button Classes="tool" Content="退出" Command="{Binding LogoutCommand}" />
+              </StackPanel>
+            </Grid>
+          </Border>
+
+          <ContentControl x:Name="StageB"
+                          Grid.Row="1"
+                          Grid.Column="0"
+                          Content="{Binding}"
+                          HorizontalContentAlignment="Stretch"
+                          VerticalContentAlignment="Stretch" />
+
+          <Border x:Name="SideB" Grid.Row="1" Grid.Column="1" Classes="info-side">
+            <ContentControl Content="{Binding}"
+                            ContentTemplate="{StaticResource ContextSideTemplate}"
+                            HorizontalContentAlignment="Stretch"
+                            VerticalContentAlignment="Stretch" />
+          </Border>
+
+          <Border Grid.Row="2" Grid.ColumnSpan="2" Classes="callbar">
+            <ContentControl Content="{Binding}"
+                            ContentTemplate="{StaticResource CallBarTemplate}"
+                            HorizontalContentAlignment="Stretch"
+                            VerticalContentAlignment="Stretch" />
+          </Border>
+        </Grid>
+
+        <!-- C: call-stage-first main + text side + bottom call bar -->
+        <Grid x:Name="ShellC" IsVisible="False" RowDefinitions="Auto,*,Auto" ColumnDefinitions="*,340">
+          <Border x:Name="TopNavC" Grid.Row="0" Grid.ColumnSpan="2" Classes="topnav">
+            <Grid ColumnDefinitions="Auto,*,Auto" Margin="12,6">
+              <TextBlock Text="PartyUp" Classes="brand" VerticalAlignment="Center" FontSize="18" />
+              <ScrollViewer Grid.Column="1"
+                            Margin="16,0"
+                            HorizontalScrollBarVisibility="Auto"
+                            VerticalScrollBarVisibility="Disabled">
+                <ListBox ItemsSource="{Binding Channels}"
+                         SelectedItem="{Binding BrowseChannel, Mode=TwoWay}">
+                  <ListBox.ItemsPanel>
+                    <ItemsPanelTemplate>
+                      <StackPanel Orientation="Horizontal" />
+                    </ItemsPanelTemplate>
+                  </ListBox.ItemsPanel>
+                </ListBox>
+              </ScrollViewer>
+              <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                <TextBlock Classes="hint" Text="已连接（模拟）" IsVisible="{Binding IsConnected}" VerticalAlignment="Center" />
+                <TextBlock Classes="danger" Text="断线（模拟）" IsVisible="{Binding !IsConnected}" VerticalAlignment="Center" />
+                <Button Classes="tool" Content="设置" Command="{Binding OpenSettingsCommand}" />
+                <Button Classes="tool" Content="退出" Command="{Binding LogoutCommand}" />
+              </StackPanel>
+            </Grid>
+          </Border>
+
+          <ContentControl x:Name="StageC"
+                          Grid.Row="1"
+                          Grid.Column="0"
+                          Content="{Binding}"
+                          HorizontalContentAlignment="Stretch"
+                          VerticalContentAlignment="Stretch" />
+
+          <Border x:Name="SideC" Grid.Row="1" Grid.Column="1" Classes="info-side">
+            <ContentControl Content="{Binding}"
+                            ContentTemplate="{StaticResource ChatSideTemplate}"
+                            HorizontalContentAlignment="Stretch"
+                            VerticalContentAlignment="Stretch" />
+          </Border>
+
+          <Border Grid.Row="2" Grid.ColumnSpan="2" Classes="callbar">
+            <ContentControl Content="{Binding}"
+                            ContentTemplate="{StaticResource CallBarTemplate}"
+                            HorizontalContentAlignment="Stretch"
+                            VerticalContentAlignment="Stretch" />
+          </Border>
+        </Grid>
+      </Grid>
+
+      <!-- ==================================================== inspector -->
+      <Border x:Name="InspectorHost"
+              Classes="inspector"
+              Width="400"
+              HorizontalAlignment="Right"
+              VerticalAlignment="Stretch"
+              IsVisible="{Binding ShowInspector}">
+        <Grid RowDefinitions="Auto,*">
+          <StackPanel Margin="14,12,14,6" Spacing="4">
+            <TextBlock Text="原型检查区" Classes="subtitle" />
+            <TextBlock Classes="hint"
+                       Text="不属于产品界面。只读显示完整模拟状态；不触发网络、设备或媒体动作。"
+                       TextWrapping="Wrap" />
+            <CheckBox Content="显示检查区" IsChecked="{Binding ShowInspector, Mode=TwoWay}" />
+          </StackPanel>
+
+          <ScrollViewer Grid.Row="1" Margin="14,0,14,14" HorizontalScrollBarVisibility="Disabled">
+            <StackPanel Spacing="10">
+              <TextBlock Text="完整状态快照（由 DemoState 生成）" Classes="caption" />
+              <SelectableTextBlock Text="{Binding InspectorText}" Classes="mono" TextWrapping="Wrap" />
+
+              <Border Height="1" Background="{DynamicResource BorderBrush}" />
+
+              <TextBlock Text="关键字段" Classes="caption" />
+              <StackPanel Spacing="5">
+                <Grid ColumnDefinitions="110,*">
+                  <TextBlock Text="布局方向" Classes="hint" />
+                  <TextBlock Grid.Column="1" Text="{Binding Variant}" />
+                </Grid>
+                <Grid ColumnDefinitions="110,*">
+                  <TextBlock Text="主题 / 字号" Classes="hint" />
+                  <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8">
+                    <TextBlock Text="{Binding ThemeChoice}" />
+                    <TextBlock Text="·" />
+                    <TextBlock Text="{Binding TextSizeChoice}" />
+                  </StackPanel>
+                </Grid>
+                <Grid ColumnDefinitions="110,*">
+                  <TextBlock Text="登录 / 连接" Classes="hint" />
+                  <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8">
+                    <TextBlock Text="登录" IsVisible="{Binding IsLoggedIn}" />
+                    <TextBlock Text="未登录" IsVisible="{Binding !IsLoggedIn}" />
+                    <TextBlock Text="已连接" IsVisible="{Binding IsConnected}" />
+                    <TextBlock Text="断线" IsVisible="{Binding !IsConnected}" />
+                  </StackPanel>
+                </Grid>
+                <Grid ColumnDefinitions="110,*">
+                  <TextBlock Text="浏览频道" Classes="hint" />
+                  <TextBlock Grid.Column="1" Text="{Binding BrowseChannel}" />
+                </Grid>
+                <Grid ColumnDefinitions="110,*">
+                  <TextBlock Text="通话频道" Classes="hint" />
+                  <TextBlock Grid.Column="1" Text="{Binding CallSummary}" TextWrapping="Wrap" />
+                </Grid>
+                <Grid ColumnDefinitions="110,*">
+                  <TextBlock Text="待转移" Classes="hint" />
+                  <TextBlock Grid.Column="1" Text="{Binding PendingChannel, TargetNullValue=无}" />
+                </Grid>
+                <Grid ColumnDefinitions="110,*">
+                  <TextBlock Text="转移失败" Classes="hint" />
+                  <TextBlock Grid.Column="1" Text="是" IsVisible="{Binding HasTransferFailure}" />
+                  <TextBlock Grid.Column="1" Text="否" IsVisible="{Binding !HasTransferFailure}" />
+                </Grid>
+                <Grid ColumnDefinitions="110,*">
+                  <TextBlock Text="发布 / 观看" Classes="hint" />
+                  <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8">
+                    <TextBlock Text="发布中" IsVisible="{Binding IsPublishing}" />
+                    <TextBlock Text="未发布" IsVisible="{Binding !IsPublishing}" />
+                    <TextBlock Text="观看中" IsVisible="{Binding IsWatching}" />
+                    <TextBlock Text="未观看" IsVisible="{Binding !IsWatching}" />
+                  </StackPanel>
+                </Grid>
+                <Grid ColumnDefinitions="110,*">
+                  <TextBlock Text="观看目标" Classes="hint" />
+                  <TextBlock Grid.Column="1" Text="{Binding SelectedShare}" />
+                </Grid>
+                <Grid ColumnDefinitions="110,*">
+                  <TextBlock Text="静音 / 闭音" Classes="hint" />
+                  <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8">
+                    <TextBlock Text="静音" IsVisible="{Binding IsMuted}" />
+                    <TextBlock Text="未静音" IsVisible="{Binding !IsMuted}" />
+                    <TextBlock Text="闭音" IsVisible="{Binding IsDeafened}" />
+                    <TextBlock Text="扬声器开" IsVisible="{Binding !IsDeafened}" />
+                  </StackPanel>
+                </Grid>
+                <Grid ColumnDefinitions="110,*">
+                  <TextBlock Text="检查区" Classes="hint" />
+                  <TextBlock Grid.Column="1" Text="显示中（原型工具）" />
+                </Grid>
+              </StackPanel>
+              <TextBlock Classes="caption"
+                         Text="场景工具在窗口顶部，与产品区域分开；检查区不保存任何数据。"
+                         TextWrapping="Wrap" />
+            </StackPanel>
+          </ScrollViewer>
+        </Grid>
+      </Border>
+    </Grid>
+  </Grid>
+</Window>

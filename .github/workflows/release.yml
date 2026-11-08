@@ -137,6 +137,12 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:PREV)) { throw '没有上一个 v* release 可复用' }
           New-Item -ItemType Directory -Force artifacts | Out-Null
           New-Item -ItemType Directory -Force artifacts/velopack | Out-Null
+          # 只有在 prev 是"已发布"的 release 时才能被 gh release download 取到；
+          # 若它还是 draft，给出可操作的提示而不是让 gh 抛一个看不懂的 404。
+          $prevInfo = gh release view $env:PREV --json isDraft,assets | ConvertFrom-Json
+          if ($prevInfo.isDraft) {
+            throw "上一个 release $env:PREV 仍是 draft：先在网页上发布它，或这次改回全量打包（把 VERSION 改回去重推 tag）"
+          }
           if ($env:NEED_CLIENT -ne 'true') {
             # 客户端三件套 + 整份 Velopack feed（feed 与 nupkg 的文件名必须原样保留）
             gh release download $env:PREV --dir artifacts --clobber `

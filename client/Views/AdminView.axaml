@@ -154,6 +154,51 @@
         </StackPanel>
       </Border>
 
+      <!-- 频道：owner/admin 的建 / 改名+描述 / 删入口（服务端 /api/admin/channels）。
+           以前这里没有入口，只能改库——owner/管理员根本没有地方新建频道。 -->
+      <Border Padding="12" CornerRadius="10" BorderThickness="1"
+              BorderBrush="{DynamicResource SemiColorBorder}"
+              Background="{DynamicResource SemiColorBackground1}">
+        <StackPanel Spacing="8">
+          <TextBlock Text="频道" FontWeight="SemiBold" />
+          <TextBlock Text="新建后所有客户端刷新频道列表即可看到；重命名/删除立即生效。删除要求该频道里没人。"
+                     Classes="caption" TextWrapping="Wrap" />
+          <Grid ColumnDefinitions="*,12,240">
+            <TextBox Grid.Column="0" Text="{Binding NewChannelName, Mode=TwoWay}"
+                     PlaceholderText="频道名称（1–64 字）"
+                     AutomationProperties.AutomationId="AdminChannelName" />
+            <TextBox Grid.Column="2" Text="{Binding NewChannelDescription, Mode=TwoWay}"
+                     PlaceholderText="描述（可选）"
+                     AutomationProperties.AutomationId="AdminChannelDescription" />
+          </Grid>
+          <StackPanel Orientation="Horizontal" Spacing="8">
+            <Button Content="新建频道" Command="{Binding CreateChannelCommand}" Classes="Primary"
+                    Theme="{StaticResource SolidButton}" IsEnabled="{Binding CanCreateChannel}"
+                    AutomationProperties.AutomationId="AdminCreateChannel" />
+            <Button Content="保存修改" Command="{Binding SaveChannelCommand}" IsEnabled="{Binding CanSaveChannel}"
+                    AutomationProperties.AutomationId="AdminSaveChannel" />
+            <Button Content="删除频道" Command="{Binding DeleteChannelCommand}" IsEnabled="{Binding CanDeleteChannel}"
+                    AutomationProperties.AutomationId="AdminDeleteChannel" />
+          </StackPanel>
+          <TextBlock Text="{Binding ChannelEditingHint}" Classes="caption" TextWrapping="Wrap" />
+          <ListBox ItemsSource="{Binding Channels}" SelectedItem="{Binding SelectedChannel, Mode=TwoWay}"
+                   MaxHeight="180" AutomationProperties.AutomationId="AdminChannels">
+            <ListBox.ItemTemplate>
+              <DataTemplate x:DataType="vm:AdminChannelRow">
+                <Grid ColumnDefinitions="*,Auto" Margin="0,3">
+                  <StackPanel Grid.Column="0" Spacing="1">
+                    <TextBlock Text="{Binding Name}" FontWeight="SemiBold" />
+                    <TextBlock Text="{Binding DescriptionCaption}" Classes="caption" TextWrapping="Wrap" />
+                  </StackPanel>
+                  <TextBlock Grid.Column="1" Text="{Binding CreatedCaption}" Classes="caption"
+                             VerticalAlignment="Center" Margin="8,0,0,0" />
+                </Grid>
+              </DataTemplate>
+            </ListBox.ItemTemplate>
+          </ListBox>
+        </StackPanel>
+      </Border>
+
       <!-- 邀请 -->
       <Border Padding="12" CornerRadius="10" BorderThickness="1"
               BorderBrush="{DynamicResource SemiColorBorder}"

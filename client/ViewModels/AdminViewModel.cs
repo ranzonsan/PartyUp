@@ -95,6 +95,50 @@ public sealed partial class AdminViewModel : ObservableObject
     /// <summary>邀请码生成权限由服务端设置决定（owner/admin/all），界面不预判，失败就显示原因。</summary>
     public bool CanCreateInvite => true;
 
+    // ---------------- 频道 ----------------
+    // 只有 owner/admin 能进这个页面，所以建/改名/删的入口放这里；服务端同样按 RoleAdmin 授权。
+    public ObservableCollection<AdminChannelRow> Channels { get; } = new();
+
+    [ObservableProperty]
+    private AdminChannelRow? _selectedChannel;
+
+    /// <summary>新建时填的名字；选中某一行时会被该行的名字预填，用于改名。</summary>
+    [ObservableProperty]
+    private string _newChannelName = string.Empty;
+
+    [ObservableProperty]
+    private string _newChannelDescription = string.Empty;
+
+    partial void OnSelectedChannelChanged(AdminChannelRow? value)
+    {
+        if (value is not null)
+        {
+            NewChannelName = value.Name;
+            NewChannelDescription = value.Description;
+        }
+        OnPropertyChanged(nameof(CanCreateChannel));
+        OnPropertyChanged(nameof(CanSaveChannel));
+        OnPropertyChanged(nameof(CanDeleteChannel));
+        OnPropertyChanged(nameof(ChannelEditingHint));
+    }
+
+    partial void OnNewChannelNameChanged(string value)
+    {
+        OnPropertyChanged(nameof(CanCreateChannel));
+        OnPropertyChanged(nameof(CanSaveChannel));
+    }
+
+    /// <summary>没选中任何行时才允许新建（选中时名称框里是那一行，避免"拿旧名字一键新建"）。</summary>
+    public bool CanCreateChannel => SelectedChannel is null && !string.IsNullOrWhiteSpace(NewChannelName);
+
+    public bool CanSaveChannel => SelectedChannel is not null && !string.IsNullOrWhiteSpace(NewChannelName);
+
+    public bool CanDeleteChannel => SelectedChannel is not null;
+
+    public string ChannelEditingHint => SelectedChannel is null
+        ? "填名称后点「新建频道」。"
+        : $"正在编辑「{SelectedChannel.Name}」：改完点「保存修改」；删除需要再点一次确认。";
+
     // ---------------- 审计 ----------------
     public ObservableCollection<string> AuditLines { get; } = new();
 
@@ -221,6 +265,15 @@ public sealed partial class AdminViewModel : ObservableObject
         {
             Invites.Add(invite);
         }
+
+        // 频道列表：刷新后保持"没选中"，避免编辑框预填成一个已过期的行。
+        var channels = await _api.GetChannelsAsync();
+        Channels.Clear();
+        foreach (var channel in channels)
+        {
+            Channels.Add(new AdminChannelRow(channel));
+        }
+        SelectedChannel = null;
 
         var audit = await _api.GetAuditAsync(limit: 100);
         AuditLines.Clear();
@@ -394,6 +447,73 @@ public sealed partial class AdminViewModel : ObservableObject
                     StatusText = "设置已保存（最大共享路数需重启服务端生效）";
                 }
             });
+    }
+
+    // ------------------------------------------------------------------
+    // 频道命令：新建 / 保存改名+描述 / 删除
+    // ------------------------------------------------------------------
+
+    [RelayCommand]
+    private async Task CreateChannelAsync()
+    {
+        var name = NewChannelName.Trim();
+        if (name.Length == 0)
+        {
+            ErrorText = "频道名称不能为空。";
+            return;
+        }
+        var description = NewChannelDescription.Trim();
+        await RunAsync($"已新建频道「{name}」", () => _api.CreateChannelAsync(name, description));
+        // RunAsync 成功后会重载列表；清空输入框，避免手滑再建一个同名频道。
+        NewChannelName = string.Empty;
+        NewChannelDescription = string.Empty;
+    }
+
+    [RelayCommand]
+    private async Task SaveChannelAsync()
+    {
+        if (SelectedChannel is not { } target)
+        {
+            return;
+        }
+        var name = NewChannelName.Trim();
+        if (name.Length == 0)
+        {
+            ErrorText = "频道名称不能为空。";
+            return;
+        }
+        var description = NewChannelDescription.Trim();
+        // 只发真正改了的字段：服务端 PATCH 用 *string 区分「没传」与「清空」。
+        var newName = string.Equals(name, target.Name, StringComparison.Ordinal) ? null : name;
+        var newDescription = string.Equals(description, target.Description, StringComparison.Ordinal) ? null : description;
+        if (newName is null && newDescription is null)
+        {
+            StatusText = "没有改动。";
+            return;
+        }
+        await RunAsync($"已保存频道「{name}」", () => _api.PatchChannelAsync(target.Id, newName, newDescription));
+    }
+
+    // 删除是破坏性操作：第一次点击只"上膛"，8 秒内再点同一个频道才真删。
+    private string? _deleteArmedChannelId;
+    private DateTime _deleteArmedAt;
+
+    [RelayCommand]
+    private async Task DeleteChannelAsync()
+    {
+        if (SelectedChannel is not { } target)
+        {
+            return;
+        }
+        if (_deleteArmedChannelId != target.Id || (DateTime.UtcNow - _deleteArmedAt).TotalSeconds > 8)
+        {
+            _deleteArmedChannelId = target.Id;
+            _deleteArmedAt = DateTime.UtcNow;
+            StatusText = $"再点一次「删除频道」确认删除「{target.Name}」（8 秒内有效）";
+            return;
+        }
+        _deleteArmedChannelId = null;
+        await RunAsync($"已删除频道「{target.Name}」", () => _api.DeleteChannelAsync(target.Id));
     }
 
     [RelayCommand]

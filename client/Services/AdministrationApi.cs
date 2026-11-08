@@ -83,6 +83,62 @@ public sealed class AdministrationApi : IDisposable
         }
     }
 
+    // ------------------------------------------------------------------
+    // 频道（owner/admin）：建 / 改名或改描述 / 删
+    // ------------------------------------------------------------------
+
+    public async Task<IReadOnlyList<AdminChannelDto>> GetChannelsAsync(CancellationToken ct = default) =>
+        (await GetAsync<ChannelsEnvelope>("api/admin/channels", ct)).Channels ?? new List<AdminChannelDto>();
+
+    public Task<AdminChannelDto> CreateChannelAsync(
+        string name, string? description, CancellationToken ct = default) =>
+        PostAsync<AdminChannelDto>(
+            "api/admin/channels",
+            new { name, description = description ?? string.Empty },
+            ct);
+
+    /// <summary>PATCH 只发要改的字段：null 表示不动（服务端用 *string 区分"没传"与"清空"）。</summary>
+    public async Task<AdminChannelDto> PatchChannelAsync(
+        string id, string? name, string? description, CancellationToken ct = default)
+    {
+        var patch = new Dictionary<string, object?> { ["id"] = id };
+        if (name is not null)
+        {
+            patch["name"] = name;
+        }
+        if (description is not null)
+        {
+            patch["description"] = description;
+        }
+        using var request = new HttpRequestMessage(HttpMethod.Patch, "api/admin/channels")
+        {
+            Content = JsonContent.Create(patch, options: JsonDefaults.Options),
+        };
+        request.Headers.Authorization = Bearer();
+        using var response = await _http.SendAsync(request, ct);
+        var body = await response.Content.ReadAsStringAsync(ct);
+        if (!response.IsSuccessStatusCode)
+        {
+            throw BuildError(response.StatusCode, body);
+        }
+        return JsonSerializer.Deserialize<AdminChannelDto>(body, JsonDefaults.Options)
+               ?? throw new PartyUpApiException("INTERNAL", "empty channel response");
+    }
+
+    /// <summary>删除频道。服务端会拒绝"还有人在里面"的频道（CONFLICT）。</summary>
+    public async Task DeleteChannelAsync(string id, CancellationToken ct = default)
+    {
+        using var request = new HttpRequestMessage(
+            HttpMethod.Delete, $"api/admin/channels?id={Uri.EscapeDataString(id)}");
+        request.Headers.Authorization = Bearer();
+        using var response = await _http.SendAsync(request, ct);
+        var body = await response.Content.ReadAsStringAsync(ct);
+        if (!response.IsSuccessStatusCode)
+        {
+            throw BuildError(response.StatusCode, body);
+        }
+    }
+
     public Task<ServerSettingsDto> GetSettingsAsync(CancellationToken ct = default) =>
         GetAsync<ServerSettingsDto>("api/admin/settings", ct);
 
@@ -121,6 +177,7 @@ public sealed class AdministrationApi : IDisposable
     private sealed record InvitesEnvelope(List<AdminInviteDto>? Invites);
     private sealed record AuditEnvelope(List<AdminAuditEventDto>? Events);
     private sealed record InviteEnvelope(AdminInviteCreateDto? Invite);
+    private sealed record ChannelsEnvelope(List<AdminChannelDto>? Channels);
 
     /// <summary>所有权转移（仅 owner）。</summary>
     public Task TransferOwnershipAsync(string memberId, CancellationToken ct = default) =>

@@ -344,12 +344,48 @@ public sealed partial class ShellViewModel : ObservableObject
     }
 
     [RelayCommand]
-    private void CloseAdmin()
+    private async Task CloseAdminAsync()
     {
         ShowAdmin = false;
         Admin = null;
         OnPropertyChanged(nameof(IsAdminOverlayVisible));
         AppLog.Info("gui: admin panel closed");
+
+        // 面板里可能刚建/改名/删了频道：关掉后把左栏列表同步一次。
+        // 只重建列表、不重新 browse 当前频道（同 id 时 OnBrowseChannelChanged 直接返回，不会闪）。
+        if (_connection is { } connection)
+        {
+            try
+            {
+                await RefreshChannelListOnlyAsync(connection);
+            }
+            catch (Exception ex)
+            {
+                AppLog.Warn("gui: refresh channel list after admin failed: " + ex.Message);
+            }
+        }
+    }
+
+    /// <summary>
+    /// 只刷新左栏频道列表，不切换当前浏览频道（管理面板建/改名/删频道后回填用）。
+    /// 当前频道还在就保持选中；被删了就退到第一条。
+    /// </summary>
+    private async Task RefreshChannelListOnlyAsync(PartyUpConnection connection)
+    {
+        var list = await connection.ListChannelsAsync();
+        var currentId = _browseChannelId;
+        _channelsById.Clear();
+        Channels.Clear();
+        foreach (var channel in list.Channels)
+        {
+            _channelsById[channel.Id] = channel;
+            Channels.Add(new ShellChannelItem(channel.Id, channel.Name));
+        }
+        BrowseChannel = Channels.FirstOrDefault(c => c.Id == currentId) ?? Channels.FirstOrDefault();
+        OnPropertyChanged(nameof(HasBrowseChannel));
+        OnPropertyChanged(nameof(BrowseChannelName));
+        FooterText = $"已加载 {Channels.Count} 个频道";
+        AppLog.Pass($"gui: channel list refreshed after admin ({Channels.Count} channels)");
     }
 
     private void RefreshServers()

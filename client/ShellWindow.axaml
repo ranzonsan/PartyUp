@@ -117,8 +117,17 @@
                 <!-- 顶栏：只占左栏宽度、只显示服务器名（品牌与连接状态不再重复占一行） -->
                 <Border Grid.Row="0" Padding="16,10" BorderThickness="0,0,0,1"
                         BorderBrush="{DynamicResource SemiColorBorder}">
-                  <TextBlock Text="{Binding ServerCaption}" FontWeight="SemiBold"
-                             TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
+                  <Grid ColumnDefinitions="*,Auto">
+                    <TextBlock Grid.Column="0" Text="{Binding ServerCaption}" FontWeight="SemiBold"
+                               TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
+                    <!-- 只有 owner/admin 可见：建/改名/删频道都在「服务器管理 → 频道」。
+                         在这之前没有任何入口，管理员只能直接改数据库。 -->
+                    <Button Grid.Column="1" Content="＋" Command="{Binding OpenAdminCommand}"
+                            IsVisible="{Binding HasServerAdminRights}"
+                            ToolTip.Tip="新建 / 管理频道（打开服务器管理）"
+                            AutomationProperties.AutomationId="NewChannelEntry"
+                            Padding="8,2" MinWidth="0" VerticalAlignment="Center" />
+                  </Grid>
                 </Border>
 
                 <Grid Grid.Row="1" RowDefinitions="Auto,*,Auto,Auto" Margin="16,16,12,12">

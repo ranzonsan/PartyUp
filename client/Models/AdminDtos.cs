@@ -91,3 +91,15 @@ public sealed record ServerSettingsDto(
 
 /// <summary>服务器管理页需要的角色快照（用于决定显示哪些页签）。</summary>
 public sealed record AdminRoleSnapshot(bool IsAdmin, bool IsOwner);
+
+/// <summary>
+/// 一条频道。GET /api/admin/channels 返回带壳对象 {channels:[...]}；
+/// POST 与 PATCH 返回单条。仅 owner/admin 可取（服务端 requireRole(RoleAdmin)）。
+/// </summary>
+public sealed record AdminChannelDto(
+    string Id,
+    string Name,
+    string Description,
+    int Position,
+    long CreatedAt);
+

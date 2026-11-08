@@ -59,7 +59,48 @@ jobs:
           "version=$ver"  >> $env:GITHUB_OUTPUT
           "tag=$tag"      >> $env:GITHUB_OUTPUT
 
+      # 决定这次要重打哪些产物：客户端与服务端各自判断，都没动就全部复用上一个 release。
+      # VERSION 本身每版都会变，故意不参与判断（否则永远两个都触发）。
+      - name: detect changed components
+        id: detect
+        shell: pwsh
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          $prev = (git tag --list 'v*' --sort=-v:refname |
+                   Where-Object { $_ -ne $env:TAG } | Select-Object -First 1)
+          if (-not $prev) {
+            $clientHit = @('no-prev-tag')
+            $serverHit = @('no-prev-tag')
+          } else {
+            $files = @(git diff --name-only "$prev..HEAD")
+            $clientRe = '^(client/|src/media-core/|third_party/|global\.json$|Directory\.(Build|Packages)\.props$|scripts/package\.ps1$|scripts/make-assets\.ps1$|assets/(?!server/))'
+            $serverRe = '^(server/|assets/server/|scripts/package\.ps1$)'
+            $clientHit = @($files | Where-Object { $_ -match $clientRe })
+            $serverHit = @($files | Where-Object { $_ -match $serverRe })
+          }
+          $needClient = $clientHit.Count -gt 0
+          $needServer = $serverHit.Count -gt 0
+          $target = if ($needClient -and $needServer) { 'all' }
+                    elseif ($needClient) { 'client' }
+                    elseif ($needServer) { 'server' }
+                    else { 'none' }
+          $reason = if (-not $prev) { '首个版本：客户端与服务端全量打包' }
+                    elseif ($target -eq 'none') { "自 $prev 以来只改了文档/CI：二者都复用" }
+                    elseif ($target -eq 'all') { "自 $prev 以来客户端与服务端都有改动：全量打包" }
+                    elseif ($target -eq 'client') { "自 $prev 以来只有客户端相关改动：只重打客户端" }
+                    else { "自 $prev 以来只有服务端相关改动：只重打服务端" }
+          Write-Host "prev=$prev needClient=$needClient needServer=$needServer target=$target"
+          Write-Host ("client paths: " + ($clientHit -join ', '))
+          Write-Host ("server paths: " + ($serverHit -join ', '))
+          "prev=$prev" >> $env:GITHUB_OUTPUT
+          "client=$($needClient.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+          "server=$($needServer.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+          "target=$target" >> $env:GITHUB_OUTPUT
+          "reason=$reason" >> $env:GITHUB_OUTPUT
+
       - name: fetch media-core dll from latest media-core release
+        if: steps.detect.outputs.client == 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -76,28 +117,93 @@ jobs:
           "$((Get-FileHash $dll -Algorithm SHA256).Hash.ToLower())  partyup_media.dll  (from $tag)" |
             Tee-Object -FilePath src/media-core/out/FROM-RELEASE.txt
 
-      - name: package (client Setup/MSI/portable + server zip)
+      - name: package (${{ steps.detect.outputs.target }})
+        if: steps.detect.outputs.target != 'none'
         shell: pwsh
-        run: ./scripts/package.ps1 -Version ${{ steps.ver.outputs.version }}
+        run: |
+          Write-Host "target=${{ steps.detect.outputs.target }}  —— ${{ steps.detect.outputs.reason }}"
+          ./scripts/package.ps1 -Version ${{ steps.ver.outputs.version }} -Target ${{ steps.detect.outputs.target }}
+
+      # 未改动的组件不重编，而是从上一次 release 原样取回，保证这次 release 依然自带全部产物。
+      - name: reuse unchanged artifacts from previous release
+        if: steps.detect.outputs.target != 'all'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PREV: ${{ steps.detect.outputs.prev }}
+          NEED_CLIENT: ${{ steps.detect.outputs.client }}
+          NEED_SERVER: ${{ steps.detect.outputs.server }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:PREV)) { throw '没有上一个 v* release 可复用' }
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          New-Item -ItemType Directory -Force artifacts/velopack | Out-Null
+          if ($env:NEED_CLIENT -ne 'true') {
+            # 客户端三件套 + 整份 Velopack feed（feed 与 nupkg 的文件名必须原样保留）
+            gh release download $env:PREV --dir artifacts --clobber `
+              --pattern 'PartyUp-*-win64-Setup.exe' `
+              --pattern 'PartyUp-*-win64.msi' `
+              --pattern 'PartyUp-*-win64-portable.zip'
+            gh release download $env:PREV --dir artifacts/velopack --clobber `
+              --pattern 'RELEASES' `
+              --pattern 'releases.win.json' `
+              --pattern 'assets.win.json' `
+              --pattern '*-full.nupkg'
+          }
+          if ($env:NEED_SERVER -ne 'true') {
+            gh release download $env:PREV --dir artifacts --clobber `
+              --pattern 'PartyUp-Server-*-win64.zip'
+          }
+          Get-ChildItem artifacts -Recurse -File | Select-Object FullName,Length |
+            Format-Table -AutoSize | Out-String | Write-Host
+
+      # package.ps1 生成的校验和只覆盖它自己产出的文件；复用旧产物后必须整体重算。
+      - name: regenerate SHA256SUMS over final asset set
+        if: steps.detect.outputs.target != 'all'
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem artifacts -File |
+            Where-Object { $_.Name -ne 'SHA256SUMS.txt' } | Sort-Object Name
+          if (-not $files) { throw 'artifacts 为空，无法生成校验和' }
+          $lines = foreach ($f in $files) {
+            $h = (Get-FileHash $f.FullName -Algorithm SHA256).Hash.ToLower()
+            "$h *$($f.Name)"
+          }
+          $lines | Set-Content -Path artifacts/SHA256SUMS.txt -Encoding utf8
+          $lines | ForEach-Object { Write-Host $_ }
 
       - name: verify artifacts
         shell: pwsh
         env:
           VER: ${{ steps.ver.outputs.version }}
+          NEED_CLIENT: ${{ steps.detect.outputs.client }}
+          NEED_SERVER: ${{ steps.detect.outputs.server }}
         run: |
-          $want = @(
-            "artifacts/PartyUp-$env:VER-win64-portable.zip",
-            "artifacts/PartyUp-$env:VER-win64-Setup.exe",
-            "artifacts/PartyUp-$env:VER-win64.msi",
-            "artifacts/PartyUp-Server-$env:VER-win64.zip",
+          # 用通配符检查"这一类产物在不在"（复用的旧产物文件名里是旧版本号）；
+          # 再单独检查"本次重打的那一半文件名里必须是本次版本号"。
+          $patterns = @(
+            "artifacts/PartyUp-*-win64-portable.zip",
+            "artifacts/PartyUp-*-win64-Setup.exe",
+            "artifacts/PartyUp-*-win64.msi",
+            "artifacts/PartyUp-Server-*-win64.zip",
             "artifacts/SHA256SUMS.txt",
             # Velopack 自动更新 feed：缺了这些，客户端 UpdateManager 找不到更新
             "artifacts/velopack/RELEASES",
             "artifacts/velopack/releases.win.json",
             "artifacts/velopack/assets.win.json"
           )
-          $missing = $want | Where-Object { -not (Test-Path $_) }
+          $missing = @()
+          foreach ($p in $patterns) {
+            if (-not (Get-ChildItem $p -ErrorAction SilentlyContinue)) { $missing += $p }
+          }
           if ($missing) { throw ("缺少产物: " + ($missing -join ', ')) }
+          if ($env:NEED_CLIENT -eq 'true' -and
+              -not (Test-Path "artifacts/PartyUp-$env:VER-win64-Setup.exe")) {
+            throw "客户端本次重新构建，但安装包文件名不是 $env:VER"
+          }
+          if ($env:NEED_SERVER -eq 'true' -and
+              -not (Test-Path "artifacts/PartyUp-Server-$env:VER-win64.zip")) {
+            throw "服务端本次重新构建，但包文件名不是 $env:VER"
+          }
           Get-ChildItem artifacts/velopack -Filter '*-full.nupkg' | ForEach-Object {
             if ($_.Length -le 0) { throw "empty nupkg: $($_.Name)" }
           }
@@ -109,6 +215,10 @@ jobs:
         env:
           TAG: ${{ steps.ver.outputs.tag }}
           VER: ${{ steps.ver.outputs.version }}
+          NEED_CLIENT: ${{ steps.detect.outputs.client }}
+          NEED_SERVER: ${{ steps.detect.outputs.server }}
+          PREV: ${{ steps.detect.outputs.prev }}
+          REASON: ${{ steps.detect.outputs.reason }}
         run: |
           $prev = (git tag --list 'v*' --sort=-v:refname | Where-Object { $_ -ne $env:TAG } | Select-Object -First 1)
           $range = if ($prev) { "$prev..HEAD" } else { "HEAD" }
@@ -117,6 +227,19 @@ jobs:
           $changes = (@(git log $range --no-merges --pretty=format:'- %s (%h)') |
             Select-Object -First 60) -join "`n"
           if ([string]::IsNullOrWhiteSpace($changes)) { $changes = '- 首个版本' }
+          # 这一版哪些产物是重打的、哪些是沿用的（沿用者在文件里保留自己的版本号）
+          $comp = @()
+          $comp += if ($env:NEED_CLIENT -eq 'true') {
+            "- 客户端：本次重新构建（$env:VER）"
+          } else {
+            "- 客户端：本次无改动，沿用 $env:PREV 的安装包（文件名里的版本号保持 $(($env:PREV -replace '^v',''))，已安装用户无需更新）"
+          }
+          $comp += if ($env:NEED_SERVER -eq 'true') {
+            "- 服务端：本次重新构建（$env:VER）"
+          } else {
+            "- 服务端：本次无改动，沿用 $env:PREV 的 Server zip"
+          }
+          $components = $comp -join "`n"
           $dir = ".docs/release-notes"
           New-Item -ItemType Directory -Force $dir | Out-Null
           $path = Join-Path $dir "$env:TAG.md"
@@ -127,16 +250,24 @@ jobs:
             "",
             $changes,
             "",
+            "## 组件",
+            "",
+            $env:REASON,
+            "",
+            $components,
+            "",
             "## 发布物",
             "",
             "| 文件 | 说明 |",
             "|---|---|",
-            "| PartyUp-$env:VER-win64-Setup.exe | 一键安装（按用户安装，无需管理员） |",
-            "| PartyUp-$env:VER-win64.msi | MSI（安装范围可选） |",
-            "| PartyUp-$env:VER-win64-portable.zip | 绿色版（解压即用，不自带自动更新） |",
-            "| PartyUp-Server-$env:VER-win64.zip | 服务端（partyup.exe + start.cmd + invite.cmd） |",
+            "| PartyUp-*-win64-Setup.exe | 一键安装（按用户安装，无需管理员） |",
+            "| PartyUp-*-win64.msi | MSI（安装范围可选） |",
+            "| PartyUp-*-win64-portable.zip | 绿色版（解压即用，不自带自动更新） |",
+            "| PartyUp-Server-*-win64.zip | 服务端（partyup.exe + start.cmd + invite.cmd） |",
             "| RELEASES / releases.win.json / *.nupkg | Velopack 自动更新 feed（不要改名） |",
             "| SHA256SUMS.txt | 校验和 |",
+            "",
+            "文件名里的版本号 = **该组件最近一次构建的版本**，不一定是本次 tag。",
             "",
             "## 安装",
             "",

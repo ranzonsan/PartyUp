@@ -201,14 +201,8 @@ foreach ($rootProps in @('Directory.Build.props', 'Directory.Packages.props')) {
     if (Test-Path $source) { Copy-Item $source (Join-Path $SrcDir $rootProps) -Force }
 }
 
-$mediaDll = Join-Path $RepoRoot 'src\media-core\out\partyup_media.dll'
-if (-not (Test-Path $mediaDll)) {
-    throw ("media core not found: {0}`nBuild it first (scripts/build-media-dll.ps1) - this script never builds C++." -f $mediaDll)
-}
-$stagedMediaDir = Join-Path $SrcDir 'src\media-core\out'
-New-Item -ItemType Directory -Force -Path $stagedMediaDir | Out-Null
-Copy-Item $mediaDll (Join-Path $stagedMediaDir 'partyup_media.dll') -Force
-Write-Host ("   media core: {0:N1} MB" -f ((Get-Item $mediaDll).Length / 1MB))
+# NOTE: the native DLL is only needed when packaging the client (-Target server
+# never touches C++ outputs). The client branch below checks and stages it.
 
 # Remove previous artifacts of the same version (keep unrelated files).
 $velopackOut = Join-Path $OutputDir 'velopack'
@@ -229,6 +223,15 @@ New-Item -ItemType Directory -Force -Path $velopackOut | Out-Null
 # ---------------------------------------------------------------------------
 
 if ($Target -in @('client', 'all')) {
+    $mediaDll = Join-Path $RepoRoot 'src\media-core\out\partyup_media.dll'
+    if (-not (Test-Path $mediaDll)) {
+        throw ("media core not found: {0}`nBuild it first (scripts/build-media-dll.ps1) - this script never builds C++." -f $mediaDll)
+    }
+    $stagedMediaDir = Join-Path $SrcDir 'src\media-core\out'
+    New-Item -ItemType Directory -Force -Path $stagedMediaDir | Out-Null
+    Copy-Item $mediaDll (Join-Path $stagedMediaDir 'partyup_media.dll') -Force
+    Write-Host ("   media core: {0:N1} MB" -f ((Get-Item $mediaDll).Length / 1MB))
+
     $dotnet = Find-CommandPath -Candidates @(
         (Join-Path $env:ProgramFiles 'dotnet\dotnet.exe'),
         (Join-Path $env:LOCALAPPDATA 'Microsoft\dotnet\dotnet.exe')

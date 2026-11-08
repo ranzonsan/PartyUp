@@ -29,8 +29,12 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($ArtifactsDir)) { $ArtifactsDir = Join-Path $RepoRoot 'artifacts' }
 $ArtifactsDir = [System.IO.Path]::GetFullPath($ArtifactsDir)
 
-if ([string]::IsNullOrWhiteSpace($Version)) {
-    $Version = (Get-Content -Path (Join-Path $RepoRoot 'VERSION') -Raw).Trim()
+$ClientVersion = (Get-Content -Path (Join-Path $RepoRoot 'client\VERSION') -Raw).Trim()
+$ServerVersion = (Get-Content -Path (Join-Path $RepoRoot 'server\VERSION') -Raw).Trim()
+# -Version still acts as an explicit override for both series (legacy callers).
+if (-not [string]::IsNullOrWhiteSpace($Version)) {
+    $ClientVersion = $Version
+    $ServerVersion = $Version
 }
 
 $script:Results = New-Object 'System.Collections.Generic.List[object]'
@@ -188,10 +192,10 @@ function Get-ShortcutCandidates {
 $runRoot = Join-Path $env:TEMP ('partyup-verify-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
 New-Item -ItemType Directory -Force -Path $runRoot | Out-Null
 
-$portableZip = Join-Path $ArtifactsDir ("PartyUp-{0}-win64-portable.zip" -f $Version)
-$setupExe = Join-Path $ArtifactsDir ("PartyUp-{0}-win64-Setup.exe" -f $Version)
-$msiPath = Join-Path $ArtifactsDir ("PartyUp-{0}-win64.msi" -f $Version)
-$serverZip = Join-Path $ArtifactsDir ("PartyUp-Server-{0}-win64.zip" -f $Version)
+$portableZip = Join-Path $ArtifactsDir ("PartyUp-{0}-win64-portable.zip" -f $ClientVersion)
+$setupExe = Join-Path $ArtifactsDir ("PartyUp-{0}-win64-Setup.exe" -f $ClientVersion)
+$msiPath = Join-Path $ArtifactsDir ("PartyUp-{0}-win64.msi" -f $ClientVersion)
+$serverZip = Join-Path $ArtifactsDir ("PartyUp-Server-{0}-win64.zip" -f $ServerVersion)
 
 foreach ($artifact in @($portableZip, $setupExe, $msiPath, $serverZip)) {
     if (-not (Test-Path $artifact)) { throw ("missing artifact: {0}" -f $artifact) }
@@ -202,7 +206,7 @@ $sourceMediaDll = Join-Path $RepoRoot 'src\media-core\out\partyup_media.dll'
 $uninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\io.partyup.client'
 
 Write-Host '================================================================='
-Write-Host (" PartyUp package verification   version={0}" -f $Version)
+Write-Host (" PartyUp package verification   client={0}  server={1}" -f $ClientVersion, $ServerVersion)
 Write-Host (" artifacts: {0}" -f $ArtifactsDir)
 Write-Host (" logs     : {0}" -f $runRoot)
 Write-Host '================================================================='
@@ -218,7 +222,7 @@ try {
     $portableDir = Join-Path $runRoot 'portable'
     New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
     Expand-Archive -Path $portableZip -DestinationPath $portableDir -Force
-    $leaf = Join-Path $portableDir ("PartyUp-{0}-win64" -f $Version)
+    $leaf = Join-Path $portableDir ("PartyUp-{0}-win64" -f $ClientVersion)
     $exe = Join-Path $leaf 'PartyUp.Client.exe'
     Add-Result -Name 'portable: extracted PartyUp.Client.exe' -Pass (Test-Path $exe) -Detail $exe
 
@@ -385,7 +389,7 @@ try {
     $serverDir = Join-Path $runRoot 'server'
     New-Item -ItemType Directory -Force -Path $serverDir | Out-Null
     Expand-Archive -Path $serverZip -DestinationPath $serverDir -Force
-    $serverRoot = Join-Path $serverDir ("PartyUp-Server-{0}-win64" -f $Version)
+    $serverRoot = Join-Path $serverDir ("PartyUp-Server-{0}-win64" -f $ServerVersion)
     $serverExe = Join-Path $serverRoot 'partyup.exe'
     Add-Result -Name 'server: partyup.exe present' -Pass (Test-Path $serverExe) -Detail $serverExe
     foreach ($name in @('start.cmd', 'invite.cmd', 'README.txt', 'LICENSE.txt')) {
@@ -393,7 +397,7 @@ try {
     }
 
     $versionOut = (& $serverExe version 2>&1 | Out-String).Trim()
-    Add-Result -Name 'server: version matches VERSION' -Pass ($versionOut -match [regex]::Escape($Version)) `
+    Add-Result -Name 'server: version matches server/VERSION' -Pass ($versionOut -match [regex]::Escape($ServerVersion)) `
         -Detail ("partyup version -> {0}" -f $versionOut)
 
     $dataDir = Join-Path $runRoot 'server-data'

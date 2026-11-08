@@ -42,17 +42,25 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\package.ps1 -Target 
 **不需要** Visual Studio / MSVC / CMake：`partyup_media.dll` 用现成构建产物
 （`src/media-core/out/partyup_media.dll`），打包脚本从不编译 C++。DLL 缺失时脚本直接报错。
 
-## 版本号：单一来源
+## 版本号：每个组件一个来源
 
-版本号只有一处：仓库根的 **`VERSION`** 文件（当前 `0.1.0`）。以下全部从它读，不要在别处再写死：
+客户端与服务端是**两个独立的版本序列与发布通道**（2026-11-08 起）：
 
-- 产物文件名（四个包）；
-- 客户端 assembly/file/informational version（`dotnet publish -p:Version=...`）；
-- Velopack `--packVersion` 与 MSI 的 `--msiVersion`（由 VERSION 补成 `x.y.z.0`）；
-- 服务端 `partyup version` 的输出（`go build -ldflags "-X main.version=<VERSION>"`；源码里是
+| 组件 | 版本文件 | release tag | 产物 |
+|---|---|---|---|
+| 客户端 | `client/VERSION` | `v0.1.0` | Setup.exe / MSI / portable.zip / Velopack feed |
+| 服务端 | `server/VERSION` | `server-v0.1.0` | Server zip + Docker 镜像 |
+
+以下全部从这两个文件读，不要在别处再写死：
+
+- 产物文件名里的版本号（客户端四件套读 `client/VERSION`，服务端 zip 读 `server/VERSION`）；
+- 客户端 assembly/file/informational version（csproj 读 `client/VERSION`）；
+- Velopack `--packVersion` 与 MSI 的 `--msiVersion`（由客户端版本补成 `x.y.z.0`）；
+- 服务端 `partyup version` 的输出（`go build -ldflags "-X main.version=<server/VERSION>"`；源码里是
   `var version = "dev"`，直接 `go build` 不走打包脚本时显示 dev）。
 
-发版时改 `VERSION` 一处，再跑一次 `package.ps1` 即可。
+发版时只改对应那一侧的文件：改客户端 → `client/VERSION` + 打 `v*`；改服务端 → `server/VERSION`
++ 打 `server-v*`。`release-client.yml` / `release-server.yml` 会校验 tag 与对应文件一致。
 
 ## 图标：单文件替换
 

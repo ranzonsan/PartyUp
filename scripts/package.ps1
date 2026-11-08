@@ -7,7 +7,8 @@
 #                                      install scope chosen at install time)
 #   PartyUp-Server-<ver>-win64.zip     partyup.exe + start.cmd + invite.cmd + README
 #
-# Version comes from the repo-root VERSION file (single source of truth).
+# Versions come from client/VERSION and server/VERSION (one source of truth per
+# component; the two release channels are independent).
 # No code signing: SmartScreen warnings are documented in the shipped READMEs and
 # the MSI welcome page; the script never hides them.
 #
@@ -19,7 +20,6 @@
 # Options:
 #   -Target      client | server | all   (default: all)
 #   -OutputDir   artifact directory      (default: <repo>\artifacts)
-#   -Version     override VERSION        (default: contents of <repo>\VERSION)
 #   -NoClean     reuse the staging src/work dirs instead of rebuilding from scratch
 #
 # Design notes:
@@ -38,8 +38,6 @@ param(
     [string]$Target = 'all',
 
     [string]$OutputDir = '',
-
-    [string]$Version = '',
 
     [switch]$NoClean
 )
@@ -61,17 +59,25 @@ if ([string]::IsNullOrWhiteSpace($OutputDir)) {
 }
 $OutputDir = [System.IO.Path]::GetFullPath($OutputDir)
 
-if ([string]::IsNullOrWhiteSpace($Version)) {
-    $versionFile = Join-Path $RepoRoot 'VERSION'
-    if (-not (Test-Path $versionFile)) { throw "VERSION file not found: $versionFile" }
-    $Version = (Get-Content -Path $versionFile -Raw).Trim()
+# Two independent version series (2026-11-08): the client and the server ship on
+# separate release channels (v* for the client, server-v* for the server), so each
+# side keeps its own VERSION file. Reading them here keeps one source of truth per
+# component — no -Version parameter anymore.
+$ClientVersionFile = Join-Path $RepoRoot 'client\VERSION'
+$ServerVersionFile = Join-Path $RepoRoot 'server\VERSION'
+foreach ($vf in @($ClientVersionFile, $ServerVersionFile)) {
+    if (-not (Test-Path $vf)) { throw "version file not found: $vf" }
 }
-if ($Version -notmatch '^\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?$') {
-    throw "invalid version '$Version' (expected semver like 0.1.0)"
+$ClientVersion = (Get-Content -Path $ClientVersionFile -Raw).Trim()
+$ServerVersion = (Get-Content -Path $ServerVersionFile -Raw).Trim()
+foreach ($v in @($ClientVersion, $ServerVersion)) {
+    if ($v -notmatch '^\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?$') {
+        throw "invalid version '$v' (expected semver like 0.1.0; check client/VERSION and server/VERSION)"
+    }
 }
 
 # Assembly/File version: numeric x.y.z.0 (prerelease suffix stripped).
-$numeric = ($Version -split '[-+]')[0].Split('.')
+$numeric = ($ClientVersion -split '[-+]')[0].Split('.')
 while ($numeric.Count -lt 4) { $numeric += '0' }
 $assemblyVersion = ($numeric[0..3] -join '.')
 # MSI wants x.x.x.x as well.
@@ -86,7 +92,7 @@ $clientExe = 'PartyUp.Client.exe'
 
 Write-Host ''
 Write-Host '================================================================='
-Write-Host (" PartyUp package  version={0}  target={1}" -f $Version, $Target)
+Write-Host (" PartyUp package  client={0}  server={1}  target={2}" -f $ClientVersion, $ServerVersion, $Target)
 Write-Host (" repo : {0}" -f $RepoRoot)
 Write-Host (" out  : {0}" -f $OutputDir)
 Write-Host (" stage: {0}" -f $StageRoot)
@@ -191,7 +197,9 @@ Write-Host '== staging sources to local disk (UNC builds are not supported)' -Fo
 Copy-Tree -From (Join-Path $RepoRoot 'client') -To (Join-Path $SrcDir 'client') -ExcludeDirs @('bin', 'obj', '.cache')
 Copy-Tree -From (Join-Path $RepoRoot 'server') -To (Join-Path $SrcDir 'server') -ExcludeDirs @('.cache')
 Copy-Tree -From (Join-Path $RepoRoot 'assets') -To (Join-Path $SrcDir 'assets')
-foreach ($file in @('VERSION', 'global.json', 'LICENSE')) {
+# client/VERSION and server/VERSION are staged with their own trees, so only the
+# repo-level files are listed here.
+foreach ($file in @('global.json', 'LICENSE')) {
     $source = Join-Path $RepoRoot $file
     if (-not (Test-Path $source)) { throw ("required file missing: {0}" -f $source) }
     Copy-Item $source (Join-Path $SrcDir $file) -Force
@@ -208,10 +216,10 @@ foreach ($rootProps in @('Directory.Build.props', 'Directory.Packages.props')) {
 $velopackOut = Join-Path $OutputDir 'velopack'
 if (-not $NoClean) {
     foreach ($stale in @($velopackOut,
-            (Join-Path $OutputDir ("PartyUp-{0}-win64-portable.zip" -f $Version)),
-            (Join-Path $OutputDir ("PartyUp-{0}-win64-Setup.exe" -f $Version)),
-            (Join-Path $OutputDir ("PartyUp-{0}-win64.msi" -f $Version)),
-            (Join-Path $OutputDir ("PartyUp-Server-{0}-win64.zip" -f $Version)),
+            (Join-Path $OutputDir ("PartyUp-{0}-win64-portable.zip" -f $ClientVersion)),
+            (Join-Path $OutputDir ("PartyUp-{0}-win64-Setup.exe" -f $ClientVersion)),
+            (Join-Path $OutputDir ("PartyUp-{0}-win64.msi" -f $ClientVersion)),
+            (Join-Path $OutputDir ("PartyUp-Server-{0}-win64.zip" -f $ServerVersion)),
             (Join-Path $OutputDir 'SHA256SUMS.txt'))) {
         if (Test-Path $stale) { Remove-Item $stale -Recurse -Force }
     }
@@ -257,10 +265,10 @@ if ($Target -in @('client', 'all')) {
         '--self-contained', 'true',
         '-o', $publishDir,
         '--nologo',
-        ("-p:Version={0}" -f $Version),
+        ("-p:Version={0}" -f $ClientVersion),
         ("-p:AssemblyVersion={0}" -f $assemblyVersion),
         ("-p:FileVersion={0}" -f $assemblyVersion),
-        ("-p:InformationalVersion={0}" -f $Version),
+        ("-p:InformationalVersion={0}" -f $ClientVersion),
         '-p:PublishTrimmed=false',
         '-p:DebugType=None',
         '-p:DebugSymbols=false'
@@ -291,7 +299,7 @@ if ($Target -in @('client', 'all')) {
     Write-Host ''
     Write-Host '== portable zip (tar.exe)' -ForegroundColor Cyan
     $portableParent = Join-Path $WorkDir 'portable'
-    $portableLeaf = ("PartyUp-{0}-win64" -f $Version)
+    $portableLeaf = ("PartyUp-{0}-win64" -f $ClientVersion)
     $portableDir = Join-Path $portableParent $portableLeaf
     if (Test-Path $portableParent) { Remove-Item $portableParent -Recurse -Force }
     New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
@@ -322,7 +330,7 @@ if ($Target -in @('client', 'all')) {
         '--outputDir', $velopackOut,
         '--channel', 'win',
         '--packId', 'io.partyup.client',
-        '--packVersion', $Version,
+        '--packVersion', $ClientVersion,
         '--packTitle', 'PartyUp',
         '--packAuthors', 'PartyUp',
         '--mainExe', $clientExe,
@@ -344,7 +352,7 @@ if ($Target -in @('client', 'all')) {
         throw ("vpk did not produce a Setup.exe; output dir contains: " +
             ((Get-ChildItem $velopackOut -File | ForEach-Object { $_.Name }) -join ', '))
     }
-    $setupTarget = Join-Path $OutputDir ("PartyUp-{0}-win64-Setup.exe" -f $Version)
+    $setupTarget = Join-Path $OutputDir ("PartyUp-{0}-win64-Setup.exe" -f $ClientVersion)
     Copy-Item $setupSource.FullName $setupTarget -Force
     Add-ArtifactRecord -Path $setupTarget -Label 'Setup.exe'
 
@@ -353,7 +361,7 @@ if ($Target -in @('client', 'all')) {
         throw ("vpk did not produce an .msi; output dir contains: " +
             ((Get-ChildItem $velopackOut -File | ForEach-Object { $_.Name }) -join ', '))
     }
-    $msiTarget = Join-Path $OutputDir ("PartyUp-{0}-win64.msi" -f $Version)
+    $msiTarget = Join-Path $OutputDir ("PartyUp-{0}-win64.msi" -f $ClientVersion)
     Copy-Item $msiSource.FullName $msiTarget -Force
     Add-ArtifactRecord -Path $msiTarget -Label 'MSI'
 
@@ -388,7 +396,7 @@ if ($Target -in @('server', 'all')) {
     New-Item -ItemType Directory -Force -Path $serverOut | Out-Null
 
     $serverProject = Join-Path $SrcDir 'server'
-    $ldflags = ("-s -w -X main.version={0}" -f $Version)
+    $ldflags = ("-s -w -X main.version={0}" -f $ServerVersion)
     $goArgs = @('build', '-trimpath', '-ldflags', $ldflags, '-o', (Join-Path $serverOut 'partyup.exe'), './cmd/partyup')
     Invoke-Step -Name 'go build (windows/amd64, version injected via -ldflags)' -Block {
         Push-Location $serverProject
@@ -399,14 +407,14 @@ if ($Target -in @('server', 'all')) {
     if (-not (Test-Path $serverExe)) { throw 'server build did not produce partyup.exe' }
     $reported = (& $serverExe version 2>&1 | Out-String).Trim()
     Write-Host ("   partyup version: {0}" -f $reported)
-    if ($reported -notmatch [regex]::Escape($Version)) {
-        throw ("server binary reports '{0}' but VERSION is {1} (ldflags injection failed?)" -f $reported, $Version)
+    if ($reported -notmatch [regex]::Escape($ServerVersion)) {
+        throw ("server binary reports '{0}' but server/VERSION is {1} (ldflags injection failed?)" -f $reported, $ServerVersion)
     }
 
     Write-Host ''
     Write-Host '== server zip (tar.exe)' -ForegroundColor Cyan
     $serverParent = Join-Path $WorkDir 'server-pkg'
-    $serverLeaf = ("PartyUp-Server-{0}-win64" -f $Version)
+    $serverLeaf = ("PartyUp-Server-{0}-win64" -f $ServerVersion)
     $serverDir = Join-Path $serverParent $serverLeaf
     if (Test-Path $serverParent) { Remove-Item $serverParent -Recurse -Force }
     New-Item -ItemType Directory -Force -Path $serverDir | Out-Null

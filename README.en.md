@@ -105,8 +105,12 @@ CI runs on GitHub Actions:
 |---|---|---|
 | `ci.yml` | push / PR | Go tests + client build |
 | `media-core.yml` | `src/media-core/**` or manual | `partyup_media.dll` → `media-core-v*` release |
-| `docker.yml` | `v*` tag / `main` | server image → `ghcr.io/ranzonsan/partyup` |
-| `release.yml` | `v*` tag | client and server bundles → draft GitHub Release |
+| `docker.yml` | `server-v*` tag / `main` | server image → `ghcr.io/ranzonsan/partyup` |
+| `release-client.yml` | `v*` tag | client bundles → draft Release (marked Latest) |
+| `release-server.yml` | `server-v*` tag | server zip → draft Release (not Latest) |
+
+Client and server have **independent versions and release channels**: client `client/VERSION`
+↔ tag `v0.1.0`, server `server/VERSION` ↔ tag `server-v0.1.0`.
 
 ## Known limitations
 

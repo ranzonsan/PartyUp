@@ -15,11 +15,13 @@
     <ApplicationIcon>$(MSBuildThisFileDirectory)../assets/icon.ico</ApplicationIcon>
 
     <!--
-      版本号唯一来源是仓库根 VERSION（scripts/package.ps1 读同一个文件打 vpk 包），
-      这样「程序集版本 = 包版本 = GitHub release tag」不会漂移；Velopack 比对新版本也靠它。
-      调试桥把源码快照到 runs/<id>/src 后 VERSION 仍与 client/ 同级；文件缺失时退回 SDK 默认版本。
+      版本号唯一来源是 client/VERSION（scripts/package.ps1 也读它打 vpk 包），
+      这样「程序集版本 = 包版本 = 客户端 release tag（v*）」不会漂移；
+      Velopack 比对新版本也靠它。服务端有独立的 server/VERSION。
+      路径相对本 csproj；调试桥把源码快照到 runs/<id>/src 后该文件仍在 client/ 下。
+      文件缺失时退回 SDK 默认版本。
     -->
-    <Version Condition="Exists('$(MSBuildThisFileDirectory)../VERSION')">$([System.IO.File]::ReadAllText('$(MSBuildThisFileDirectory)../VERSION').Trim())</Version>
+    <Version Condition="Exists('$(MSBuildThisFileDirectory)VERSION')">$([System.IO.File]::ReadAllText('$(MSBuildThisFileDirectory)VERSION').Trim())</Version>
 
     <!--
       Avalonia 依赖反射，trim 的风险高于收益：显式关闭（打包命令也会再传一次）。

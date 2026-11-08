@@ -1,0 +1,153 @@
+name: release-server
+
+# 服务端发版通道：push tag server-v*（或手动 dispatch）→ Go 编译 windows/amd64
+# → 打 PartyUp-Server-<ver>-win64.zip → 建 **draft** release（note 审后手动 Publish）。
+#
+# 版本真源：server/VERSION（tag server-v<x.y.z> 必须与它一致）。
+# 客户端走独立通道 release-client.yml（tag v*，版本真源 client/VERSION）。
+# Docker 镜像由 docker.yml 在同一个 server-v* tag 上构建并推 ghcr。
+#
+# 发布时请**取消勾选 "Set as the latest release"**：Latest 属于客户端 release，
+# 玩家在 Releases 页默认看到的那一份应该是客户端。
+
+on:
+  push:
+    tags: ["server-v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布/重发的服务端 tag（如 server-v0.1.1）；留空则用当前 ref 的 tag"
+        required: false
+        type: string
+
+concurrency:
+  group: release-server-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: package server + draft release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+
+      - name: resolve version
+        id: ver
+        shell: pwsh
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $tag = if ($env:INPUT_TAG) { $env:INPUT_TAG } else { $env:REF_NAME }
+          if ($tag -notmatch '^server-v(\d+\.\d+\.\d+)$') {
+            throw "tag '$tag' 不是 server-v<major>.<minor>.<patch> 形式（这是服务端通道；客户端用 v*）"
+          }
+          $ver = $Matches[1]
+          $fileVer = (Get-Content server/VERSION -Raw).Trim()
+          if ($ver -ne $fileVer) { throw "tag=$tag 与 server/VERSION=$fileVer 不一致：先改 server/VERSION 再打 tag" }
+          "version=$ver" >> $env:GITHUB_OUTPUT
+          "tag=$tag"     >> $env:GITHUB_OUTPUT
+
+      - name: package server
+        shell: pwsh
+        run: ./scripts/package.ps1 -Target server
+
+      - name: verify artifacts
+        shell: pwsh
+        env:
+          VER: ${{ steps.ver.outputs.version }}
+        run: |
+          $want = @(
+            "artifacts/PartyUp-Server-$env:VER-win64.zip",
+            "artifacts/SHA256SUMS.txt"
+          )
+          $missing = $want | Where-Object { -not (Test-Path $_) }
+          if ($missing) { throw ("缺少产物: " + ($missing -join ', ')) }
+          Get-ChildItem artifacts | Select-Object Name,Length | Format-Table -AutoSize | Out-String | Write-Host
+
+      - name: generate release notes
+        id: notes
+        shell: pwsh
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          VER: ${{ steps.ver.outputs.version }}
+        run: |
+          $prev = (git tag --list 'server-v*' --sort=-v:refname | Where-Object { $_ -ne $env:TAG } | Select-Object -First 1)
+          $range = if ($prev) { "$prev..HEAD" } else { "HEAD" }
+          # git log 是字符串数组，先自己 join；直接塞进 @() 会渲染成 System.Object[]
+          $changes = (@(git log $range --no-merges --pretty=format:'- %s (%h)') |
+            Select-Object -First 60) -join "`n"
+          if ([string]::IsNullOrWhiteSpace($changes)) { $changes = '- 首个版本' }
+          $dir = ".docs/release-notes"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          $path = Join-Path $dir "server-$env:TAG.md"
+          @(
+            "# PartyUp 服务端 $env:VER",
+            "",
+            "> 这个 release 只包含**服务端**（Windows zip）。客户端在独立通道（tag 形如 ``v0.1.1``），",
+            "> Docker 镜像见 ``ghcr.io/ranzonsan/partyup:$env:VER`` / ``:latest``。",
+            "",
+            "## 变更",
+            "",
+            $changes,
+            "",
+            "## 发布物",
+            "",
+            "| 文件 | 说明 |",
+            "|---|---|",
+            "| PartyUp-Server-$env:VER-win64.zip | partyup.exe + start.cmd + invite.cmd + README |",
+            "| SHA256SUMS.txt | 校验和 |",
+            "",
+            "## 升级",
+            "",
+            "**Windows（zip）**",
+            "",
+            "1. 停止正在运行的服务端。",
+            "2. 解压新 zip，覆盖旧目录（`data/` 数据目录保留不动）。",
+            "3. 重新启动 `start.cmd`。",
+            "",
+            "**Docker**",
+            "",
+            "```bash",
+            "docker pull ghcr.io/ranzonsan/partyup:$env:VER",
+            "docker compose up -d      # 或 docker run ... 重启容器",
+            "```",
+            "",
+            "已经在跑 `:latest` 的可以用 watchtower 自动跟随。",
+            "",
+            "> 发布时请取消勾选 **Set as the latest release**（Latest 留给客户端）。",
+            ""
+          ) -join "`n" | Set-Content -Path $path -Encoding utf8
+          "path=$path" >> $env:GITHUB_OUTPUT
+
+      - name: create draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          NOTES: ${{ steps.notes.outputs.path }}
+        run: |
+          $assets = @(
+            "artifacts/PartyUp-Server-*.zip",
+            "artifacts/SHA256SUMS.txt"
+          )
+          gh release create $env:TAG --draft --latest=false --title "PartyUp 服务端 $env:TAG" `
+            --notes-file $env:NOTES --verify-tag @assets
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-assets
+          path: |
+            artifacts/*.zip
+            artifacts/SHA256SUMS.txt
+          retention-days: 14

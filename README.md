@@ -105,8 +105,12 @@ CI 全部跑在 GitHub Actions：
 |---|---|---|
 | `ci.yml` | push / PR | Go 测试 + 客户端编译 |
 | `media-core.yml` | 仅 `src/media-core/**` 或手动 | `partyup_media.dll` → `media-core-v*` release |
-| `docker.yml` | `v*` tag / `main` | 服务端镜像 → `ghcr.io/ranzonsan/partyup` |
-| `release.yml` | `v*` tag | 客户端与打包产物 → draft GitHub Release |
+| `docker.yml` | `server-v*` tag / `main` | 服务端镜像 → `ghcr.io/ranzonsan/partyup` |
+| `release-client.yml` | `v*` tag | 客户端三件套 → draft Release（Latest） |
+| `release-server.yml` | `server-v*` tag | 服务端 zip → draft Release（不发 Latest） |
+
+客户端与服务端有**独立的版本号与发布通道**：客户端 `client/VERSION` ↔ tag `v0.1.0`，
+服务端 `server/VERSION` ↔ tag `server-v0.1.0`。
 
 ## 已知限制
 

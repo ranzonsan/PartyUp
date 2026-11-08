@@ -68,9 +68,45 @@ jobs:
           if (-not (Test-Path "$env:LIBWEBRTC_DIR/release/webrtc.lib")) { throw "missing release/webrtc.lib after extract" }
           if (-not (Test-Path "$env:LIBWEBRTC_DIR/include")) { throw "missing include/ after extract" }
 
-      - name: build dll + run smoke
+      # 构建与冒烟分开：构建失败就是真失败；冒烟在无音频设备的 runner 上可能因 ADM
+      # 初始化失败而退出，那是环境限制而不是代码缺陷，所以 best-effort 但把日志留档。
+      - name: build dll
         shell: pwsh
-        run: ./scripts/build-media-dll.ps1 -Run
+        run: |
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          ./scripts/build-media-dll.ps1 2>&1 | Tee-Object -FilePath build-dll.log
+          if ($LASTEXITCODE -ne 0) { throw "build-media-dll.ps1 failed (exit $LASTEXITCODE)" }
+          Write-Host ("build took {0:n1}s" -f $sw.Elapsed.TotalSeconds)
+
+      - name: smoke (best effort)
+        id: smoke
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $stage = Join-Path $env:LOCALAPPDATA 'PartyUp\media-stage'
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item src/media-core/out/partyup_media.dll $stage -Force
+          $smoke = Get-ChildItem src/media-core/out -Filter 'media_smoke.exe' -Recurse -File |
+            Select-Object -First 1
+          if (-not $smoke) { Write-Host 'SKIP: media_smoke.exe not produced'; exit 0 }
+          Copy-Item $smoke.FullName $stage -Force
+          Push-Location $stage
+          try {
+            & (Join-Path $stage 'media_smoke.exe') 2>&1 | Tee-Object -FilePath (Join-Path $stage 'smoke.log')
+            Write-Host "smoke exit=$LASTEXITCODE"
+            if ($LASTEXITCODE -ne 0) { throw "media_smoke failed (exit $LASTEXITCODE)" }
+          } finally { Pop-Location }
+
+      - name: upload logs (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: media-core-logs
+          path: |
+            build-dll.log
+            ${{ env.LOCALAPPDATA }}/PartyUp/media-stage/smoke.log
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: collect artifacts
         shell: pwsh

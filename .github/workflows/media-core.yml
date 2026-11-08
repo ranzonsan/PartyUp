@@ -68,8 +68,10 @@ jobs:
           if (-not (Test-Path "$env:LIBWEBRTC_DIR/release/webrtc.lib")) { throw "missing release/webrtc.lib after extract" }
           if (-not (Test-Path "$env:LIBWEBRTC_DIR/include")) { throw "missing include/ after extract" }
 
-      # 构建与冒烟分开：构建失败就是真失败；冒烟在无音频设备的 runner 上可能因 ADM
-      # 初始化失败而退出，那是环境限制而不是代码缺陷，所以 best-effort 但把日志留档。
+      # 构建与冒烟分开。实测结论（2026-11-08）：脚本的 -Run 会连带跑
+      # screen_capture_smoke，而它需要真实交互桌面 + WGC 采集，托管 runner 上必然
+      # 失败（frame-acquire.png was not produced），与代码质量无关。
+      # 所以：构建失败 = 真失败；冒烟 best-effort 但日志留档。
       - name: build dll
         shell: pwsh
         run: |
@@ -83,7 +85,8 @@ jobs:
         continue-on-error: true
         shell: pwsh
         run: |
-          $stage = Join-Path $env:LOCALAPPDATA 'PartyUp\media-stage'
+          # 只跑不依赖桌面的引擎冒烟；采集类冒烟需要交互会话，跳过并在日志里说明。
+          $stage = Join-Path $env:GITHUB_WORKSPACE '.ci-smoke'
           New-Item -ItemType Directory -Force $stage | Out-Null
           Copy-Item src/media-core/out/partyup_media.dll $stage -Force
           $smoke = Get-ChildItem src/media-core/out -Filter 'media_smoke.exe' -Recurse -File |
@@ -104,7 +107,7 @@ jobs:
           name: media-core-logs
           path: |
             build-dll.log
-            ${{ env.LOCALAPPDATA }}/PartyUp/media-stage/smoke.log
+            .ci-smoke/smoke.log
           if-no-files-found: ignore
           retention-days: 14
 

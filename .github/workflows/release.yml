@@ -112,7 +112,11 @@ jobs:
         run: |
           $prev = (git tag --list 'v*' --sort=-v:refname | Where-Object { $_ -ne $env:TAG } | Select-Object -First 1)
           $range = if ($prev) { "$prev..HEAD" } else { "HEAD" }
-          $log = git log $range --no-merges --pretty=format:'- %s (%h)' | Select-Object -First 60
+          # 注意：git log 的输出是字符串数组，直接放进下面的 @() 里 -join 会变成
+          # "System.Object[]"（v0.1.0 首次发布就是这样），必须先自己 join 成多行文本。
+          $changes = (@(git log $range --no-merges --pretty=format:'- %s (%h)') |
+            Select-Object -First 60) -join "`n"
+          if ([string]::IsNullOrWhiteSpace($changes)) { $changes = '- 首个版本' }
           $dir = ".docs/release-notes"
           New-Item -ItemType Directory -Force $dir | Out-Null
           $path = Join-Path $dir "$env:TAG.md"
@@ -121,7 +125,7 @@ jobs:
             "",
             "## 变更",
             "",
-            $log,
+            $changes,
             "",
             "## 发布物",
             "",

@@ -146,7 +146,7 @@ jobs:
             "## 已知限制",
             "",
             "- Windows 客户端；未签名（SmartScreen 会提示）。",
-            "- 无摄像头、无 E2EE。",
+            "- 无 E2EE。",
             ""
           ) -join "`n" | Set-Content -Path $path -Encoding utf8
           "path=$path" >> $env:GITHUB_OUTPUT

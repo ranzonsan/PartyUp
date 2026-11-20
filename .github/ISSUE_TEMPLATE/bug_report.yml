@@ -1,0 +1,115 @@
+name: 缺陷报告
+description: 报告一个可复现的问题。安全问题请走 SECURITY.md，不要用这个表单。
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提交前请确认：这是**可复现的缺陷**，不是使用问题或功能请求。
+        **安全漏洞**请按 [SECURITY.md](https://github.com/ranzonsan/PartyUp/blob/main/SECURITY.md) 走私密渠道，不要在这里贴细节。
+
+  - type: input
+    id: client_version
+    attributes:
+      label: 客户端版本
+      description: 设置页或「关于」里显示的版本号
+      placeholder: 0.1.0
+    validations:
+      required: true
+
+  - type: input
+    id: server_version
+    attributes:
+      label: 服务端版本
+      description: 启动日志首行显示的版本号
+      placeholder: 0.1.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: 服务端部署方式
+      options:
+        - Docker（--network host）
+        - Docker（bridge + 固定端口）
+        - Windows 服务端包
+        - 源码运行
+        - 其他 / 不确定
+    validations:
+      required: true
+
+  - type: dropdown
+    id: transport
+    attributes:
+      label: 传输模式
+      description: 服务端启动参数里的 --voice-mode / --screen-mode
+      options:
+        - relay（默认）
+        - direct
+        - 两者混合
+        - 不确定
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 问题出现在哪一块
+      options:
+        - 登录 / 邀请码
+        - 文字消息
+        - 语音
+        - 屏幕共享
+        - 管理后台（成员、频道、邀请码、设置）
+        - 安装 / 自动更新
+        - 其他
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 从干净启动开始，一步一步写
+      placeholder: |
+        1. 启动服务端，参数 ...
+        2. 客户端 A、B 登录并加入同一频道
+        3. A 点击共享屏幕
+        4. B 的画面 ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为 vs 实际行为
+    validations:
+      required: true
+
+  - type: input
+    id: network
+    attributes:
+      label: 网络环境
+      description: 同一局域网 / 跨 NAT / 经过反向代理 / 不确定
+      placeholder: 同一局域网
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志（已脱敏）
+      description: 服务端日志与客户端日志的相关片段。请删掉内网 IP、邀请码、令牌、成员名。
+      render: text
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 确认
+      options:
+        - label: 已读 SECURITY.md，确认这不是安全问题
+          required: true
+        - label: 已从日志中移除凭据、内网地址与个人信息
+          required: true
+        - label: 已搜索过现有 issue，没有重复
+          required: true

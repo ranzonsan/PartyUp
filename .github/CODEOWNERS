@@ -1,0 +1,28 @@
+# 本项目采用 BDFL：所有路径的最终评审与合并权归项目 owner。
+# 下面的拆分不是为了分权，而是为了让「哪些面改动风险最高」在评审时可见，
+# 并且保证这些路径的改动一定会被 owner 看到。
+
+*                           @ranzonsan
+
+# 协议与兼容性
+/docs/PROTOCOL.md           @ranzonsan
+/docs/ARCHITECTURE.md       @ranzonsan
+
+# 不可逆决策
+/docs/adr/                  @ranzonsan
+
+# 治理与法务
+/LICENSE                    @ranzonsan
+/TRADEMARK.md               @ranzonsan
+/GOVERNANCE.md              @ranzonsan
+/CODE_OF_CONDUCT.md         @ranzonsan
+/SECURITY.md                @ranzonsan
+
+# 媒体核心：C ABI 是对外契约，改动影响已发布的 DLL
+/src/media-core/            @ranzonsan
+
+# 服务端鉴权、频道与媒体信令
+/server/internal/server/    @ranzonsan
+
+# 发布流水线：能改这里就能改发布产物
+/.github/workflows/         @ranzonsan

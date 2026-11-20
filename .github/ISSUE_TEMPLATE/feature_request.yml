@@ -1,0 +1,58 @@
+name: 功能建议
+description: 提出一个需求或改进。请先看 PRODUCT.md 的非目标，越界的需求会被直接关闭。
+title: "[feat] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提交前请先读 [PRODUCT.md 的非目标](https://github.com/ranzonsan/PartyUp/blob/main/docs/PRODUCT.md)。
+        官方托管、无服务器模式、移动端、会议能力、端到端加密、v1 的逐成员混合路径
+        都属于明确不做的事——提之前请说明为什么现有边界不适用。
+
+  - type: textarea
+    id: scenario
+    attributes:
+      label: 使用场景
+      description: 谁、在什么情况下、多久一次。不要从解决方案开始写。
+      placeholder: 我们 4 个人每周开黑两次，每次都要 ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: gap
+    attributes:
+      label: 现有功能为什么不够
+      description: 说明你现在是怎么绕过去的，以及绕不过去的地方
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 你设想的做法（可选）
+      description: 如果有具体实现想法可以写。不写也没关系，先把问题说清楚更重要。
+
+  - type: dropdown
+    id: boundary
+    attributes:
+      label: 是否触及已知非目标
+      options:
+        - 不涉及
+        - 涉及，但我认为应该重新讨论（请在下面说明理由）
+    validations:
+      required: true
+
+  - type: textarea
+    id: boundary_reason
+    attributes:
+      label: 若涉及非目标，说明理由
+
+  - type: dropdown
+    id: pr
+    attributes:
+      label: 是否愿意提交 PR
+      options:
+        - 愿意
+        - 愿意，但需要指导
+        - 不打算提交

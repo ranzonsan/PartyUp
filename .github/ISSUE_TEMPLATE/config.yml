@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+
+contact_links:
+  - name: 安全漏洞
+    url: https://github.com/ranzonsan/PartyUp/security/policy
+    about: 请不要在公开 issue 中报告安全问题，按 SECURITY.md 走私密渠道。
+
+  - name: 参与贡献
+    url: https://github.com/ranzonsan/PartyUp/blob/main/CONTRIBUTING.md
+    about: 提 PR 之前请先读贡献指南与四类边界。
+
+  - name: 项目边界
+    url: https://github.com/ranzonsan/PartyUp/blob/main/docs/BOUNDARIES.md
+    about: 不确定一个需求是否越界？先看这里，再决定要不要提。

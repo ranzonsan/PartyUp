@@ -1,90 +1,77 @@
 # PartyUp
 
-> Self-hosted, channel-based desktop app for **text, voice and screen sharing** — built for small groups (2–12 people): gaming nights, watching things together, remote collaboration.
-> The server is **a single binary** that runs on your own machine. No cloud services involved.
+PartyUp is a lightweight, self-hosted desktop app for small groups — voice, text and screen sharing.
 
-## Why
+## Features
 
-- **One command to run a server**: `docker run` or a single exe. No livekit-server, no separate TURN, no database server to install.
-- **Voice + screen sharing**: join voice and share your screen inside a channel; the transport mode is decided by the server (`relay` saves client bandwidth / `direct` saves server bandwidth) and the client doesn't have to care.
-- **Your data stays yours**: accounts, channels and chat history live in SQLite on your machine. No federation, no external identity provider, no telemetry.
-- **Admin panel**: kick/ban members, invite codes, audit log, announcement & welcome message, transport modes and concurrency limits, with owner/admin roles.
-- **Install once, updates itself**: the Windows client checks for new versions, asks before downloading, and applies on restart.
+- **Lightweight and easy to get started**: built with .NET 10 + Avalonia; a clean, responsive UI that stays light on resources.
+- **Everything in one place**: voice, video and text.
+- **A simple permission model**: just three roles — owner, admin and user — with none of the tedious configuration.
+- **Quick to deploy**: the server bundles the control plane, Pion SFU, STUN and SQLite storage. A single command or a single executable keeps it running, with no extra services.
+- **Low server load**: peer-to-peer (end-to-end) voice and video are coming, keeping as much traffic off your server as possible.
 
 ## Quick start
 
-### 1. Run the server (Linux, ~30s)
+### 1. Get the client (Windows)
+
+Download the latest build from [Releases](https://github.com/ranzonsan/partyup/releases/latest):
+
+- `PartyUp-<version>-win64-Setup.exe`: recommended for most people. Supports auto-update.
+- `PartyUp-<version>-win64.msi`: for a specific install path or for deployment through software distribution.
+- `PartyUp-<version>-win64-portable.zip`: portable, no installation, no auto-update.
+
+On first launch, enter the server address and register with an invite code from the admin.
+
+### 2. Deploy the server (your own machine)
+
+Your server needs:
+
+- At least 512 MB of free storage and 256 MB of free memory.
+- At least one port that your users can reach.
+
+PartyUp ships the server as a Docker image. Start one with:
 
 ```bash
 docker run -d --name partyup --network host --restart unless-stopped \
   -v "$PWD/partyup-data:/data" \
   ghcr.io/ranzonsan/partyup:latest
+```
 
+Once it is running, read the bootstrap token from the logs:
+
+```bash
 docker logs partyup | head -20
-# BOOTSTRAP_TOKEN=xxxx   ← used once to create the owner account
-# INVITE_CODE=xxxx       ← share with friends to register
 ```
 
-Then open `http://<server-ip>:8080` and use `BOOTSTRAP_TOKEN` to create your admin account.
+Use the bootstrap token to register the owner account for this server.
 
-> ⚠️ **`--network host` is the simplest setup**: voice/screen media uses UDP on dynamic ports, so it does not work behind Docker's bridge network (text still works — easy to misdiagnose).
-> For bridge networking, pass `--ice-port-range 50000-50010 --ice-public-ip <public-ip>` and publish the same UDP range with `-p 50000-50010:50000-50010/udp` (see [Docker deployment](docs/DOCKER.md)).
-> Docker Desktop on Windows/macOS does not provide real host networking and **cannot** be used as the server; run the binary directly there.
+> [!CAUTION]
+> Keep the bootstrap token safe until the owner account exists. Anyone who can reach the server can use this token to register the owner account and take over the server.
 
-**No Docker?** Download `PartyUp-Server-<version>-win64.zip` and run `start.cmd`; see [Packaging](docs/PACKAGING.md) for other platforms.
+## Known limitations
 
-### 2. Install the client (Windows)
-
-Download any asset from [Releases](https://github.com/ranzonsan/partyup/releases):
-
-| File | For whom |
-|---|---|
-| `PartyUp-<version>-win64-Setup.exe` | Most people: one-click, per-user install, **supports auto-update** |
-| `PartyUp-<version>-win64.msi` | Managed software distribution / choosing install scope |
-| `PartyUp-<version>-win64-portable.zip` | Portable: unzip and run, no auto-update |
-
-On first launch enter the server address (e.g. `http://192.168.1.10:8080`); ask the admin for an invite code.
-
-## How it fits together
-
-```
-┌────────────┐   HTTP / WebSocket (control plane: login, channels, text, signaling)  ┌──────────────────────┐
-│  Windows   │ ────────────────────────────────────────────────────────────────────> │ Go single binary     │
-│  client    │                                                                       │  · control plane     │
-│ (Avalonia) │ <──────────────────── UDP (voice / screen media, in-process SFU) ────── │  · Pion SFU in-proc  │
-└────────────┘                                                                       │  · SQLite            │
-       │                                                                             └──────────────────────┘
-       └─ partyup_media.dll (C++ / libwebrtc, narrow C ABI)
-```
-
-See [Architecture](docs/ARCHITECTURE.md) and [Protocol](docs/PROTOCOL.md); irreversible decisions live in [ADR](docs/adr/).
-
-## Requirements
-
-| Item | Guideline |
-|---|---|
-| Server | 1 vCPU / 512 MB to start; relay bandwidth grows with concurrent voice and screen shares |
-| Network | control plane TCP 8080; media UDP (dynamic ports, or a configured fixed range) + optional STUN UDP 3478 |
-| Client | Windows 10/11 x64 with network access to the server |
-
-Measured numbers: [Capacity](docs/CAPACITY.md).
+- The client is Windows-only.
+- Installers are unsigned, so Windows SmartScreen warns about an unknown publisher.
+- End-to-end (peer-to-peer) media is still under development.
 
 ## Documentation
 
 | Doc | Contents |
 |---|---|
 | [Product](docs/PRODUCT.md) | goals, non-goals, transport strategy, v1 acceptance |
-| [Architecture](docs/ARCHITECTURE.md) | components, C ABI boundary, data flow, session states |
+| [Architecture](docs/ARCHITECTURE.md) | components, C ABI boundary, data flow, path state machine |
 | [Protocol](docs/PROTOCOL.md) | signaling message shapes |
-| [Docker](docs/DOCKER.md) | container deployment, host vs fixed-port networking, troubleshooting |
-| [Packaging](docs/PACKAGING.md) | portable / Setup / MSI / server bundle, version source, SmartScreen |
+| [Docker deployment](docs/DOCKER.md) | containerization, host vs fixed-port networking, troubleshooting |
+| [Packaging & distribution](docs/PACKAGING.md) | portable / Setup / MSI / server bundle, version source, SmartScreen |
 | [Development](docs/DEV.md) | toolchain baseline, build flow, known pitfalls |
-| [Glossary](GLOSSARY.md) | project vocabulary (Chinese; source of truth for naming) |
-| [ADR](docs/adr/) | irreversible decisions and their rationale |
+| [Glossary](GLOSSARY.md) | project vocabulary; authoritative for prose and code naming |
+| [Project boundaries](docs/BOUNDARIES.md) | scope / architecture / collaboration / legal — read this before proposing anything |
+| [Documentation index](docs/README.md) | find what to read by role (user / operator / contributor / agent) |
+| [Architecture decisions](docs/adr/) | irreversible decisions and their rationale |
 | [Research: desktop GUI and media stack](docs/research/2026-11-01-desktop-media-stack.md) | selection facts and sources |
 | [Brand assets](brand/) | icons, splash, horizontal/vertical lockups |
 
-Verification notes and measured evidence (screenshots, ICE candidates, temporary tokens) live in `.docs/` and are **not committed** — they contain internal addresses and machine details, and are process artefacts rather than documentation.
+Verification notes and measured evidence (screenshots, candidate addresses, temporary tokens) live in `.docs/` and are **not committed** — they contain internal addresses and machine details, and are process material rather than documentation.
 
 ## Building from source
 
@@ -99,7 +86,7 @@ dotnet build client/PartyUp.Client.csproj -c Release
 pwsh -File scripts/build-media-dll.ps1
 ```
 
-CI runs on GitHub Actions:
+CI runs entirely on GitHub Actions:
 
 | Workflow | Trigger | Output |
 |---|---|---|
@@ -109,21 +96,16 @@ CI runs on GitHub Actions:
 | `release-client.yml` | `v*` tag | client bundles → draft Release (marked Latest) |
 | `release-server.yml` | `server-v*` tag | server zip → draft Release (not Latest) |
 
-Client and server have **independent versions and release channels**: client `client/VERSION`
-↔ tag `v0.1.0`, server `server/VERSION` ↔ tag `server-v0.1.0`.
+## Contributing
 
-## Known limitations
+- **[Contributing guide](CONTRIBUTING.md)** (Chinese): what gets accepted, how to open a PR, how to verify it. Read the "won't be accepted" table first.
+- **[Project boundaries](docs/BOUNDARIES.md)** (Chinese): scope / architecture / collaboration / legal. If you are unsure whether something belongs here, start here.
+- **[Code of conduct](CODE_OF_CONDUCT.md)** (Chinese; canonical English text at contributor-covenant.org): the precondition for taking part in issues, PRs and discussions.
+- **[Security policy](SECURITY.md)**: report vulnerabilities through a private channel, never in a public issue.
+- **[Governance](GOVERNANCE.md)** and **[name policy](TRADEMARK.md)**: who decides and how releases work; and how forks must rename.
 
-- The client is **Windows-only** for now (architecture is cross-platform; Linux/macOS ports are not done).
-- Installers are **unsigned**, so Windows SmartScreen warns about an unknown publisher.
-- No camera, no end-to-end encryption; text messages are relayed and stored without backup guarantees.
-- Screen sharing in `direct` transport mode is 1-to-1 only.
-- The server container is best run with host networking; bridge networking needs a fixed port range plus a public-IP override (see [Docker](docs/DOCKER.md)).
-
-## Status
-
-v1 is feature-complete and passes seven acceptance areas (packaging, invite codes, text history persistence, voice, screen sharing, both transport paths, reconnect). See [Product](docs/PRODUCT.md).
+AI-assisted contributions are welcome, but they must disclose the workflow and include verification that was actually run.
 
 ## License
 
-[GPL-3.0](LICENSE).
+PartyUp is licensed under [GPL-3.0](LICENSE).

@@ -27,7 +27,7 @@ On first launch, enter the server address and register with an invite code from 
 Your server needs:
 
 - At least 512 MB of free storage and 256 MB of free memory.
-- At least one port that your users can reach.
+- At least two ports that your users can reach: one for the server's main communication, the other for voice transport.
 
 PartyUp ships the server as a Docker image. Start one with:
 
@@ -56,22 +56,8 @@ Use the bootstrap token to register the owner account for this server.
 
 ## Documentation
 
-| Doc | Contents |
-|---|---|
-| [Product](docs/PRODUCT.md) | goals, non-goals, transport strategy, v1 acceptance |
-| [Architecture](docs/ARCHITECTURE.md) | components, C ABI boundary, data flow, path state machine |
-| [Protocol](docs/PROTOCOL.md) | signaling message shapes |
-| [Docker deployment](docs/DOCKER.md) | containerization, host vs fixed-port networking, troubleshooting |
-| [Packaging & distribution](docs/PACKAGING.md) | portable / Setup / MSI / server bundle, version source, SmartScreen |
-| [Development](docs/DEV.md) | toolchain baseline, build flow, known pitfalls |
-| [Glossary](GLOSSARY.md) | project vocabulary; authoritative for prose and code naming |
-| [Project boundaries](docs/BOUNDARIES.md) | scope / architecture / collaboration / legal — read this before proposing anything |
-| [Documentation index](docs/README.md) | find what to read by role (user / operator / contributor / agent) |
-| [Architecture decisions](docs/adr/) | irreversible decisions and their rationale |
-| [Research: desktop GUI and media stack](docs/research/2026-11-01-desktop-media-stack.md) | selection facts and sources |
-| [Brand assets](brand/) | icons, splash, horizontal/vertical lockups |
-
-Verification notes and measured evidence (screenshots, candidate addresses, temporary tokens) live in `.docs/` and are **not committed** — they contain internal addresses and machine details, and are process material rather than documentation.
+Usage documentation lives in the [Wiki](https://github.com/ranzonsan/PartyUp/wiki).
+Documentation for developing the project lives in [Docs](docs).
 
 ## Building from source
 
@@ -86,7 +72,7 @@ dotnet build client/PartyUp.Client.csproj -c Release
 pwsh -File scripts/build-media-dll.ps1
 ```
 
-CI runs entirely on GitHub Actions:
+CI runs on GitHub Actions:
 
 | Workflow | Trigger | Output |
 |---|---|---|
@@ -98,13 +84,13 @@ CI runs entirely on GitHub Actions:
 
 ## Contributing
 
-- **[Contributing guide](CONTRIBUTING.md)** (Chinese): what gets accepted, how to open a PR, how to verify it. Read the "won't be accepted" table first.
-- **[Project boundaries](docs/BOUNDARIES.md)** (Chinese): scope / architecture / collaboration / legal. If you are unsure whether something belongs here, start here.
-- **[Code of conduct](CODE_OF_CONDUCT.md)** (Chinese; canonical English text at contributor-covenant.org): the precondition for taking part in issues, PRs and discussions.
-- **[Security policy](SECURITY.md)**: report vulnerabilities through a private channel, never in a public issue.
-- **[Governance](GOVERNANCE.md)** and **[name policy](TRADEMARK.md)**: who decides and how releases work; and how forks must rename.
+- **[Contributing guide](CONTRIBUTING.md)**: how to share code, documentation or other content with this project, and where the limits are.
+- **[Project boundaries](docs/BOUNDARIES.md)**: scope, architecture, collaboration and legal — the four parts that determine whether a (new) requirement is viable.
+- **[Code of conduct](CODE_OF_CONDUCT.md)**: the rules that must be followed when taking part in issues, PRs and discussions.
+- **[Security policy](SECURITY.md)**: how vulnerabilities are reported. Use a private channel; do not post details in a public issue.
+- **[Governance](GOVERNANCE.md)**: who decides, the ADR process and the release process; **[name policy](TRADEMARK.md)**: how the project's name and icons may be used.
 
-AI-assisted contributions are welcome, but they must disclose the workflow and include verification that was actually run.
+The project allows and welcomes AI-generated code, provided it is produced within these rules.
 
 ## License
 

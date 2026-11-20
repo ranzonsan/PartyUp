@@ -26,7 +26,7 @@ PartyUp 是一个面向小型团体的轻量级自托管桌面语音、文字交
 
 您的服务器需要满足以下需求：
 - 至少 512MB 可用存储及 256MB 可用内存。
-- 至少1 个能够被您的用户访问的端口
+- 至少 2 个能够被您的用户访问的端口。一个用于服务器的主要通信，另一个用于语音传输。
 
 PartyUp 默认使用 Docker 镜像打包服务端，您可使用以下命令快捷建立一个服务端：
 
@@ -55,22 +55,8 @@ docker logs partyup | head -20
 
 ## 文档
 
-| 文档 | 内容 |
-|---|---|
-| [产品定义](docs/PRODUCT.md) | 目标、非目标、传输策略、v1 验收 |
-| [架构](docs/ARCHITECTURE.md) | 组件、C ABI 边界、数据流、路径状态机 |
-| [协议](docs/PROTOCOL.md) | 信令消息形状 |
-| [Docker 部署](docs/DOCKER.md) | 容器化、host 网络 vs 固定端口、排障 |
-| [打包与分发](docs/PACKAGING.md) | 绿色版 / Setup / MSI / 服务端包、版本源、SmartScreen |
-| [开发环境](docs/DEV.md) | 工具链基线、构建流、已知坑 |
-| [术语表](GLOSSARY.md) | 项目语言，写作与代码命名以此为准 |
-| [项目边界](docs/BOUNDARIES.md) | 范围 / 架构 / 协作 / 法律四条线，提需求前先看 |
-| [文档索引](docs/README.md) | 按身份（使用者 / 部署者 / 贡献者 / agent）找到该读的文档 |
-| [架构决策记录](docs/adr/) | 不可逆决定及其理由 |
-| [调研：桌面 GUI 与媒体栈](docs/research/2026-11-01-desktop-media-stack.md) | 选型事实与来源 |
-| [品牌资产](brand/) | 图标、锁屏图、横竖版 lockup |
-
-验证性过程记录与实测证据（截图、候选地址、临时 token）保存在 `.docs/`，**不入库**——它们含内网地址与机器信息，且属于过程而非文档。
+使用文档请见 [Wiki](https://github.com/ranzonsan/PartyUp/wiki)。
+有关项目开发的相关文档，请见 [Docs](docs)。
 
 ## 从源码构建
 
@@ -85,7 +71,7 @@ dotnet build client/PartyUp.Client.csproj -c Release
 pwsh -File scripts/build-media-dll.ps1
 ```
 
-CI 全部跑在 GitHub Actions：
+CI 使用 GitHub Actions：
 
 | workflow | 触发 | 产出 |
 |---|---|---|
@@ -95,15 +81,15 @@ CI 全部跑在 GitHub Actions：
 | `release-client.yml` | `v*` tag | 客户端三件套 → draft Release（Latest） |
 | `release-server.yml` | `server-v*` tag | 服务端 zip → draft Release（不发 Latest） |
 
-## 参与
+## 贡献
 
-- **[贡献指南](CONTRIBUTING.md)**：什么样的改动会被接受、怎么提、怎么验。**动手前先读其中的「不会被接受的改动」。**
-- **[项目边界](docs/BOUNDARIES.md)**：范围 / 架构 / 协作 / 法律四条线。不确定一个需求该不该做，看这里。
-- **[行为准则](CODE_OF_CONDUCT.md)**：参与 issue、PR 与讨论的前提。
-- **[安全策略](SECURITY.md)**：漏洞请走私密渠道，不要在公开 issue 里贴细节。
-- **[治理](GOVERNANCE.md)**：决策权、ADR 流程与发布流程；**[名称使用](TRADEMARK.md)** 说明 fork 时该怎么改名。
+- **[贡献指南](CONTRIBUTING.md)**：本章节明确了为本项目共享代码、文档或其他内容的方法与界限。
+- **[项目边界](docs/BOUNDARIES.md)**：本章节从范围、架构、协作、法律四部分规定了一个（新）需求的可行性。
+- **[行为准则](CODE_OF_CONDUCT.md)**：本章节规定了参与 issue、PR 与讨论必须要遵守的规则。
+- **[安全策略](SECURITY.md)**：本章节规定了项目的漏洞提交规范。提交漏洞请走私密渠道，不要在公开 issue 里贴细节。
+- **[治理](GOVERNANCE.md)**：宣布了项目的决策权、ADR 流程与发布流程；**[名称使用](TRADEMARK.md)** 规定了本项目的名称及图标的使用。
 
-用 AI 写代码也欢迎，但需要披露并附上真跑过的验证——规则在贡献指南里。
+本项目允许且欢迎各种在规范约束下生成的 AI 代码。
 
 ## 许可证
 

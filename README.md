@@ -4,11 +4,11 @@ PartyUp 是一个面向小型团体的轻量级自托管桌面语音、文字交
 
 ## 特点
 
-- 轻量且易于上手：使用.NET 10 + Avalonia，界面简洁流畅且性能占用低。
+- 轻量且易于上手：使用 .NET 10 + Avalonia，界面简洁流畅且性能占用低。
 - 完整的交流体验：语音、视频以及文字媒体一应俱全。
-- 简单的权限模型：仅owner、admin、user三级模型，减少繁琐配置
+- 简单的权限模型：仅 owner、admin、user 三级模型，减少繁琐配置
 - 部署快捷：服务端内置控制面、Pion SFU、STUN 与 SQLite 存储。仅使用一条命令或单个可执行文件即可稳定运行，不需要额外服务。
-- 低服务端性能需求：（即将）支持语音、视频端到端，尽可能减少服务器网络压力。
+- 低服务端性能需求：（即将）支持点对点（Peer to Peer）语音和视频传输，尽可能减少服务器网络压力。
 
 ## 快速开始
 
@@ -27,6 +27,9 @@ PartyUp 是一个面向小型团体的轻量级自托管桌面语音、文字交
 您的服务器需要满足以下需求：
 - 至少 512MB 可用存储及 256MB 可用内存。
 - 至少 2 个能够被您的用户访问的端口。一个用于服务器的主要通信，另一个用于语音传输。
+
+> [!NOTE]
+> 对于端口的需求可能会随着功能更新而改变。
 
 PartyUp 默认使用 Docker 镜像打包服务端，您可使用以下命令快捷建立一个服务端：
 
@@ -56,7 +59,7 @@ docker logs partyup | head -20
 ## 文档
 
 使用文档请见 [Wiki](https://github.com/ranzonsan/PartyUp/wiki)。
-有关项目开发的相关文档，请见 [Docs](docs)。
+有关项目开发的文档，请见 [Docs](docs)。
 
 ## 从源码构建
 
@@ -71,26 +74,18 @@ dotnet build client/PartyUp.Client.csproj -c Release
 pwsh -File scripts/build-media-dll.ps1
 ```
 
-CI 使用 GitHub Actions：
-
-| workflow | 触发 | 产出 |
-|---|---|---|
-| `ci.yml` | push / PR | Go 测试 + 客户端编译 |
-| `media-core.yml` | 仅 `src/media-core/**` 或手动 | `partyup_media.dll` → `media-core-v*` release |
-| `docker.yml` | `server-v*` tag / `main` | 服务端镜像 → `ghcr.io/ranzonsan/partyup` |
-| `release-client.yml` | `v*` tag | 客户端三件套 → draft Release（Latest） |
-| `release-server.yml` | `server-v*` tag | 服务端 zip → draft Release（不发 Latest） |
-
 ## 贡献
 
-- **[贡献指南](CONTRIBUTING.md)**：本章节明确了为本项目共享代码、文档或其他内容的方法与界限。
+- **[贡献指南](CONTRIBUTING.md)**：本章节明确了为本项目贡献代码、文档或其他内容的方法与界限。
 - **[项目边界](docs/BOUNDARIES.md)**：本章节从范围、架构、协作、法律四部分规定了一个（新）需求的可行性。
-- **[行为准则](CODE_OF_CONDUCT.md)**：本章节规定了参与 issue、PR 与讨论必须要遵守的规则。
-- **[安全策略](SECURITY.md)**：本章节规定了项目的漏洞提交规范。提交漏洞请走私密渠道，不要在公开 issue 里贴细节。
-- **[治理](GOVERNANCE.md)**：宣布了项目的决策权、ADR 流程与发布流程；**[名称使用](TRADEMARK.md)** 规定了本项目的名称及图标的使用。
+- **[行为准则](CODE_OF_CONDUCT.md)**：本章节规定了参与 issue（工单）、Pull Request（合并请求）与讨论必须要遵守的规则。
+- **[安全策略](SECURITY.md)**：本章节规定了项目的漏洞提交规范。请通过私密渠道提交漏洞，不在公开 issue 里展示细节。
+- **[治理](GOVERNANCE.md)**：本章节说明了项目的决策权、ADR 流程与发布流程；**[名称使用](TRADEMARK.md)** 规定了本项目的名称及图标的使用。
 
 本项目允许且欢迎各种在规范约束下生成的 AI 代码。
 
 ## 许可证
 
 PartyUp 使用 [GPL-3.0](LICENSE) 作为许可证。
+
+请留意，PartyUp 所使用的各种开源组件的许可证不尽相同。

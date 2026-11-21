@@ -1,5 +1,7 @@
 # 打包与分发
 
+> 最后核对：2026-11-21 · 对应 未发版
+>
 > 本文是「产物怎么来、怎么验、怎么换图标、不签名怎么告知用户」的唯一出处。
 > 脚本：`scripts/package.ps1`（打包）、`scripts/verify-package.ps1`（验收）、
 > `scripts/make-assets.ps1`（占位图标/启动图生成，一次性）。

@@ -1,6 +1,8 @@
 # PartyUp 架构
 
-> 状态：v0.1 · 2026-11-01。技术栈见 [ADR-0006](adr/0006-client-stack.md)；协议消息见 [PROTOCOL.md](PROTOCOL.md)（草案）。
+> 最后核对：2026-11-01 · 对应 未发版
+>
+> 技术栈见 [ADR-0006](adr/0006-client-stack.md)；协议消息见 [PROTOCOL.md](PROTOCOL.md)。
 
 ## 1. 组件
 

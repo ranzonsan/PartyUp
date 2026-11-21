@@ -1,5 +1,7 @@
 # PartyUp 容量基线
 
+> 最后核对：2026-11-04 · 对应 未发版
+>
 > 2026-11-04 实测。工具：`server/cmd/loadtest`（pion 假客户端，**独立进程**）+ 
 > `scripts/scale-test.sh`（一键跑并采样服务端 CPU/RSS）。
 >

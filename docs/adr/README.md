@@ -36,6 +36,7 @@ ADR 记录**不可逆或高代价的决定及其理由**。它回答「当时为
 | [0004](0004-flat-channels.md) | 频道只有一层，不分类型 | accepted · 2026-11-01 |
 | [0005](0005-local-identity.md) | 身份属于服务器，不做全局账号与联邦 | accepted · 2026-11-01 |
 | [0006](0006-client-stack.md) | 客户端用 Avalonia + C++ 媒体核心，不用 Qt | accepted · 2026-11-01 |
+| [0007](0007-docs-layering.md) | 文档分层与权威来源：docs/ 入库，.docs/ 只放过程 | accepted · 2026-11-21 |
 
 ## 与其它文档的关系
 

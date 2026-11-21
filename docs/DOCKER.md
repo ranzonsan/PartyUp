@@ -1,5 +1,7 @@
 # 用 Docker 部署服务端
 
+> 最后核对：2026-11-08 · 对应 未发版
+
 服务端是**单个静态 Go 二进制**（控制面 HTTP/WebSocket + 同进程 Pion SFU，没有 livekit-server、没有独立 TURN），容器镜像约 20 MB。
 
 网络配置有**两种模式**，选一种：

@@ -25,9 +25,9 @@
 | [DOCKER.md](DOCKER.md) | 容器化、host 网络 vs 固定端口、排障 | v0.1 |
 | [PACKAGING.md](PACKAGING.md) | 绿色版 / Setup / MSI / 服务端包、版本源 | v0.1 |
 | [CAPACITY.md](CAPACITY.md) | 实测 CPU / 内存 / 带宽基准 | 持续更新 |
+| [ROADMAP.md](ROADMAP.md) | v1.0 的验收判据、里程碑与当前进度 | 未发版 |
 | [adr/](adr/) | 架构决策记录：不可逆决定与理由 | 6 篇 |
 | [research/](research/) | 选型调研（带来源） | — |
-| [design/](design/) | v1.1 的界面与契约设计 | — |
 | [GLOSSARY.md](../GLOSSARY.md) | 项目语言，写作与命名以此为准 | v1 |
 
 ## 根目录的社区文件

@@ -51,7 +51,7 @@ Use the bootstrap token to register the owner account for this server.
 ## Known limitations
 
 - The client is Windows-only.
-- Installers are unsigned, so Windows SmartScreen warns about an unknown publisher.
+- Builds are not code-signed, so Windows SmartScreen warns about an unknown publisher; every release ships a `SHA256SUMS.txt` you can verify against.
 - End-to-end (peer-to-peer) media is still under development.
 
 ## Documentation

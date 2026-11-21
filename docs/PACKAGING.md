@@ -1,6 +1,6 @@
 # 打包与分发
 
-> 本文是「产物怎么来、怎么验、怎么换图标、未签名怎么告知用户」的唯一出处。
+> 本文是「产物怎么来、怎么验、怎么换图标、不签名怎么告知用户」的唯一出处。
 > 脚本：`scripts/package.ps1`（打包）、`scripts/verify-package.ps1`（验收）、
 > `scripts/make-assets.ps1`（占位图标/启动图生成，一次性）。
 
@@ -116,16 +116,36 @@ msiexec /i PartyUp-<ver>-win64.msi /qn VELOPACK_INSTALLDIR="D:\Apps\PartyUp"
 > **per-machine 路径未验证**：当前开发机是非管理员会话，验收只覆盖 per-user 安装/卸载。
 > 发布前如需承诺 per-machine，请用管理员会话补测。
 
-## 未签名：SmartScreen 警告必须告知用户
+## 不提供代码签名：SmartScreen 警告必须告知用户
 
-产物**不签名**（没有代码签名证书）。从网上下载后首次运行，Windows SmartScreen
+产物**不做代码签名**。从网上下载后首次运行，Windows SmartScreen
 会弹「Windows 已保护你的电脑」。这是正常提示，但**必须提前告知**，否则用户会以为中了病毒：
 
 - 绿色版：`assets/portable-README.txt`（随 zip 分发为 `README.txt`）；
 - MSI：`assets/installer/welcome.md`（欢迎页）；
 - 安装器/README/本文档都写明操作：**更多信息 → 仍要运行**。
 
-不要试图隐藏或绕过该提示；要消除它只能购买代码签名证书并给 exe/Setup/MSI 签名（后续可做）。
+不要试图隐藏或绕过该提示。既然不做签名，就提供**可校验的完整性**：每次 release 附带
+`SHA256SUMS.txt`，下载页写明校验方式：
+
+```powershell
+Get-FileHash .\PartyUp-<版本>-win64-Setup.exe -Algorithm SHA256
+```
+
+## 为什么不做代码签名
+
+免费方案存在，但代价不小：
+
+- **SignPath Foundation** 为开源项目免费签名，但证书签发给基金会——用户看到的发布者是
+  `SignPath Foundation` 而不是 PartyUp，并要求项目持续维护、全员启用 MFA、每次发布人工批准；
+- **OSSign** 免费，但申请通道目前暂停；
+- **Certum 开源证书** €49/年，发布者显示 `Open Source Developer` 加个人姓名，且禁止用于商业分发；
+- **Azure Artifact Signing**（原 Trusted Signing）$9.99/月，但面向个人开发者仅限美国与加拿大。
+
+付费 OV 证书每年 $99–300；并且自 2024 年起 **EV 证书也不再免 SmartScreen 声誉积累**——
+签名能消除「未知发布者」，但新文件的首次下载仍可能被拦，声誉要靠持续发布累积。
+
+结论：v1.0 不做代码签名，改为提供 SHA256 校验值。见 [Roadmap](ROADMAP.md) 的「明确不做」。
 
 ## 服务端包
 

@@ -53,7 +53,7 @@ docker logs partyup | head -20
 ## 已知限制及问题
 
 - 仅支持 Windows 客户端。
-- 安装包未签名，Windows SmartScreen 会提示"未知发布者"。
+- 不提供代码签名，Windows SmartScreen 会提示"未知发布者"；每个 release 附 `SHA256SUMS.txt` 供核对。
 - 端到端功能仍在开发中。
 
 ## 文档
